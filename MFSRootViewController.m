@@ -76,54 +76,61 @@
         [_specifiers addObject:installedGroup];
         
         NSMutableArray *appSpecifiers = [NSMutableArray new];
-        [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy *appProxy) {
-            id proxy = (id)appProxy;  // 强制转换为 id 以便调用 KVC
-            
-            // 获取图标（通过 KVC 避免编译错误）
-            UIImage *icon = nil;
-            @try {
-                icon = [proxy valueForKey:@"applicationIcon"];
-            } @catch (NSException *e) {
-                // 忽略，使用 nil
-            }
-            
-            // 获取版本号
-            NSString *version = @"Unknown";
-            NSURL *bundleURL = appProxy.bundleURL;
-            if (bundleURL) {
-                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
-                if (info) {
-                    version = info[@"CFBundleShortVersionString"] ?: info[@"CFBundleVersion"] ?: @"Unknown";
-                }
-            }
-            
-            // 获取下载账号的 Apple ID（KVC 获取私有属性）
-            NSString *appleID = @"Unknown";
-            @try {
-                id aid = [proxy valueForKey:@"installerAppleID"];
-                if ([aid isKindOfClass:[NSString class]]) appleID = aid;
-            } @catch (NSException *e) {}
-            
-            // 主标题：应用名 (版本号)
-            NSString *title = [NSString stringWithFormat:@"%@ (%@)", appProxy.localizedName, version];
-            // 副标题：Bundle ID | Apple ID
-            NSString *subtitle = [NSString stringWithFormat:@"%@ | %@", appProxy.bundleIdentifier, appleID];
-            
-            PSSpecifier *spec = [PSSpecifier preferenceSpecifierNamed:title
-                                                                target:self
-                                                                   set:nil
-                                                                   get:nil
-                                                                detail:nil
-                                                                  cell:PSSubtitleCell
-                                                                  edit:nil];
-            [spec setProperty:bundleURL forKey:@"bundleURL"];
-            [spec setProperty:@YES forKey:@"enabled"];
-            if (icon) [spec setProperty:icon forKey:@"iconImage"];
-            [spec setProperty:subtitle forKey:@"subtitle"];
-            spec.buttonAction = @selector(downloadAppShortcut:);
-            [appSpecifiers addObject:spec];
-        }];
         
+        // 使用 LSEnumerator 获取所有已安装应用（更可靠）
+        LSEnumerator *enumerator = [LSEnumerator enumeratorForApplicationProxiesWithOptions:0];
+        enumerator.predicate = [NSPredicate predicateWithFormat:@"isPlaceholder = NO AND isInstalled = YES"];
+        
+        for (LSApplicationProxy *appProxy in enumerator) {
+            // 只显示用户应用（非系统应用），可根据需要调整
+            if ([appProxy.applicationType isEqualToString:@"User"]) {
+                id proxy = (id)appProxy;
+                
+                // 获取图标（通过 KVC）
+                UIImage *icon = nil;
+                @try {
+                    icon = [proxy valueForKey:@"applicationIcon"];
+                } @catch (NSException *e) {}
+                
+                // 获取版本号
+                NSString *version = @"Unknown";
+                NSURL *bundleURL = appProxy.bundleURL;
+                if (bundleURL) {
+                    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
+                    if (info) {
+                        version = info[@"CFBundleShortVersionString"] ?: info[@"CFBundleVersion"] ?: @"Unknown";
+                    }
+                }
+                
+                // 获取下载账号的 Apple ID
+                NSString *appleID = @"Unknown";
+                @try {
+                    id aid = [proxy valueForKey:@"installerAppleID"];
+                    if ([aid isKindOfClass:[NSString class]]) appleID = aid;
+                } @catch (NSException *e) {}
+                
+                // 主标题：应用名 (版本号)
+                NSString *title = [NSString stringWithFormat:@"%@ (%@)", appProxy.localizedName, version];
+                // 副标题：Bundle ID | Apple ID
+                NSString *subtitle = [NSString stringWithFormat:@"%@ | %@", appProxy.bundleIdentifier, appleID];
+                
+                PSSpecifier *spec = [PSSpecifier preferenceSpecifierNamed:title
+                                                                    target:self
+                                                                       set:nil
+                                                                       get:nil
+                                                                    detail:nil
+                                                                      cell:PSSubtitleCell
+                                                                      edit:nil];
+                [spec setProperty:bundleURL forKey:@"bundleURL"];
+                [spec setProperty:@YES forKey:@"enabled"];
+                if (icon) [spec setProperty:icon forKey:@"iconImage"];
+                [spec setProperty:subtitle forKey:@"subtitle"];
+                spec.buttonAction = @selector(downloadAppShortcut:);
+                [appSpecifiers addObject:spec];
+            }
+        }
+        
+        // 按应用名称排序
         [appSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier *a, PSSpecifier *b) {
             return [a.name compare:b.name];
         }];
