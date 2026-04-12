@@ -71,13 +71,13 @@
         
         NSMutableArray *appSpecifiers = [NSMutableArray new];
         [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
-            // 获取应用图标
+            // 获取应用图标（私有 API，使用 performSelector 避免编译错误）
             UIImage *iconImage = nil;
             if ([appProxy respondsToSelector:@selector(applicationIcon)]) {
-                iconImage = [appProxy applicationIcon];
+                iconImage = [appProxy performSelector:@selector(applicationIcon)];
             }
             if (!iconImage) {
-                iconImage = [UIImage imageNamed:@"AppIconPlaceholder"]; // 默认占位图，若无则使用透明图
+                iconImage = [UIImage imageNamed:@"AppIconPlaceholder"]; // 占位图，若无则忽略
             }
             
             // 获取版本号
@@ -93,11 +93,10 @@
                 }
             }
             
-            // 获取下载账号的 Apple ID
+            // 获取下载账号的 Apple ID（私有属性，通过 KVC 获取）
             NSString *appleID = @"Unknown";
             @try {
-                // 使用 KVC 获取私有属性 installerAppleID
-                id installerAppleID = [appProxy valueForKey:@"installerAppleID"];
+                id installerAppleID = [(id)appProxy valueForKey:@"installerAppleID"];
                 if (installerAppleID && [installerAppleID isKindOfClass:[NSString class]]) {
                     appleID = installerAppleID;
                 }
@@ -105,23 +104,25 @@
                 // 忽略异常
             }
             
-            // 构建显示文本：应用名称 + 版本号
-            NSString *displayName = [NSString stringWithFormat:@"%@ (%@)", appProxy.localizedName, version];
-            // 详细文本：Bundle ID + Apple ID
-            NSString *detailText = [NSString stringWithFormat:@"%@ | %@", appProxy.bundleIdentifier, appleID];
+            // 主标题：应用名称 + 版本号
+            NSString *title = [NSString stringWithFormat:@"%@ (%@)", appProxy.localizedName, version];
+            // 副标题：Bundle ID + Apple ID
+            NSString *subtitle = [NSString stringWithFormat:@"%@ | %@", appProxy.bundleIdentifier, appleID];
             
-            // 使用 PSSubtitleCell 类型以显示副标题和图标
-            PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:displayName
+            // 使用 PSLinkCell（枚举值 4）支持图标和副标题，且可执行按钮动作
+            PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:title
                                                                         target:self
                                                                            set:nil
                                                                            get:nil
                                                                         detail:nil
-                                                                          cell:PSSubtitleCell
+                                                                          cell:4  // PSLinkCell
                                                                           edit:nil];
             [appSpecifier setProperty:bundleURL forKey:@"bundleURL"];
             [appSpecifier setProperty:@YES forKey:@"enabled"];
-            [appSpecifier setProperty:iconImage forKey:@"iconImage"];      // 设置图标
-            [appSpecifier setProperty:detailText forKey:@"subtitle"];      // 设置副标题
+            if (iconImage) {
+                [appSpecifier setProperty:iconImage forKey:@"iconImage"];
+            }
+            [appSpecifier setProperty:subtitle forKey:@"subtitle"]; // 副标题
             appSpecifier.buttonAction = @selector(downloadAppShortcut:);
             [appSpecifiers addObject:appSpecifier];
         }];
@@ -168,7 +169,7 @@
     [self reloadSpecifiers];
 }
 
-#pragma mark - 原有功能（未改动）
+#pragma mark - 原有功能（未改动核心逻辑，仅修复编译警告）
 
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
@@ -205,7 +206,7 @@
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2\nMade by Mineek\nEnhanced by IPMan\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.3\nMade by Mineek\nEnhanced by IPMan\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
@@ -253,7 +254,8 @@
             }
             UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
             [versionAlert addAction:cancelAction];
-            if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+            // iPad 适配，修复废弃 API
+            if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
                 versionAlert.popoverPresentationController.sourceView = self.view;
                 versionAlert.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 0, 0);
             }
