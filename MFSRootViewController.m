@@ -77,57 +77,80 @@
         
         NSMutableArray *appSpecifiers = [NSMutableArray new];
         
-        // 使用 LSEnumerator 获取所有已安装应用（更可靠）
-        LSEnumerator *enumerator = [LSEnumerator enumeratorForApplicationProxiesWithOptions:0];
-        enumerator.predicate = [NSPredicate predicateWithFormat:@"isPlaceholder = NO AND isInstalled = YES"];
+        // 获取所有已安装应用（使用更可靠的私有 API）
+        LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
+        NSArray *allApps = nil;
         
-        for (LSApplicationProxy *appProxy in enumerator) {
-            // 只显示用户应用（非系统应用），可根据需要调整
-            if ([appProxy.applicationType isEqualToString:@"User"]) {
-                id proxy = (id)appProxy;
-                
-                // 获取图标（通过 KVC）
-                UIImage *icon = nil;
-                @try {
-                    icon = [proxy valueForKey:@"applicationIcon"];
-                } @catch (NSException *e) {}
-                
-                // 获取版本号
-                NSString *version = @"Unknown";
-                NSURL *bundleURL = appProxy.bundleURL;
-                if (bundleURL) {
-                    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
-                    if (info) {
-                        version = info[@"CFBundleShortVersionString"] ?: info[@"CFBundleVersion"] ?: @"Unknown";
-                    }
+        // 尝试多种方式获取应用列表
+        if ([workspace respondsToSelector:@selector(allInstalledApplications)]) {
+            allApps = [workspace performSelector:@selector(allInstalledApplications)];
+        } else if ([workspace respondsToSelector:@selector(installedApplications)]) {
+            allApps = [workspace performSelector:@selector(installedApplications)];
+        } else {
+            // 回退到枚举方式
+            NSMutableArray *apps = [NSMutableArray array];
+            [workspace enumerateApplicationsOfType:0 block:^(LSApplicationProxy *app) {
+                [apps addObject:app];
+            }];
+            allApps = apps;
+        }
+        
+        for (LSApplicationProxy *appProxy in allApps) {
+            // 过滤条件：不是占位应用、已安装、不是系统应用（可选）
+            if (appProxy.isPlaceholder || !appProxy.isInstalled) continue;
+            
+            // 可选：过滤掉系统应用（只显示用户应用）
+            NSString *appType = appProxy.applicationType;
+            if (appType && ![appType isEqualToString:@"User"]) continue;
+            
+            // 额外过滤：排除明显的系统应用（可选）
+            NSString *bundleID = appProxy.bundleIdentifier;
+            if ([bundleID hasPrefix:@"com.apple."]) continue;
+            
+            id proxy = (id)appProxy;
+            
+            // 获取图标（通过 KVC）
+            UIImage *icon = nil;
+            @try {
+                icon = [proxy valueForKey:@"applicationIcon"];
+            } @catch (NSException *e) {}
+            
+            // 获取版本号
+            NSString *version = @"Unknown";
+            NSURL *bundleURL = appProxy.bundleURL;
+            if (bundleURL) {
+                NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
+                if (info) {
+                    version = info[@"CFBundleShortVersionString"] ?: info[@"CFBundleVersion"] ?: @"Unknown";
                 }
-                
-                // 获取下载账号的 Apple ID
-                NSString *appleID = @"Unknown";
-                @try {
-                    id aid = [proxy valueForKey:@"installerAppleID"];
-                    if ([aid isKindOfClass:[NSString class]]) appleID = aid;
-                } @catch (NSException *e) {}
-                
-                // 主标题：应用名 (版本号)
-                NSString *title = [NSString stringWithFormat:@"%@ (%@)", appProxy.localizedName, version];
-                // 副标题：Bundle ID | Apple ID
-                NSString *subtitle = [NSString stringWithFormat:@"%@ | %@", appProxy.bundleIdentifier, appleID];
-                
-                PSSpecifier *spec = [PSSpecifier preferenceSpecifierNamed:title
-                                                                    target:self
-                                                                       set:nil
-                                                                       get:nil
-                                                                    detail:nil
-                                                                      cell:PSSubtitleCell
-                                                                      edit:nil];
-                [spec setProperty:bundleURL forKey:@"bundleURL"];
-                [spec setProperty:@YES forKey:@"enabled"];
-                if (icon) [spec setProperty:icon forKey:@"iconImage"];
-                [spec setProperty:subtitle forKey:@"subtitle"];
-                spec.buttonAction = @selector(downloadAppShortcut:);
-                [appSpecifiers addObject:spec];
             }
+            
+            // 获取下载账号的 Apple ID
+            NSString *appleID = @"Unknown";
+            @try {
+                id aid = [proxy valueForKey:@"installerAppleID"];
+                if ([aid isKindOfClass:[NSString class]]) appleID = aid;
+            } @catch (NSException *e) {}
+            
+            // 主标题：应用名 (版本号)
+            NSString *title = [NSString stringWithFormat:@"%@ (%@)", appProxy.localizedName ?: bundleID, version];
+            // 副标题：Bundle ID | Apple ID
+            NSString *subtitle = [NSString stringWithFormat:@"%@ | %@", bundleID, appleID];
+            
+            PSSpecifier *spec = [PSSpecifier preferenceSpecifierNamed:title
+                                                                target:self
+                                                                   set:nil
+                                                                   get:nil
+                                                                detail:nil
+                                                                  cell:PSSubtitleCell
+                                                                  edit:nil];
+            [spec setProperty:bundleURL forKey:@"bundleURL"];
+            [spec setProperty:bundleID forKey:@"bundleID"]; // 额外保存 bundleID
+            [spec setProperty:@YES forKey:@"enabled"];
+            if (icon) [spec setProperty:icon forKey:@"iconImage"];
+            [spec setProperty:subtitle forKey:@"subtitle"];
+            spec.buttonAction = @selector(downloadAppShortcut:);
+            [appSpecifiers addObject:spec];
         }
         
         // 按应用名称排序
@@ -135,6 +158,18 @@
             return [a.name compare:b.name];
         }];
         [_specifiers addObjectsFromArray:appSpecifiers];
+        
+        // 如果没有获取到任何应用，添加一个提示项
+        if (appSpecifiers.count == 0) {
+            PSSpecifier *noAppSpec = [PSSpecifier preferenceSpecifierNamed:@"No apps found"
+                                                                    target:nil
+                                                                       set:nil
+                                                                       get:nil
+                                                                    detail:nil
+                                                                      cell:PSStaticTextCell
+                                                                      edit:nil];
+            [_specifiers addObject:noAppSpec];
+        }
     }
     self.navigationItem.title = @"MuffinStore";
     return _specifiers;
@@ -164,21 +199,44 @@
     [self reloadSpecifiers];
 }
 
-#pragma mark - 原有功能（保持不变）
+#pragma mark - 应用快捷下载（从已安装应用获取 App ID）
 
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
-    NSURL *bundleURL = [specifier propertyForKey:@"bundleURL"];
-    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
-    NSString *bundleId = info[@"CFBundleIdentifier"];
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software", bundleId]];
+    NSString *bundleID = [specifier propertyForKey:@"bundleID"];
+    if (!bundleID) {
+        NSURL *bundleURL = [specifier propertyForKey:@"bundleURL"];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
+        bundleID = info[@"CFBundleIdentifier"];
+    }
+    if (!bundleID) {
+        [self showAlert:@"Error" message:@"Unable to get bundle identifier"];
+        return;
+    }
+    
+    // 通过 iTunes API 根据 bundleId 获取 trackId
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software", bundleID]];
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error) { dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"Error" message:error.localizedDescription]; }); return; }
+        if (error) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"Error" message:error.localizedDescription]; });
+            return;
+        }
         NSError *jsonErr = nil;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
-        if (jsonErr) { dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"JSON Error" message:jsonErr.localizedDescription]; }); return; }
+        if (jsonErr) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"JSON Error" message:jsonErr.localizedDescription]; });
+            return;
+        }
         NSArray *results = json[@"results"];
-        if (results.count == 0) { dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"Error" message:@"No results"]; }); return; }
-        [self getAllAppVersionIdsAndPrompt:[results[0][@"trackId"] longLongValue]];
+        if (results.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"Error" message:@"No results for this bundle ID"]; });
+            return;
+        }
+        NSNumber *trackId = results[0][@"trackId"];
+        if (trackId) {
+            [self getAllAppVersionIdsAndPrompt:[trackId longLongValue]];
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"Error" message:@"trackId not found"]; });
+        }
     }];
     [task resume];
 }
@@ -195,21 +253,34 @@
     });
 }
 
+#pragma mark - 版本选择与下载核心逻辑
+
 - (void)getAllAppVersionIdsFromServer:(long long)appId {
     NSString *serverURL = @"https://apis.bilin.eu.org/history/";
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@%lld", serverURL, appId]];
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error) { dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"Error" message:error.localizedDescription]; }); return; }
+        if (error) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"Error" message:error.localizedDescription]; });
+            return;
+        }
         NSError *jsonErr = nil;
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
-        if (jsonErr) { dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"JSON Error" message:jsonErr.debugDescription]; }); return; }
+        if (jsonErr) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"JSON Error" message:jsonErr.debugDescription]; });
+            return;
+        }
         NSArray *versions = json[@"data"];
-        if (versions.count == 0) { dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"Error" message:@"No version IDs"]; }); return; }
+        if (versions.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self showAlert:@"Error" message:@"No version IDs"]; });
+            return;
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Version ID" message:@"Select version" preferredStyle:UIAlertControllerStyleActionSheet];
             for (NSDictionary *v in versions) {
-                [alert addAction:[UIAlertAction actionWithTitle:v[@"bundle_version"] style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    [self downloadAppWithAppId:appId versionId:[v[@"external_identifier"] longLongValue]];
+                NSString *bundleVersion = v[@"bundle_version"] ?: @"Unknown";
+                NSNumber *extId = v[@"external_identifier"];
+                [alert addAction:[UIAlertAction actionWithTitle:bundleVersion style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                    [self downloadAppWithAppId:appId versionId:[extId longLongValue]];
                 }]];
             }
             [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
@@ -226,7 +297,7 @@
 - (void)promptForVersionId:(long long)appId {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Version ID" message:@"Enter external_identifier" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.placeholder = @"Version ID"; }];
+        [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.placeholder = @"Version ID"; tf.keyboardType = UIKeyboardTypeNumberPad; }];
         [alert addAction:[UIAlertAction actionWithTitle:@"Download" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
             long long vid = [alert.textFields.firstObject.text longLongValue];
             [self downloadAppWithAppId:appId versionId:vid];
@@ -253,7 +324,7 @@
 - (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId {
     NSString *adamId = [NSString stringWithFormat:@"%lld", appId];
     NSString *appExtVrsId = [NSString stringWithFormat:@"%lld", versionId];
-    NSString *offerString = versionId == 0 ?
+    NSString *offerString = (versionId == 0) ?
         [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=pricingParameter&clientBuyId=1&installed=0&trolled=1", adamId] :
         [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=pricingParameter&appExtVrsId=%@&clientBuyId=1&installed=0&trolled=1", adamId, appExtVrsId];
     
@@ -261,7 +332,9 @@
     SKUIItem *item = [[SKUIItem alloc] initWithLookupDictionary:@{@"_itemOffer": adamId}];
     [item setValue:offer forKey:@"_itemOffer"];
     [item setValue:@"iosSoftware" forKey:@"_itemKindString"];
-    if (versionId != 0) [item setValue:@(versionId) forKey:@"_versionIdentifier"];
+    if (versionId != 0) {
+        [item setValue:@(versionId) forKey:@"_versionIdentifier"];
+    }
     
     SKUIItemStateCenter *center = [SKUIItemStateCenter defaultCenter];
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -273,17 +346,23 @@
     NSString *target = nil;
     if ([link containsString:@"id"]) {
         NSArray *parts = [link componentsSeparatedByString:@"id"];
-        if (parts.count < 2) { [self showAlert:@"Error" message:@"Invalid link"]; return; }
+        if (parts.count < 2) {
+            [self showAlert:@"Error" message:@"Invalid link"];
+            return;
+        }
         target = [[parts[1] componentsSeparatedByString:@"?"] firstObject];
     } else {
-        [self showAlert:@"Error" message:@"Invalid link"]; return;
+        [self showAlert:@"Error" message:@"Invalid link"];
+        return;
     }
     [self getAllAppVersionIdsAndPrompt:[target longLongValue]];
 }
 
 - (void)downloadApp {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"App Link" message:@"Enter App Store link" preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.placeholder = @"https://apps.apple.com/..."; }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"https://apps.apple.com/...";
+    }];
     [alert addAction:[UIAlertAction actionWithTitle:@"Download" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         [self downloadAppWithLink:alert.textFields.firstObject.text];
     }]];
