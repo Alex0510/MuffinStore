@@ -77,12 +77,14 @@
         
         NSMutableArray *appSpecifiers = [NSMutableArray new];
         [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy *appProxy) {
-            id proxy = (id)appProxy;  // 强制转换为 id 以调用私有方法
+            id proxy = (id)appProxy;  // 强制转换为 id 以便调用 KVC
             
-            // 获取图标
+            // 获取图标（通过 KVC 避免编译错误）
             UIImage *icon = nil;
-            if ([proxy respondsToSelector:@selector(applicationIcon)]) {
-                icon = [proxy applicationIcon];
+            @try {
+                icon = [proxy valueForKey:@"applicationIcon"];
+            } @catch (NSException *e) {
+                // 忽略，使用 nil
             }
             
             // 获取版本号
@@ -95,7 +97,7 @@
                 }
             }
             
-            // 获取下载账号的 Apple ID
+            // 获取下载账号的 Apple ID（KVC 获取私有属性）
             NSString *appleID = @"Unknown";
             @try {
                 id aid = [proxy valueForKey:@"installerAppleID"];
