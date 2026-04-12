@@ -47,6 +47,56 @@
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reloadSpecifiers) name:UIApplicationWillEnterForegroundNotification object:nil];
 }
 
+#pragma mark - 获取已安装应用列表（多种后备方案）
+
+- (NSArray<LSApplicationProxy *> *)getAllInstalledApps {
+    LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
+    NSArray *apps = nil;
+    
+    // 方案1：allInstalledApplications（最常用）
+    if ([workspace respondsToSelector:@selector(allInstalledApplications)]) {
+        apps = [workspace performSelector:@selector(allInstalledApplications)];
+        if (apps.count > 0) {
+            NSLog(@"[MuffinStore] Got %lu apps via allInstalledApplications", (unsigned long)apps.count);
+            return apps;
+        }
+    }
+    
+    // 方案2：installedApplications
+    if ([workspace respondsToSelector:@selector(installedApplications)]) {
+        apps = [workspace performSelector:@selector(installedApplications)];
+        if (apps.count > 0) {
+            NSLog(@"[MuffinStore] Got %lu apps via installedApplications", (unsigned long)apps.count);
+            return apps;
+        }
+    }
+    
+    // 方案3：enumerateApplicationsOfType:0
+    NSMutableArray *enumApps = [NSMutableArray array];
+    [workspace enumerateApplicationsOfType:0 block:^(LSApplicationProxy *app) {
+        [enumApps addObject:app];
+    }];
+    if (enumApps.count > 0) {
+        NSLog(@"[MuffinStore] Got %lu apps via enumerateApplicationsOfType", (unsigned long)enumApps.count);
+        return enumApps;
+    }
+    
+    // 方案4：LSEnumerator
+    LSEnumerator *enumerator = [LSEnumerator enumeratorForApplicationProxiesWithOptions:0];
+    enumerator.predicate = [NSPredicate predicateWithFormat:@"isPlaceholder = NO AND isInstalled = YES"];
+    NSMutableArray *enumApps2 = [NSMutableArray array];
+    for (LSApplicationProxy *app in enumerator) {
+        [enumApps2 addObject:app];
+    }
+    if (enumApps2.count > 0) {
+        NSLog(@"[MuffinStore] Got %lu apps via LSEnumerator", (unsigned long)enumApps2.count);
+        return enumApps2;
+    }
+    
+    NSLog(@"[MuffinStore] Warning: No apps found via any private API");
+    return @[];
+}
+
 - (NSMutableArray*)specifiers {
     if (!_specifiers) {
         _specifiers = [NSMutableArray new];
@@ -77,39 +127,25 @@
         
         NSMutableArray *appSpecifiers = [NSMutableArray new];
         
-        // 获取所有已安装应用（使用更可靠的私有 API）
-        LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
-        NSArray *allApps = nil;
-        
-        // 尝试多种方式获取应用列表
-        if ([workspace respondsToSelector:@selector(allInstalledApplications)]) {
-            allApps = [workspace performSelector:@selector(allInstalledApplications)];
-        } else if ([workspace respondsToSelector:@selector(installedApplications)]) {
-            allApps = [workspace performSelector:@selector(installedApplications)];
-        } else {
-            // 回退到枚举方式
-            NSMutableArray *apps = [NSMutableArray array];
-            [workspace enumerateApplicationsOfType:0 block:^(LSApplicationProxy *app) {
-                [apps addObject:app];
-            }];
-            allApps = apps;
-        }
+        // 获取所有已安装应用
+        NSArray *allApps = [self getAllInstalledApps];
         
         for (LSApplicationProxy *appProxy in allApps) {
-            // 过滤条件：不是占位应用、已安装、不是系统应用（可选）
+            // 基础过滤
             if (appProxy.isPlaceholder || !appProxy.isInstalled) continue;
             
-            // 可选：过滤掉系统应用（只显示用户应用）
+            // 可选：只显示用户应用（非系统）
             NSString *appType = appProxy.applicationType;
-            if (appType && ![appType isEqualToString:@"User"]) continue;
-            
-            // 额外过滤：排除明显的系统应用（可选）
+            if (appType && ![appType isEqualToString:@"User"] && ![appType isEqualToString:@"System"]) {
+                // 如果既不是 User 也不是 System，可能是第三方但标记为其他，保留
+            }
+            // 排除明显的系统应用
             NSString *bundleID = appProxy.bundleIdentifier;
             if ([bundleID hasPrefix:@"com.apple."]) continue;
             
             id proxy = (id)appProxy;
             
-            // 获取图标（通过 KVC）
+            // 获取图标（KVC）
             UIImage *icon = nil;
             @try {
                 icon = [proxy valueForKey:@"applicationIcon"];
@@ -132,9 +168,9 @@
                 if ([aid isKindOfClass:[NSString class]]) appleID = aid;
             } @catch (NSException *e) {}
             
-            // 主标题：应用名 (版本号)
-            NSString *title = [NSString stringWithFormat:@"%@ (%@)", appProxy.localizedName ?: bundleID, version];
-            // 副标题：Bundle ID | Apple ID
+            // 显示名称
+            NSString *appName = appProxy.localizedName ?: bundleID;
+            NSString *title = [NSString stringWithFormat:@"%@ (%@)", appName, version];
             NSString *subtitle = [NSString stringWithFormat:@"%@ | %@", bundleID, appleID];
             
             PSSpecifier *spec = [PSSpecifier preferenceSpecifierNamed:title
@@ -145,7 +181,7 @@
                                                                   cell:PSSubtitleCell
                                                                   edit:nil];
             [spec setProperty:bundleURL forKey:@"bundleURL"];
-            [spec setProperty:bundleID forKey:@"bundleID"]; // 额外保存 bundleID
+            [spec setProperty:bundleID forKey:@"bundleID"];
             [spec setProperty:@YES forKey:@"enabled"];
             if (icon) [spec setProperty:icon forKey:@"iconImage"];
             [spec setProperty:subtitle forKey:@"subtitle"];
@@ -153,15 +189,15 @@
             [appSpecifiers addObject:spec];
         }
         
-        // 按应用名称排序
+        // 排序
         [appSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier *a, PSSpecifier *b) {
             return [a.name compare:b.name];
         }];
         [_specifiers addObjectsFromArray:appSpecifiers];
         
-        // 如果没有获取到任何应用，添加一个提示项
+        // 如果仍然没有应用，添加一个提示
         if (appSpecifiers.count == 0) {
-            PSSpecifier *noAppSpec = [PSSpecifier preferenceSpecifierNamed:@"No apps found"
+            PSSpecifier *noAppSpec = [PSSpecifier preferenceSpecifierNamed:@"No apps found - check system logs"
                                                                     target:nil
                                                                        set:nil
                                                                        get:nil
@@ -199,7 +235,7 @@
     [self reloadSpecifiers];
 }
 
-#pragma mark - 应用快捷下载（从已安装应用获取 App ID）
+#pragma mark - 应用快捷下载
 
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSString *bundleID = [specifier propertyForKey:@"bundleID"];
@@ -213,7 +249,6 @@
         return;
     }
     
-    // 通过 iTunes API 根据 bundleId 获取 trackId
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software", bundleID]];
     NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:[NSURLRequest requestWithURL:url] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error) {
@@ -253,7 +288,7 @@
     });
 }
 
-#pragma mark - 版本选择与下载核心逻辑
+#pragma mark - 版本选择与下载
 
 - (void)getAllAppVersionIdsFromServer:(long long)appId {
     NSString *serverURL = @"https://apis.bilin.eu.org/history/";
