@@ -36,7 +36,6 @@ static NSCache *iconCache = nil;
     [super loadView];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reloadSpecifiers) name:UIApplicationWillEnterForegroundNotification object:nil];
     
-    // 添加右上角刷新按钮
     UIBarButtonItem *refreshButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshAppList)];
     self.navigationItem.rightBarButtonItem = refreshButton;
 }
@@ -73,16 +72,28 @@ static NSCache *iconCache = nil;
             NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
             appInfo[@"bundleURL"] = appProxy.bundleURL;
             appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
-            appInfo[@"localizedName"] = appProxy.localizedName ?: @"未知";
             
+            // 从 Info.plist 读取应用名称和版本号
             NSString *infoPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"];
             NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
-            NSString *version = infoPlist[@"CFBundleShortVersionString"] ?: infoPlist[@"CFBundleVersion"] ?: @"N/A";
+            
+            // 应用名称：优先 CFBundleDisplayName，其次 CFBundleName，最后使用系统本地化名称或 Bundle ID
+            NSString *displayName = infoPlist[@"CFBundleDisplayName"];
+            NSString *bundleName = infoPlist[@"CFBundleName"];
+            NSString *localizedName = appProxy.localizedName ?: appProxy.bundleIdentifier;
+            NSString *appName = displayName ?: (bundleName ?: localizedName);
+            appInfo[@"localizedName"] = appName;
+            
+            // 版本号：优先 CFBundleShortVersionString，其次 CFBundleVersion
+            NSString *shortVersion = infoPlist[@"CFBundleShortVersionString"];
+            NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
+            NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
             appInfo[@"version"] = version;
+            
             appInfo[@"bundlePath"] = appProxy.bundleURL.path;
             appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
             
-            PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appProxy.localizedName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+            PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
             [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
             [appSpecifier setProperty:@YES forKey:@"enabled"];
             appSpecifier.buttonAction = @selector(downloadAppShortcut:);
@@ -140,7 +151,7 @@ static NSCache *iconCache = nil;
     return cell;
 }
 
-// 关键修改：正确解析嵌套的 accountInfo 和 purchaseDate
+// 显示应用详情（iTunesMetadata.plist 解析）
 - (void)showAppDetails:(UIButton *)sender {
     NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
     if (!appInfo) return;
@@ -170,20 +181,20 @@ static NSCache *iconCache = nil;
     } else {
         NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
         if (metadata) {
-            // 尝试从根目录获取 artistName
             NSString *artist = metadata[@"artistName"] ?: @"未知";
             
-            // 获取 downloadInfo 和 accountInfo
             NSDictionary *downloadInfo = metadata[@"com.apple.iTunesStore.downloadInfo"];
-            NSDictionary *accountInfoDict = downloadInfo[@"accountInfo"];
             NSString *appleID = nil;
             NSString *purchaseDate = nil;
             
-            if (accountInfoDict && [accountInfoDict isKindOfClass:[NSDictionary class]]) {
-                appleID = accountInfoDict[@"AppleID"];
-                purchaseDate = accountInfoDict[@"purchaseDate"];
+            if (downloadInfo && [downloadInfo isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *accountInfoDict = downloadInfo[@"accountInfo"];
+                if (accountInfoDict && [accountInfoDict isKindOfClass:[NSDictionary class]]) {
+                    appleID = accountInfoDict[@"AppleID"];
+                }
+                purchaseDate = downloadInfo[@"purchaseDate"];
             }
-            // 如果嵌套结构不存在，尝试直接从根目录读取（兼容旧格式）
+            // 兼容旧格式
             if (!appleID) appleID = metadata[@"AppleID"];
             if (!purchaseDate) purchaseDate = metadata[@"purchaseDate"];
             
@@ -252,7 +263,7 @@ static NSCache *iconCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能（中文化，无修改）
+#pragma mark - 下载功能（中文化）
 
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
