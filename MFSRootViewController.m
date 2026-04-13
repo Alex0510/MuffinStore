@@ -3,15 +3,15 @@
 #import "CoreServices.h"
 #import <objc/runtime.h>
 
-// 私有扩展，添加搜索控制器和过滤数据源
-@interface MFSRootViewController () <UISearchResultsUpdating>
+// 私有扩展，添加简单的搜索栏作为 tableHeaderView
+@interface MFSRootViewController () <UISearchBarDelegate>
 @property (nonatomic, strong) NSMutableArray *originalSpecifiers;   // 所有原始 specifiers
 @property (nonatomic, strong) NSMutableArray *filteredAppSpecifiers; // 过滤后的应用 specifiers
-@property (nonatomic, strong) UISearchController *searchController;
+@property (nonatomic, strong) UISearchBar *searchBar;
 @property (nonatomic, copy) NSString *searchText;
 @end
 
-// 以下是原有的私有类声明（保持不变）
+// 私有类声明（保持不变）
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
 - (id)_newPurchasesWithItems:(id)items;
@@ -43,19 +43,6 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    // 配置搜索控制器
-    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
-    self.searchController.searchResultsUpdater = self;
-    self.searchController.obscuresBackgroundDuringPresentation = NO;
-    self.searchController.searchBar.placeholder = @"搜索应用";
-    self.searchController.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    self.navigationItem.searchController = self.searchController;
-    self.navigationItem.hidesSearchBarWhenScrolling = NO;
-    self.definesPresentationContext = YES;
-}
-
 - (void)loadView {
     [super loadView];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reloadSpecifiers) name:UIApplicationWillEnterForegroundNotification object:nil];
@@ -67,13 +54,25 @@ static NSCache *groupPathCache = nil;
     // 左上角：直接输入软件ID下载按钮
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
+    
+    // 初始化搜索栏（作为 tableHeaderView，避免与 PSViewController 冲突）
+    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
+    self.searchBar.placeholder = @"搜索应用";
+    self.searchBar.delegate = self;
+    self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
+    self.tableView.tableHeaderView = self.searchBar;
 }
 
-#pragma mark - UISearchResultsUpdating
-- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
-    self.searchText = searchController.searchBar.text;
+#pragma mark - UISearchBarDelegate
+- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+    self.searchText = searchText;
     [self filterAppSpecifiers];
     [self reloadSpecifiers];
+}
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
+    [searchBar resignFirstResponder];
 }
 
 #pragma mark - 过滤应用
@@ -97,7 +96,7 @@ static NSCache *groupPathCache = nil;
                 [self.filteredAppSpecifiers addObject:spec];
             }
         } else {
-            // 非应用的 specifier（下载组、标题组）始终显示
+            // 非应用的分组（下载组、标题组）始终显示
             [self.filteredAppSpecifiers addObject:spec];
         }
     }
@@ -111,7 +110,7 @@ static NSCache *groupPathCache = nil;
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
     self.searchText = @"";
-    self.searchController.searchBar.text = @"";
+    self.searchBar.text = @"";
     [self reloadSpecifiers];
 }
 
@@ -177,6 +176,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSMutableArray*)specifiers {
+    // 懒加载原始数据
     if (!_originalSpecifiers) {
         _originalSpecifiers = [self buildOriginalSpecifiers];
         _filteredAppSpecifiers = [_originalSpecifiers mutableCopy];
@@ -348,6 +348,7 @@ static NSCache *groupPathCache = nil;
                 NSString *identifier = metadata[@"MCMMetadataIdentifier"];
                 if (identifier) {
                     NSString *identifierLower = [identifier lowercaseString];
+                    // 完全匹配 或 后缀匹配 或 包含匹配（大小写不敏感）
                     if ([identifierLower isEqualToString:bundleIdLower] ||
                         [identifierLower hasSuffix:bundleIdLower] ||
                         [identifierLower rangeOfString:bundleIdLower].location != NSNotFound) {
@@ -592,7 +593,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能（完全保留）
+#pragma mark - 下载功能（完全保留，确保所有 UI 操作在主线程）
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
