@@ -66,7 +66,7 @@ static NSCache *iconCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 长按菜单（动态显示应用组目录）
+#pragma mark - 长按菜单（动态显示应用组目录，修复所有应用目录跳转）
 - (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
     UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
     if (existingGesture) {
@@ -96,12 +96,12 @@ static NSCache *iconCache = nil;
     UIAlertAction *launchAction = [UIAlertAction actionWithTitle:@"启动" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self launchAppWithBundleId:bundleId];
     }];
-    // 2. 应用目录
+    // 2. 应用目录（修复所有应用跳转，使用绝对路径和正确的 URL 编码）
     UIAlertAction *appDirAction = [UIAlertAction actionWithTitle:@"应用目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         if (bundlePath && [[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) {
             [self openInFilza:bundlePath];
         } else {
-            [self showAlert:@"错误" message:@"应用目录不存在"];
+            [self showAlert:@"错误" message:[NSString stringWithFormat:@"应用目录不存在:\n%@", bundlePath]];
         }
     }];
     // 3. 数据目录
@@ -121,37 +121,8 @@ static NSCache *iconCache = nil;
         }
     }];
     
-    // 检查是否有应用组目录（使用更可靠的方法）
-    BOOL hasAppGroup = NO;
-    // 方法1：通过 KVC 获取 groupContainerURLs
-    NSArray *groupURLs = nil;
-    if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-        groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-    } else {
-        groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-    }
-    if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
-        hasAppGroup = YES;
-    } else {
-        // 方法2：直接检查 /var/mobile/Containers/Shared/AppGroup 下是否有该应用的组目录（通过 metadata 文件）
-        NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
-        NSFileManager *fm = [NSFileManager defaultManager];
-        if ([fm fileExistsAtPath:appGroupRoot]) {
-            NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
-            for (NSString *dir in subDirs) {
-                NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
-                NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-                if ([fm fileExistsAtPath:metadataPath]) {
-                    NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
-                    NSString *identifier = metadata[@"MCMMetadataIdentifier"];
-                    if ([identifier isEqualToString:bundleId]) {
-                        hasAppGroup = YES;
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    // 检查是否有应用组目录（增强版：同时使用 KVC 和文件扫描）
+    BOOL hasAppGroup = [self appHasGroupContainer:bundleId appProxy:appProxy];
     
     // 按顺序添加按钮
     [actionSheet addAction:launchAction];
@@ -179,6 +150,43 @@ static NSCache *iconCache = nil;
         actionSheet.popoverPresentationController.sourceRect = cell.bounds;
     }
     [self presentViewController:actionSheet animated:YES completion:nil];
+}
+
+// 增强版应用组检测（支持更多 App）
+- (BOOL)appHasGroupContainer:(NSString *)bundleId appProxy:(id)appProxy {
+    // 方法1：通过 LSApplicationProxy 的 groupContainerURLs
+    NSArray *groupURLs = nil;
+    @try {
+        if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+            groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+        } else {
+            groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+        }
+    } @catch (NSException *exception) {
+        groupURLs = nil;
+    }
+    if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
+        return YES;
+    }
+    
+    // 方法2：扫描 /var/mobile/Containers/Shared/AppGroup 目录
+    NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:appGroupRoot]) {
+        NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
+        for (NSString *dir in subDirs) {
+            NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
+            NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+            if ([fm fileExistsAtPath:metadataPath]) {
+                NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+                NSString *identifier = metadata[@"MCMMetadataIdentifier"];
+                if ([identifier isEqualToString:bundleId]) {
+                    return YES;
+                }
+            }
+        }
+    }
+    return NO;
 }
 
 // 查找数据容器路径
@@ -209,24 +217,27 @@ static NSCache *iconCache = nil;
     }
 }
 
-// 修复 Filza 跳转：使用 filza:/// 绝对路径格式
+// 修复 Filza 跳转：使用 filza:// 绝对路径格式（三个斜杠）
 - (void)openInFilza:(NSString *)path {
     if (!path || path.length == 0) {
         [self showAlert:@"错误" message:@"路径无效"];
         return;
     }
+    // 检查路径是否存在
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
         [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不存在:\n%@", path]];
         return;
     }
+    // 对路径进行 URL 编码，确保特殊字符（如空格、中文）正确处理
     NSString *encodedPath = [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+    // Filza URL Scheme 格式：filza:///absolute/path
     NSString *urlString = [NSString stringWithFormat:@"filza://%@", encodedPath];
     NSURL *url = [NSURL URLWithString:urlString];
     if ([[UIApplication sharedApplication] canOpenURL:url]) {
         [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL success) {
             if (!success) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装最新版Filza"];
+                    [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装最新版Filza并授权"];
                 });
             }
         }];
@@ -267,10 +278,14 @@ static NSCache *iconCache = nil;
         }
         // 应用组目录
         NSArray *groupURLs = nil;
-        if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-            groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-        } else {
-            groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+        @try {
+            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+            } else {
+                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+            }
+        } @catch (NSException *exception) {
+            groupURLs = nil;
         }
         if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
             for (NSURL *groupURL in groupURLs) {
