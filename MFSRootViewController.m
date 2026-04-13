@@ -541,34 +541,55 @@ static NSCache *groupPathCache = nil;
         fileExists = YES;
     }
     
-    NSString *accountInfoStr;
-    if (!fileExists) {
-        accountInfoStr = [NSString stringWithFormat:@"未找到 iTunesMetadata.plist\n尝试路径:\n%@\n%@", metadataPath1, metadataPath2];
-    } else {
+    // 默认值
+    NSString *appleID = @"未知";
+    NSString *artist = @"未知";
+    NSString *purchaseDate = @"未知";
+    NSString *appIdStr = @"未知";
+    
+    if (fileExists) {
         NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
         if (metadata) {
-            NSString *artist = metadata[@"artistName"] ?: @"未知";
+            // 开发者
+            artist = metadata[@"artistName"] ?: @"未知";
+            
+            // 尝试从 downloadInfo 获取
             NSDictionary *downloadInfo = metadata[@"com.apple.iTunesStore.downloadInfo"];
-            NSString *appleID = nil;
-            NSString *purchaseDate = nil;
             if (downloadInfo && [downloadInfo isKindOfClass:[NSDictionary class]]) {
                 NSDictionary *accountInfoDict = downloadInfo[@"accountInfo"];
                 if (accountInfoDict && [accountInfoDict isKindOfClass:[NSDictionary class]]) {
-                    appleID = accountInfoDict[@"AppleID"];
+                    appleID = accountInfoDict[@"AppleID"] ?: @"未知";
                 }
-                purchaseDate = downloadInfo[@"purchaseDate"];
+                purchaseDate = downloadInfo[@"purchaseDate"] ?: @"未知";
             }
-            if (!appleID) appleID = metadata[@"AppleID"];
-            if (!purchaseDate) purchaseDate = metadata[@"purchaseDate"];
-            if (!appleID) appleID = @"未知";
-            if (!purchaseDate) purchaseDate = @"未知";
-            accountInfoStr = [NSString stringWithFormat:@"Apple ID: %@\n开发者: %@\n购买日期: %@", appleID, artist, purchaseDate];
+            
+            // 如果上面没获取到，尝试直接从根字典获取
+            if ([appleID isEqualToString:@"未知"]) appleID = metadata[@"AppleID"] ?: @"未知";
+            if ([purchaseDate isEqualToString:@"未知"]) purchaseDate = metadata[@"purchaseDate"] ?: @"未知";
+            
+            // 获取 App ID (trackId)
+            // 字段可能是 itemId, appleId, adamId 等
+            if (downloadInfo[@"itemId"]) {
+                appIdStr = [downloadInfo[@"itemId"] stringValue];
+            } else if (metadata[@"itemId"]) {
+                appIdStr = [metadata[@"itemId"] stringValue];
+            } else if (metadata[@"appleId"]) {
+                appIdStr = [metadata[@"appleId"] stringValue];
+            } else if (metadata[@"adamId"]) {
+                appIdStr = [metadata[@"adamId"] stringValue];
+            } else {
+                appIdStr = @"未知";
+            }
         } else {
-            accountInfoStr = [NSString stringWithFormat:@"文件存在但无法解析:\n%@", metadataPath];
+            appIdStr = @"解析失败";
         }
+    } else {
+        appIdStr = @"未找到 metadata";
     }
     
+    NSString *accountInfoStr = [NSString stringWithFormat:@"App ID: %@\nApple ID: %@\n开发者: %@\n购买日期: %@", appIdStr, appleID, artist, purchaseDate];
     NSString *message = [NSString stringWithFormat:@"路径: %@\n\nBundle ID: %@\n版本: %@\n\n%@", bundlePath, bundleId, version, accountInfoStr];
+    
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"应用详情" message:message preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
@@ -617,7 +638,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能（核心修改：增加降级处理）
+#pragma mark - 下载功能（含降级处理）
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
@@ -642,18 +663,16 @@ static NSCache *groupPathCache = nil;
         }
         NSArray* results = json[@"results"];
         if(results.count == 0) {
-            // ========== 关键修改：API 无结果时提供降级选项 ==========
+            // 降级：提供手动输入或从服务器获取
             dispatch_async(dispatch_get_main_queue(), ^{
                 UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"未找到应用"
                                                                                message:[NSString stringWithFormat:@"iTunes API 未返回结果。\n\n你可以手动输入版本ID，或从历史版本服务器获取列表。"]
                                                                         preferredStyle:UIAlertControllerStyleAlert];
                 [alert addAction:[UIAlertAction actionWithTitle:@"手动输入版本ID" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    // 由于没有 appId，先尝试通过 bundleId 获取一次 appId（备用的备用）
                     [self fetchAppIdForBundleId:bundleId completion:^(long long appId) {
                         if (appId != 0) {
                             [self promptForVersionId:appId];
                         } else {
-                            // 实在获取不到，直接让用户输入 appId 和 versionId
                             [self promptForAppIdAndVersionIdManually];
                         }
                     }];
@@ -680,7 +699,6 @@ static NSCache *groupPathCache = nil;
     [task resume];
 }
 
-// 新增辅助方法：通过 bundleId 获取 appId（备用）
 - (void)fetchAppIdForBundleId:(NSString *)bundleId completion:(void(^)(long long appId))completion {
     NSURL* url = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software", bundleId]];
     NSURLRequest* request = [NSURLRequest requestWithURL:url];
@@ -700,7 +718,6 @@ static NSCache *groupPathCache = nil;
     [task resume];
 }
 
-// 完全手动输入 App ID 和版本 ID
 - (void)promptForAppIdAndVersionIdManually {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"手动输入" message:@"请输入 App ID (trackId) 和版本 ID (external_identifier)" preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
