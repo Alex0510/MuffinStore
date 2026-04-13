@@ -1,5 +1,4 @@
-// MFSRootViewController.m （终极完整融合版）
-
+// MFSRootViewController.m
 #import "MFSRootViewController.h"
 #import "CoreServices.h"
 #import <objc/runtime.h>
@@ -7,7 +6,8 @@
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
 - (id)_newPurchasesWithItems:(id)items;
-- (void)_performPurchases:(id)purchases hasBundlePurchase:(_Bool)purchase withClientContext:(id)context completionBlock:(id)block;
+- (void)_performPurchases:(id)purchases hasBundlePurchase:(_Bool)purchase withClientContext:(id)context completionBlock:(id /* block */)block;
+- (void)_performSoftwarePurchases:(id)purchases withClientContext:(id)context completionBlock:(id /* block */)block;
 @end
 
 @interface SKUIItem : NSObject
@@ -22,38 +22,27 @@
 + (id)defaultContext;
 @end
 
-static NSCache *iconCache;
-static NSCache *groupPathCache;
+static NSCache *iconCache = nil;
+static NSCache *groupPathCache = nil;
 
 @implementation MFSRootViewController
 
-#pragma mark - 初始化
-
 + (void)initialize {
     if (self == [MFSRootViewController class]) {
-        iconCache = [NSCache new];
-        groupPathCache = [NSCache new];
+        iconCache = [[NSCache alloc] init];
+        groupPathCache = [[NSCache alloc] init];
     }
 }
 
-#pragma mark - UI
-
 - (void)loadView {
     [super loadView];
-
-    UIBarButtonItem *refresh = [[UIBarButtonItem alloc]
-        initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
-        target:self
-        action:@selector(refreshAppList)];
-
-    UIBarButtonItem *idDownload = [[UIBarButtonItem alloc]
-        initWithTitle:@"ID下载"
-        style:UIBarButtonItemStylePlain
-        target:self
-        action:@selector(promptForAppIdDownload)];
-
-    self.navigationItem.rightBarButtonItem = refresh;
-    self.navigationItem.leftBarButtonItem = idDownload;
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reloadSpecifiers) name:UIApplicationWillEnterForegroundNotification object:nil];
+    
+    UIBarButtonItem *refreshButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshAppList)];
+    self.navigationItem.rightBarButtonItem = refreshButton;
+    
+    UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
+    self.navigationItem.leftBarButtonItem = idDownloadButton;
 }
 
 - (void)refreshAppList {
@@ -63,239 +52,684 @@ static NSCache *groupPathCache;
     [self reloadSpecifiers];
 }
 
-#pragma mark - Filza 修复（关键）
+#pragma mark - 左上角按钮：直接输入软件ID查询版本并下载
+- (void)promptForAppIdDownload {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"输入软件ID" message:@"请输入App的Apple ID (trackId)" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"例如: 310633997";
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    UIAlertAction *confirmAction = [UIAlertAction actionWithTitle:@"查询版本" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *appIdStr = alert.textFields.firstObject.text;
+        if (appIdStr.length > 0) {
+            long long appId = [appIdStr longLongValue];
+            [self getAllAppVersionIdsAndPrompt:appId];
+        } else {
+            [self showAlert:@"错误" message:@"软件ID不能为空"];
+        }
+    }];
+    [alert addAction:confirmAction];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
 
+#pragma mark - 长按菜单
+- (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
+    UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
+    if (existingGesture) {
+        [cell removeGestureRecognizer:existingGesture];
+    }
+    UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPress:)];
+    longPress.minimumPressDuration = 0.6;
+    [cell addGestureRecognizer:longPress];
+    objc_setAssociatedObject(cell, "longPressGesture", longPress, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, "appInfo", appInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, "specifier", specifier, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (void)handleLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+    UITableViewCell *cell = (UITableViewCell *)gesture.view;
+    NSDictionary *appInfo = objc_getAssociatedObject(cell, "appInfo");
+    if (!appInfo) return;
+    
+    NSString *bundleId = appInfo[@"bundleIdentifier"];
+    NSString *bundlePath = appInfo[@"bundlePath"];
+    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    
+    UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    
+    UIAlertAction *launchAction = [UIAlertAction actionWithTitle:@"启动" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self launchAppWithBundleId:bundleId];
+    }];
+    UIAlertAction *appDirAction = [UIAlertAction actionWithTitle:@"应用目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        if (bundlePath && [[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) {
+            [self openInFilza:bundlePath];
+        } else {
+            [self showAlert:@"错误" message:[NSString stringWithFormat:@"应用目录不存在:\n%@", bundlePath]];
+        }
+    }];
+    UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *dataPath = [self getDataContainerPathForBundleId:bundleId appProxy:appProxy];
+        if (dataPath && [[NSFileManager defaultManager] fileExistsAtPath:dataPath]) {
+            [self openInFilza:dataPath];
+        } else {
+            [self showAlert:@"错误" message:@"无法找到数据目录，请确保应用已运行过"];
+        }
+    }];
+    
+    NSString *groupPath = [self getFirstGroupContainerPathForBundleId:bundleId appProxy:appProxy];
+    BOOL hasAppGroup = (groupPath != nil);
+    
+    [actionSheet addAction:launchAction];
+    [actionSheet addAction:appDirAction];
+    [actionSheet addAction:dataAction];
+    
+    if (hasAppGroup) {
+        UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            [self openInFilza:groupPath];
+        }];
+        [actionSheet addAction:appGroupAction];
+    }
+    
+    UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"清理数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self confirmClearDataForAppProxy:appProxy bundleId:bundleId];
+    }];
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    
+    [actionSheet addAction:clearDataAction];
+    [actionSheet addAction:cancelAction];
+    
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        actionSheet.popoverPresentationController.sourceView = cell;
+        actionSheet.popoverPresentationController.sourceRect = cell.bounds;
+    }
+    [self presentViewController:actionSheet animated:YES completion:nil];
+}
+
+- (NSString *)getDataContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
+    NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
+    if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
+        NSString *path = [(NSURL *)dataContainerURL path];
+        if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            return path;
+        }
+    }
+    return [self findDataContainerPathForBundleId:bundleId];
+}
+
+- (NSString *)findDataContainerPathForBundleId:(NSString *)bundleId {
+    NSString *dataRoot = @"/var/mobile/Containers/Data/Application";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *subDirs = [fm contentsOfDirectoryAtPath:dataRoot error:nil];
+    for (NSString *dir in subDirs) {
+        NSString *appDir = [dataRoot stringByAppendingPathComponent:dir];
+        NSString *metadataPlist = [appDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        if ([fm fileExistsAtPath:metadataPlist]) {
+            NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPlist];
+            NSString *mcBundleId = metadata[@"MCMMetadataIdentifier"];
+            if ([mcBundleId isEqualToString:bundleId]) {
+                return appDir;
+            }
+        }
+    }
+    return nil;
+}
+
+// 增强版应用组路径查找（支持QQ等）
+- (NSString *)getFirstGroupContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
+    // 缓存
+    NSString *cached = [groupPathCache objectForKey:bundleId];
+    if (cached && [[NSFileManager defaultManager] fileExistsAtPath:cached]) {
+        return cached;
+    } else if (cached) {
+        [groupPathCache removeObjectForKey:bundleId];
+    }
+    
+    // 方法1：官方 API
+    NSArray *groupURLs = nil;
+    @try {
+        if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+            groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+        } else {
+            groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+        }
+    } @catch (NSException *e) {}
+    if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
+        for (NSURL *url in groupURLs) {
+            if ([url isKindOfClass:[NSURL class]] && [[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
+                [groupPathCache setObject:url.path forKey:bundleId];
+                return url.path;
+            }
+        }
+    }
+    
+    // 方法2：扫描 AppGroup 目录
+    NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:appGroupRoot]) return nil;
+    
+    NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
+    NSString *bundleIdLower = [bundleId lowercaseString];
+    
+    for (NSString *dir in subDirs) {
+        NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
+        NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        if (![fm fileExistsAtPath:metadataPath]) continue;
+        
+        NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+        NSString *identifier = metadata[@"MCMMetadataIdentifier"];
+        if (!identifier) continue;
+        
+        NSString *idLower = [identifier lowercaseString];
+        
+        // 多种匹配规则
+        if ([idLower isEqualToString:bundleIdLower]) {
+            [groupPathCache setObject:groupDir forKey:bundleId];
+            return groupDir;
+        }
+        
+        // 去掉 "group." 前缀
+        NSString *idWithoutGroup = [idLower hasPrefix:@"group."] ? [idLower substringFromIndex:6] : idLower;
+        if ([idWithoutGroup isEqualToString:bundleIdLower]) {
+            [groupPathCache setObject:groupDir forKey:bundleId];
+            return groupDir;
+        }
+        
+        // 后缀匹配（如 group.com.tencent.QQExtension 匹配 com.tencent.qq）
+        if ([idLower hasSuffix:bundleIdLower]) {
+            [groupPathCache setObject:groupDir forKey:bundleId];
+            return groupDir;
+        }
+        
+        // 前缀匹配
+        if ([bundleIdLower hasPrefix:idLower] || [idLower hasPrefix:bundleIdLower]) {
+            [groupPathCache setObject:groupDir forKey:bundleId];
+            return groupDir;
+        }
+        
+        // 包含匹配（避免短ID误匹配，要求 bundleId 长度 >= 5）
+        if (bundleIdLower.length >= 5 && [idLower rangeOfString:bundleIdLower].location != NSNotFound) {
+            [groupPathCache setObject:groupDir forKey:bundleId];
+            return groupDir;
+        }
+    }
+    
+    // 降级：目录名包含 bundleId
+    for (NSString *dir in subDirs) {
+        if ([[dir lowercaseString] containsString:bundleIdLower]) {
+            NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
+            [groupPathCache setObject:groupDir forKey:bundleId];
+            return groupDir;
+        }
+    }
+    
+    return nil;
+}
+
+#pragma mark - 辅助功能
+- (void)launchAppWithBundleId:(NSString *)bundleId {
+    LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
+    BOOL success = [workspace openApplicationWithBundleID:bundleId];
+    if (!success) {
+        [self showAlert:@"错误" message:@"无法启动该应用"];
+    }
+}
+
+// 终极可靠的 Filza 跳转方法
 - (void)openInFilza:(NSString *)path {
     if (!path.length) {
         [self showAlert:@"错误" message:@"路径无效"];
         return;
     }
-
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        [self showAlert:@"错误" message:@"路径不存在"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) {
+        [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不存在:\n%@", path]];
         return;
     }
-
-    NSString *encoded = [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"filza://%@", encoded]];
-
-    UIApplication *app = UIApplication.sharedApplication;
-
-    if ([app canOpenURL:url]) {
-        [app openURL:url options:@{} completionHandler:nil];
+    
+    // 方法：先构造标准的 file:// URL，再替换 scheme 为 filza://
+    NSURL *fileURL = [NSURL fileURLWithPath:path];
+    NSString *fileURLString = fileURL.absoluteString;  // 格式 file:///path
+    NSString *filzaURLString = [fileURLString stringByReplacingOccurrencesOfString:@"file://" withString:@"filza://"];
+    NSURL *filzaURL = [NSURL URLWithString:filzaURLString];
+    
+    if (filzaURL && [[UIApplication sharedApplication] canOpenURL:filzaURL]) {
+        [[UIApplication sharedApplication] openURL:filzaURL options:@{} completionHandler:^(BOOL success) {
+            if (!success) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装最新版Filza并授权"];
+                });
+            }
+        }];
     } else {
-        NSURL *fallback = [NSURL URLWithString:[NSString stringWithFormat:@"filza://%@", path]];
-        [app openURL:fallback options:@{} completionHandler:nil];
+        [self showAlert:@"错误" message:@"未安装Filza文件管理器或URL Scheme不支持"];
     }
 }
 
-#pragma mark - AppGroup（增强）
-
-- (NSArray *)getAllGroupPaths:(NSString *)bundleId appProxy:(id)appProxy {
-    NSMutableArray *arr = [NSMutableArray array];
-    NSFileManager *fm = NSFileManager.defaultManager;
-
-    @try {
-        NSArray *urls = [appProxy valueForKey:@"groupContainerURLs"];
-        for (NSURL *url in urls) {
-            if ([fm fileExistsAtPath:url.path]) {
-                [arr addObject:url.path];
-            }
-        }
-    } @catch (NSException *e) {}
-
-    NSString *root = @"/var/mobile/Containers/Shared/AppGroup";
-    NSArray *dirs = [fm contentsOfDirectoryAtPath:root error:nil];
-    NSString *lower = bundleId.lowercaseString;
-
-    for (NSString *dir in dirs) {
-        NSString *full = [root stringByAppendingPathComponent:dir];
-        NSString *meta = [full stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-
-        NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:meta];
-        NSString *idStr = [plist[@"MCMMetadataIdentifier"] lowercaseString];
-
-        if (!idStr) continue;
-
-        if ([idStr containsString:lower] || [lower containsString:idStr]) {
-            if (![arr containsObject:full]) {
-                [arr addObject:full];
-            }
-        }
-    }
-
-    return arr;
+- (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self performClearDataForAppProxy:appProxy bundleId:bundleId];
+    }];
+    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    [confirm addAction:clear];
+    [confirm addAction:cancel];
+    [self presentViewController:confirm animated:YES completion:nil];
 }
 
-- (void)showAllAppGroups:(NSString *)bundleId appProxy:(id)appProxy {
-    NSArray *groups = [self getAllGroupPaths:bundleId appProxy:appProxy];
+- (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *dataPath = [self getDataContainerPathForBundleId:bundleId appProxy:appProxy];
+        if (dataPath && [fm fileExistsAtPath:dataPath]) {
+            for (NSString *item in [fm contentsOfDirectoryAtPath:dataPath error:nil]) {
+                [fm removeItemAtPath:[dataPath stringByAppendingPathComponent:item] error:nil];
+            }
+        }
+        NSArray *groupURLs = nil;
+        @try {
+            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+            } else {
+                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+            }
+        } @catch (NSException *e) {}
+        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
+            for (NSURL *groupURL in groupURLs) {
+                if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
+                    for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
+                        [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
+                    }
+                }
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showAlert:@"完成" message:@"数据已清理，应用可能需要重启才能生效"];
+        });
+    });
+}
 
-    if (groups.count == 0) {
-        [self showAlert:@"提示" message:@"没有 AppGroup"];
-        return;
+#pragma mark - 原有代码（保持不变）
+- (NSMutableArray*)specifiers {
+    if(!_specifiers) {
+        _specifiers = [NSMutableArray new];
+        
+        PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+        downloadGroupSpecifier.name = @"下载";
+        [_specifiers addObject:downloadGroupSpecifier];
+        
+        PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+        downloadSpecifier.identifier = @"download";
+        [downloadSpecifier setProperty:@YES forKey:@"enabled"];
+        downloadSpecifier.buttonAction = @selector(downloadApp);
+        [_specifiers addObject:downloadSpecifier];
+        
+        NSString* aboutText = [self getAboutText];
+        [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
+        
+        PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+        installedGroupSpecifier.name = @"已安装应用";
+        [_specifiers addObject:installedGroupSpecifier];
+        
+        NSMutableArray *appSpecifiers = [NSMutableArray new];
+        [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
+            NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
+            appInfo[@"bundleURL"] = appProxy.bundleURL;
+            appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
+            
+            NSString *infoPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+            
+            NSString *displayName = infoPlist[@"CFBundleDisplayName"];
+            NSString *bundleName = infoPlist[@"CFBundleName"];
+            NSString *localizedName = appProxy.localizedName ?: appProxy.bundleIdentifier;
+            NSString *appName = displayName ?: (bundleName ?: localizedName);
+            appInfo[@"localizedName"] = appName;
+            
+            NSString *shortVersion = infoPlist[@"CFBundleShortVersionString"];
+            NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
+            NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
+            appInfo[@"version"] = version;
+            
+            appInfo[@"bundlePath"] = appProxy.bundleURL.path;
+            appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
+            
+            PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+            [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
+            [appSpecifier setProperty:@YES forKey:@"enabled"];
+            appSpecifier.buttonAction = @selector(downloadAppShortcut:);
+            [appSpecifier setProperty:appInfo forKey:@"appInfo"];
+            [appSpecifiers addObject:appSpecifier];
+        }];
+        
+        [appSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier* a, PSSpecifier* b) {
+            return [a.name compare:b.name];
+        }];
+        [_specifiers addObjectsFromArray:appSpecifiers];
     }
+    self.navigationItem.title = @"MuffinStore";
+    return _specifiers;
+}
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"AppGroup"
-                                                                   message:nil
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-
-    for (NSString *path in groups) {
-        [alert addAction:[UIAlertAction actionWithTitle:path.lastPathComponent
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(UIAlertAction *a) {
-            [self openInFilza:path];
-        }]];
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
+    PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];
+    NSDictionary *appInfo = [specifier propertyForKey:@"appInfo"];
+    
+    if (appInfo && specifier.identifier != nil && ![specifier.identifier isEqualToString:@"download"]) {
+        cell.textLabel.text = appInfo[@"localizedName"];
+        NSString *version = appInfo[@"version"];
+        NSString *bundleId = appInfo[@"bundleIdentifier"];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"v%@ • %@", version, bundleId];
+        cell.detailTextLabel.textColor = [UIColor grayColor];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
+        
+        UIImage *icon = [iconCache objectForKey:bundleId];
+        if (!icon) {
+            icon = [self loadIconForAppAtPath:appInfo[@"bundlePath"]];
+            if (icon) {
+                [iconCache setObject:icon forKey:bundleId];
+            } else {
+                icon = [UIImage imageNamed:@"AppIconPlaceholder"];
+            }
+        }
+        cell.imageView.image = icon;
+        cell.imageView.layer.cornerRadius = 8;
+        cell.imageView.clipsToBounds = YES;
+        
+        UIButton *infoButton = [UIButton buttonWithType:UIButtonTypeDetailDisclosure];
+        [infoButton addTarget:self action:@selector(showAppDetails:) forControlEvents:UIControlEventTouchUpInside];
+        objc_setAssociatedObject(infoButton, "appInfo", appInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        cell.accessoryView = infoButton;
+        cell.selectionStyle = UITableViewCellSelectionStyleBlue;
+        
+        [self addLongPressGestureForCell:cell appInfo:appInfo specifier:specifier];
+    } else {
+        cell.accessoryView = nil;
+        cell.detailTextLabel.text = nil;
+        cell.imageView.image = nil;
     }
+    return cell;
+}
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:1 handler:nil]];
+- (void)showAppDetails:(UIButton *)sender {
+    NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
+    if (!appInfo) return;
+    
+    NSString *bundlePath = appInfo[@"bundlePath"];
+    NSString *containerPath = appInfo[@"containerPath"];
+    NSString *bundleId = appInfo[@"bundleIdentifier"];
+    NSString *version = appInfo[@"version"];
+    
+    NSString *metadataPath1 = [containerPath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
+    NSString *metadataPath2 = [bundlePath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
+    
+    NSString *metadataPath = nil;
+    BOOL fileExists = NO;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:metadataPath1]) {
+        metadataPath = metadataPath1;
+        fileExists = YES;
+    } else if ([[NSFileManager defaultManager] fileExistsAtPath:metadataPath2]) {
+        metadataPath = metadataPath2;
+        fileExists = YES;
+    }
+    
+    NSString *accountInfoStr;
+    if (!fileExists) {
+        accountInfoStr = [NSString stringWithFormat:@"未找到 iTunesMetadata.plist\n尝试路径:\n%@\n%@", metadataPath1, metadataPath2];
+    } else {
+        NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+        if (metadata) {
+            NSString *artist = metadata[@"artistName"] ?: @"未知";
+            NSDictionary *downloadInfo = metadata[@"com.apple.iTunesStore.downloadInfo"];
+            NSString *appleID = nil;
+            NSString *purchaseDate = nil;
+            if (downloadInfo && [downloadInfo isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *accountInfoDict = downloadInfo[@"accountInfo"];
+                if (accountInfoDict && [accountInfoDict isKindOfClass:[NSDictionary class]]) {
+                    appleID = accountInfoDict[@"AppleID"];
+                }
+                purchaseDate = downloadInfo[@"purchaseDate"];
+            }
+            if (!appleID) appleID = metadata[@"AppleID"];
+            if (!purchaseDate) purchaseDate = metadata[@"purchaseDate"];
+            if (!appleID) appleID = @"未知";
+            if (!purchaseDate) purchaseDate = @"未知";
+            accountInfoStr = [NSString stringWithFormat:@"Apple ID: %@\n开发者: %@\n购买日期: %@", appleID, artist, purchaseDate];
+        } else {
+            accountInfoStr = [NSString stringWithFormat:@"文件存在但无法解析:\n%@", metadataPath];
+        }
+    }
+    
+    NSString *message = [NSString stringWithFormat:@"路径: %@\n\nBundle ID: %@\n版本: %@\n\n%@", bundlePath, bundleId, version, accountInfoStr];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"应用详情" message:message preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 数据路径
-
-- (NSString *)getDataContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
-    NSURL *url = [appProxy valueForKey:@"dataContainerURL"];
-    if ([url isKindOfClass:NSURL.class]) {
-        return url.path;
+- (UIImage *)loadIconForAppAtPath:(NSString *)bundlePath {
+    NSString *infoPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
+    NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+    if (!infoPlist) return nil;
+    
+    NSArray *iconFiles = nil;
+    NSDictionary *bundleIcons = infoPlist[@"CFBundleIcons"];
+    if (bundleIcons) {
+        NSDictionary *primaryIcon = bundleIcons[@"CFBundlePrimaryIcon"];
+        iconFiles = primaryIcon[@"CFBundleIconFiles"];
+    }
+    if (!iconFiles.count) {
+        iconFiles = infoPlist[@"CFBundleIconFiles"];
+    }
+    if (!iconFiles.count) {
+        NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:bundlePath error:nil];
+        for (NSString *file in contents) {
+            if ([file containsString:@"AppIcon"] && [file hasSuffix:@".png"]) {
+                iconFiles = @[file];
+                break;
+            }
+        }
+    }
+    
+    if (iconFiles.count) {
+        NSString *iconName = [iconFiles lastObject];
+        if (![iconName containsString:@".png"]) {
+            iconName = [iconName stringByAppendingString:@".png"];
+        }
+        NSString *iconPath = [bundlePath stringByAppendingPathComponent:iconName];
+        UIImage *icon = [UIImage imageWithContentsOfFile:iconPath];
+        if (icon) {
+            CGSize newSize = CGSizeMake(30, 30);
+            UIGraphicsBeginImageContextWithOptions(newSize, NO, 0.0);
+            [icon drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
+            UIImage *scaledIcon = UIGraphicsGetImageFromCurrentImageContext();
+            UIGraphicsEndImageContext();
+            return scaledIcon;
+        }
     }
     return nil;
 }
 
-#pragma mark - 备份 & 恢复
-
-- (void)backupAppData:(NSString *)bundleId appProxy:(id)appProxy {
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        NSString *data = [self getDataContainerPathForBundleId:bundleId appProxy:appProxy];
-        NSString *backupDir = @"/var/mobile/Documents/MuffinBackup";
-
-        NSFileManager *fm = NSFileManager.defaultManager;
-        [fm createDirectoryAtPath:backupDir withIntermediateDirectories:YES attributes:nil error:nil];
-
-        NSString *target = [backupDir stringByAppendingPathComponent:bundleId];
-        [fm removeItemAtPath:target error:nil];
-
-        if (data) {
-            [fm copyItemAtPath:data toPath:target error:nil];
-        }
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self showAlert:@"完成" message:@"备份完成"];
-        });
-    });
-}
-
-- (void)restoreAppData:(NSString *)bundleId appProxy:(id)appProxy {
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        NSString *backup = [@"/var/mobile/Documents/MuffinBackup" stringByAppendingPathComponent:bundleId];
-        NSString *data = [self getDataContainerPathForBundleId:bundleId appProxy:appProxy];
-
-        NSFileManager *fm = NSFileManager.defaultManager;
-
-        if (![fm fileExistsAtPath:backup]) {
+#pragma mark - 下载功能
+- (void)downloadAppShortcut:(PSSpecifier*)specifier {
+    NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
+    NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
+    NSString* bundleId = infoPlist[@"CFBundleIdentifier"];
+    NSURL* url = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software", bundleId]];
+    NSURLRequest* request = [NSURLRequest requestWithURL:url];
+    NSURLSessionDataTask* task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+        if(error) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlert:@"错误" message:@"没有备份"];
+                [self showAlert:@"错误" message:error.localizedDescription];
             });
             return;
         }
-
-        for (NSString *f in [fm contentsOfDirectoryAtPath:data error:nil]) {
-            [fm removeItemAtPath:[data stringByAppendingPathComponent:f] error:nil];
+        NSError* jsonError = nil;
+        NSDictionary* json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+        if(jsonError) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlert:@"JSON解析错误" message:jsonError.localizedDescription];
+            });
+            return;
         }
-
-        for (NSString *f in [fm contentsOfDirectoryAtPath:backup error:nil]) {
-            [fm copyItemAtPath:[backup stringByAppendingPathComponent:f]
-                        toPath:[data stringByAppendingPathComponent:f]
-                         error:nil];
+        NSArray* results = json[@"results"];
+        if(results.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlert:@"错误" message:@"无结果"];
+            });
+            return;
         }
+        NSDictionary* app = results[0];
+        [self getAllAppVersionIdsAndPrompt:[app[@"trackId"] longLongValue]];
+    }];
+    [task resume];
+}
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self showAlert:@"完成" message:@"恢复完成"];
-        });
+- (NSString*)getAboutText {
+    return @"MuffinStore v1.2 (增强版)\n作者 Mineek\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
+}
+
+- (void)showAlert:(NSString*)title message:(NSString*)message {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController* alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
     });
 }
 
-#pragma mark - 长按菜单（增强）
-
-- (void)handleLongPress:(UILongPressGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateBegan) return;
-
-    UITableViewCell *cell = (UITableViewCell *)g.view;
-    NSDictionary *appInfo = objc_getAssociatedObject(cell, "appInfo");
-
-    NSString *bundleId = appInfo[@"bundleIdentifier"];
-    id proxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
-
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"]
-                                                                  message:nil
-                                                           preferredStyle:0];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"启动" style:0 handler:^(id a){
-        [[LSApplicationWorkspace defaultWorkspace] openApplicationWithBundleID:bundleId];
-    }]];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"应用目录" style:0 handler:^(id a){
-        [self openInFilza:appInfo[@"bundlePath"]];
-    }]];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"数据目录" style:0 handler:^(id a){
-        [self openInFilza:[self getDataContainerPathForBundleId:bundleId appProxy:proxy]];
-    }]];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"应用组目录" style:0 handler:^(id a){
-        [self showAllAppGroups:bundleId appProxy:proxy];
-    }]];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"备份数据" style:0 handler:^(id a){
-        [self backupAppData:bundleId appProxy:proxy];
-    }]];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"恢复数据" style:0 handler:^(id a){
-        [self restoreAppData:bundleId appProxy:proxy];
-    }]];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"清理数据" style:2 handler:^(id a){
-        [self performClearDataForAppProxy:proxy bundleId:bundleId];
-    }]];
-
-    [menu addAction:[UIAlertAction actionWithTitle:@"取消" style:1 handler:nil]];
-
-    [self presentViewController:menu animated:YES completion:nil];
+- (void)getAllAppVersionIdsFromServer:(long long)appId {
+    NSString* serverURL = @"https://apis.bilin.eu.org/history/";
+    NSURL* url = [NSURL URLWithString:[NSString stringWithFormat:@"%@%lld", serverURL, appId]];
+    NSURLRequest* request = [NSURLRequest requestWithURL:url];
+    NSURLSessionDataTask* task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+        if(error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlert:@"错误" message:error.localizedDescription];
+            });
+            return;
+        }
+        NSError* jsonError = nil;
+        NSDictionary* json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+        if(jsonError) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlert:@"JSON解析错误" message:jsonError.debugDescription];
+            });
+            return;
+        }
+        NSArray* versionIds = json[@"data"];
+        if(versionIds.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlert:@"错误" message:@"没有获取到版本ID，可能是内部错误"];
+            });
+            return;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请选择要下载的应用版本ID" preferredStyle:UIAlertControllerStyleActionSheet];
+            for(NSDictionary* versionId in versionIds) {
+                UIAlertAction* versionAction = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@", versionId[@"bundle_version"]] style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+                    [self downloadAppWithAppId:appId versionId:[versionId[@"external_identifier"] longLongValue]];
+                }];
+                [versionAlert addAction:versionAction];
+            }
+            UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+            [versionAlert addAction:cancelAction];
+            if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+                versionAlert.popoverPresentationController.sourceView = self.view;
+                versionAlert.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 0, 0);
+            }
+            [self presentViewController:versionAlert animated:YES completion:nil];
+        });
+    }];
+    [task resume];
 }
 
-#pragma mark - 下载功能（完整保留）
+- (void)promptForVersionId:(long long)appId {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请输入要下载的应用版本ID" preferredStyle:UIAlertControllerStyleAlert];
+        [versionAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
+            textField.placeholder = @"版本ID";
+        }];
+        UIAlertAction* downloadAction = [UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+            long long versionId = [versionAlert.textFields.firstObject.text longLongValue];
+            [self downloadAppWithAppId:appId versionId:versionId];
+        }];
+        [versionAlert addAction:downloadAction];
+        [versionAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:versionAlert animated:YES completion:nil];
+    });
+}
+
+- (void)getAllAppVersionIdsAndPrompt:(long long)appId {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController* promptAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"您想手动输入版本ID还是从服务器获取版本列表？" preferredStyle:UIAlertControllerStyleAlert];
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"手动" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+            [self promptForVersionId:appId];
+        }]];
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"服务器" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+            [self getAllAppVersionIdsFromServer:appId];
+        }]];
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:promptAlert animated:YES completion:nil];
+    });
+}
 
 - (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId {
-
-    NSString *adamId = [NSString stringWithFormat:@"%lld", appId];
-    NSString *offer = [NSString stringWithFormat:
-        @"productType=C&price=0&salableAdamId=%@&appExtVrsId=%lld",
-        adamId, versionId];
-
-    NSDictionary *offerDict = @{@"buyParams": offer};
-    NSDictionary *itemDict = @{@"_itemOffer": adamId};
-
-    SKUIItemOffer *o = [[SKUIItemOffer alloc] initWithLookupDictionary:offerDict];
-    SKUIItem *item = [[SKUIItem alloc] initWithLookupDictionary:itemDict];
-
-    [item setValue:o forKey:@"_itemOffer"];
+    NSString* adamId = [NSString stringWithFormat:@"%lld", appId];
+    NSString* pricingParameters = @"pricingParameter";
+    NSString* appExtVrsId = [NSString stringWithFormat:@"%lld", versionId];
+    NSString* installed = @"0";
+    NSString* offerString = nil;
+    if (versionId == 0) {
+        offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, installed];
+    } else {
+        offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&appExtVrsId=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, appExtVrsId, installed];
+    }
+    NSDictionary* offerDict = @{@"buyParams": offerString};
+    NSDictionary* itemDict = @{@"_itemOffer": adamId};
+    SKUIItemOffer* offer = [[SKUIItemOffer alloc] initWithLookupDictionary:offerDict];
+    SKUIItem* item = [[SKUIItem alloc] initWithLookupDictionary:itemDict];
+    [item setValue:offer forKey:@"_itemOffer"];
     [item setValue:@"iosSoftware" forKey:@"_itemKindString"];
-    [item setValue:@(versionId) forKey:@"_versionIdentifier"];
-
-    SKUIItemStateCenter *center = [SKUIItemStateCenter defaultCenter];
-
-    [center _performPurchases:
-        [center _newPurchasesWithItems:@[item]]
-        hasBundlePurchase:0
-        withClientContext:[SKUIClientContext defaultContext]
-        completionBlock:^(id x){}];
+    if(versionId != 0) {
+        [item setValue:@(versionId) forKey:@"_versionIdentifier"];
+    }
+    SKUIItemStateCenter* center = [SKUIItemStateCenter defaultCenter];
+    NSArray* items = @[item];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [center _performPurchases:[center _newPurchasesWithItems:items] hasBundlePurchase:0 withClientContext:[SKUIClientContext defaultContext] completionBlock:^(id arg1){}];
+    });
 }
 
-#pragma mark - Alert
+- (void)downloadAppWithLink:(NSString*)link {
+    NSString* targetAppIdParsed = nil;
+    if([link containsString:@"id"]) {
+        NSArray* components = [link componentsSeparatedByString:@"id"];
+        if(components.count < 2) {
+            [self showAlert:@"错误" message:@"无效链接"];
+            return;
+        }
+        NSArray* idComponents = [components[1] componentsSeparatedByString:@"?"];
+        targetAppIdParsed = idComponents[0];
+    } else {
+        [self showAlert:@"错误" message:@"无效链接"];
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self getAllAppVersionIdsAndPrompt:[targetAppIdParsed longLongValue]];
+    });
+}
 
-- (void)showAlert:(NSString *)title message:(NSString *)msg {
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:1];
-    [a addAction:[UIAlertAction actionWithTitle:@"确定" style:0 handler:nil]];
-    [self presentViewController:a animated:YES completion:nil];
+- (void)downloadApp {
+    UIAlertController* linkAlert = [UIAlertController alertControllerWithTitle:@"应用链接" message:@"请输入要下载的应用链接" preferredStyle:UIAlertControllerStyleAlert];
+    [linkAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
+        textField.placeholder = @"应用链接";
+    }];
+    [linkAlert addAction:[UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        [self downloadAppWithLink:linkAlert.textFields.firstObject.text];
+    }]];
+    [linkAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:linkAlert animated:YES completion:nil];
 }
 
 @end
