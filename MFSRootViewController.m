@@ -255,6 +255,18 @@ static NSCache *groupPathCache = nil;
         }
     }
     
+    // 方法3：从 entitlements 中读取 application-groups
+    NSArray *entitlementGroups = [self getApplicationGroupsFromEntitlementsForBundleId:bundleId];
+    if (entitlementGroups.count > 0) {
+        for (NSString *groupID in entitlementGroups) {
+            NSString *possiblePath = [self findGroupContainerPathForGroupIdentifier:groupID];
+            if (possiblePath) {
+                [groupPathCache setObject:possiblePath forKey:bundleId];
+                return possiblePath;
+            }
+        }
+    }
+    
     // 降级：目录名包含 bundleId
     for (NSString *dir in subDirs) {
         if ([[dir lowercaseString] containsString:bundleIdLower]) {
@@ -267,6 +279,79 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
+// 新增：从 entitlements 获取应用组ID列表
+- (NSArray<NSString *> *)getApplicationGroupsFromEntitlementsForBundleId:(NSString *)bundleId {
+    NSMutableArray *groups = [NSMutableArray array];
+    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    if (!appProxy) return groups;
+    
+    // 尝试通过私有属性获取 entitlements
+    NSDictionary *entitlements = nil;
+    @try {
+        entitlements = [appProxy valueForKey:@"entitlements"];
+    } @catch (NSException *e) {}
+    
+    if (!entitlements || ![entitlements isKindOfClass:[NSDictionary class]]) {
+        // 降级：读取 embedded.mobileprovision
+        NSString *bundlePath = [appProxy bundleURL].path;
+        NSString *provisionPath = [bundlePath stringByAppendingPathComponent:@"embedded.mobileprovision"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:provisionPath]) {
+            NSData *provisionData = [NSData dataWithContentsOfFile:provisionPath];
+            if (provisionData) {
+                // 使用 CMS 解码（越狱环境可用 Security.framework）
+                // 此处简化：直接查找字符串 "application-identifier"
+                NSString *provisionStr = [[NSString alloc] initWithData:provisionData encoding:NSASCIIStringEncoding];
+                if (provisionStr) {
+                    NSRange range = [provisionStr rangeOfString:@"<key>com.apple.security.application-groups</key>"];
+                    if (range.location != NSNotFound) {
+                        NSRange arrayStart = [provisionStr rangeOfString:@"<array>" options:0 range:NSMakeRange(range.location, provisionStr.length - range.location)];
+                        NSRange arrayEnd = [provisionStr rangeOfString:@"</array>" options:0 range:NSMakeRange(arrayStart.location, provisionStr.length - arrayStart.location)];
+                        if (arrayStart.location != NSNotFound && arrayEnd.location != NSNotFound) {
+                            NSString *arrayContent = [provisionStr substringWithRange:NSMakeRange(arrayStart.location + 7, arrayEnd.location - arrayStart.location - 7)];
+                            NSArray *lines = [arrayContent componentsSeparatedByString:@"<string>"];
+                            for (NSString *line in lines) {
+                                NSRange endRange = [line rangeOfString:@"</string>"];
+                                if (endRange.location != NSNotFound) {
+                                    NSString *groupID = [line substringToIndex:endRange.location];
+                                    groupID = [groupID stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                                    if (groupID.length > 0) {
+                                        [groups addObject:groupID];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        NSArray *groupArray = entitlements[@"com.apple.security.application-groups"];
+        if ([groupArray isKindOfClass:[NSArray class]]) {
+            [groups addObjectsFromArray:groupArray];
+        }
+    }
+    return groups;
+}
+
+// 新增：根据 group identifier 查找容器路径
+- (NSString *)findGroupContainerPathForGroupIdentifier:(NSString *)groupID {
+    NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
+    for (NSString *dir in subDirs) {
+        NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
+        NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        if ([fm fileExistsAtPath:metadataPath]) {
+            NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+            NSString *identifier = metadata[@"MCMMetadataIdentifier"];
+            if ([identifier isEqualToString:groupID]) {
+                return groupDir;
+            }
+        }
+    }
+    return nil;
+}
+
 #pragma mark - 辅助功能
 - (void)launchAppWithBundleId:(NSString *)bundleId {
     LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
@@ -276,7 +361,7 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// 终极可靠的 Filza 跳转方法
+// 增强的 Filza 跳转方法（解决部分目录打不开的问题）
 - (void)openInFilza:(NSString *)path {
     if (!path.length) {
         [self showAlert:@"错误" message:@"路径无效"];
@@ -288,23 +373,37 @@ static NSCache *groupPathCache = nil;
         return;
     }
     
-    // 方法：先构造标准的 file:// URL，再替换 scheme 为 filza://
-    NSURL *fileURL = [NSURL fileURLWithPath:path];
-    NSString *fileURLString = fileURL.absoluteString;  // 格式 file:///path
-    NSString *filzaURLString = [fileURLString stringByReplacingOccurrencesOfString:@"file://" withString:@"filza://"];
-    NSURL *filzaURL = [NSURL URLWithString:filzaURLString];
-    
-    if (filzaURL && [[UIApplication sharedApplication] canOpenURL:filzaURL]) {
-        [[UIApplication sharedApplication] openURL:filzaURL options:@{} completionHandler:^(BOOL success) {
-            if (!success) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装最新版Filza并授权"];
-                });
-            }
-        }];
-    } else {
-        [self showAlert:@"错误" message:@"未安装Filza文件管理器或URL Scheme不支持"];
+    // 对路径进行百分号编码，处理空格和特殊字符
+    NSString *encodedPath = [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+    if (!encodedPath) {
+        encodedPath = path;
     }
+    
+    // 尝试多种 Filza URL Scheme
+    NSArray *urlStrings = @[
+        [NSString stringWithFormat:@"filza://view?path=%@", encodedPath],
+        [NSString stringWithFormat:@"filza://open?path=%@", encodedPath],
+        [NSString stringWithFormat:@"filza://%@", encodedPath],
+        [NSString stringWithFormat:@"filza://%@", [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLHostAllowedCharacterSet]]],
+        [NSString stringWithFormat:@"filza://%@", path] // 原始路径最后尝试
+    ];
+    
+    for (NSString *urlString in urlStrings) {
+        NSURL *url = [NSURL URLWithString:urlString];
+        if (url && [[UIApplication sharedApplication] canOpenURL:url]) {
+            [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL success) {
+                if (!success) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装最新版Filza并授权"];
+                    });
+                }
+            }];
+            return;
+        }
+    }
+    
+    // 所有 scheme 都失败
+    [self showAlert:@"错误" message:@"未安装Filza文件管理器或URL Scheme不支持"];
 }
 
 - (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
