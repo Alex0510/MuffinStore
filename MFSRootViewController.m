@@ -91,12 +91,16 @@ static NSCache *iconCache = nil;
     
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *bundlePath = appInfo[@"bundlePath"];
-    NSURL *bundleURL = [specifier propertyForKey:@"bundleURL"];
     
-    // 获取数据目录
-    LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
-    NSURL *dataContainerURL = appProxy.dataContainerURL;
-    NSString *dataPath = dataContainerURL ? dataContainerURL.path : @"未找到";
+    // 获取应用代理和数据目录 (使用KVC避免头文件缺失)
+    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    NSString *dataPath = nil;
+    NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
+    if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
+        dataPath = [(NSURL *)dataContainerURL path];
+    } else {
+        dataPath = @"未找到";
+    }
     
     UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     
@@ -106,7 +110,7 @@ static NSCache *iconCache = nil;
     }];
     // 数据目录
     UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"🗄️ 数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        if (dataContainerURL) {
+        if (dataPath && ![dataPath isEqualToString:@"未找到"]) {
             [self openInFilza:dataPath];
         } else {
             [self showAlert:@"错误" message:@"无法获取数据目录路径"];
@@ -133,8 +137,8 @@ static NSCache *iconCache = nil;
     [actionSheet addAction:downgradeAction];
     [actionSheet addAction:cancelAction];
     
-    // iPad适配
-    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+    // iPad适配 - 使用现代API
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         actionSheet.popoverPresentationController.sourceView = cell;
         actionSheet.popoverPresentationController.sourceRect = cell.bounds;
     }
@@ -155,7 +159,7 @@ static NSCache *iconCache = nil;
 }
 
 // 确认清除数据
-- (void)confirmClearDataForAppProxy:(LSApplicationProxy *)appProxy dataPath:(NSString *)dataPath bundleId:(NSString *)bundleId {
+- (void)confirmClearDataForAppProxy:(id)appProxy dataPath:(NSString *)dataPath bundleId:(NSString *)bundleId {
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清除数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self performClearDataForAppProxy:appProxy dataPath:dataPath bundleId:bundleId];
@@ -166,10 +170,9 @@ static NSCache *iconCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-- (void)performClearDataForAppProxy:(LSApplicationProxy *)appProxy dataPath:(NSString *)dataPath bundleId:(NSString *)bundleId {
+- (void)performClearDataForAppProxy:(id)appProxy dataPath:(NSString *)dataPath bundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSError *error = nil;
         // 1. 清除数据目录
         if (dataPath && ![dataPath isEqualToString:@"未找到"] && [fm fileExistsAtPath:dataPath]) {
             for (NSString *item in [fm contentsOfDirectoryAtPath:dataPath error:nil]) {
@@ -178,10 +181,10 @@ static NSCache *iconCache = nil;
             }
         }
         // 2. 清除应用组目录 (通过KVC获取groupContainerURLs)
-        NSArray<NSURL *> *groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-        if (groupURLs.count) {
+        NSArray *groupURLs = [(id)appProxy valueForKey:@"groupContainerURLs"];
+        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
             for (NSURL *groupURL in groupURLs) {
-                if ([fm fileExistsAtPath:groupURL.path]) {
+                if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
                     for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
                         NSString *fullPath = [groupURL.path stringByAppendingPathComponent:item];
                         [fm removeItemAtPath:fullPath error:nil];
@@ -524,7 +527,7 @@ static NSCache *iconCache = nil;
             }
             UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
             [versionAlert addAction:cancelAction];
-            if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+            if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
                 versionAlert.popoverPresentationController.sourceView = self.view;
                 versionAlert.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 0, 0);
             }
