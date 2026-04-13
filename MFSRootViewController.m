@@ -35,6 +35,17 @@ static NSCache *iconCache = nil;
 - (void)loadView {
     [super loadView];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reloadSpecifiers) name:UIApplicationWillEnterForegroundNotification object:nil];
+    
+    // 添加右上角刷新按钮
+    UIBarButtonItem *refreshButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshAppList)];
+    self.navigationItem.rightBarButtonItem = refreshButton;
+}
+
+- (void)refreshAppList {
+    // 清除缓存，强制重新构建 specifiers
+    _specifiers = nil;
+    [iconCache removeAllObjects];
+    [self reloadSpecifiers];
 }
 
 - (NSMutableArray*)specifiers {
@@ -43,10 +54,10 @@ static NSCache *iconCache = nil;
         
         // Download 分组
         PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
-        downloadGroupSpecifier.name = @"Download";
+        downloadGroupSpecifier.name = @"下载";
         [_specifiers addObject:downloadGroupSpecifier];
         
-        PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"Download" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+        PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
         downloadSpecifier.identifier = @"download";
         [downloadSpecifier setProperty:@YES forKey:@"enabled"];
         downloadSpecifier.buttonAction = @selector(downloadApp);
@@ -57,7 +68,7 @@ static NSCache *iconCache = nil;
         
         // Installed Apps 分组
         PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
-        installedGroupSpecifier.name = @"Installed Apps";
+        installedGroupSpecifier.name = @"已安装应用";
         [_specifiers addObject:installedGroupSpecifier];
         
         NSMutableArray *appSpecifiers = [NSMutableArray new];
@@ -65,7 +76,7 @@ static NSCache *iconCache = nil;
             NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
             appInfo[@"bundleURL"] = appProxy.bundleURL;
             appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
-            appInfo[@"localizedName"] = appProxy.localizedName ?: @"Unknown";
+            appInfo[@"localizedName"] = appProxy.localizedName ?: @"未知";
             
             // 获取版本号
             NSString *infoPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"];
@@ -73,8 +84,10 @@ static NSCache *iconCache = nil;
             NSString *version = infoPlist[@"CFBundleShortVersionString"] ?: infoPlist[@"CFBundleVersion"] ?: @"N/A";
             appInfo[@"version"] = version;
             
-            // 存储应用路径（用于详情弹窗实时读取 iTunesMetadata.plist）
+            // 存储应用路径（.app 目录）
             appInfo[@"bundlePath"] = appProxy.bundleURL.path;
+            // 存储 .app 所在的上层目录（UUID 目录），用于查找 iTunesMetadata.plist
+            appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
             
             PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appProxy.localizedName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
             [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
@@ -139,22 +152,34 @@ static NSCache *iconCache = nil;
     return cell;
 }
 
-// 显示应用详情（实时读取 iTunesMetadata.plist）
+// 显示应用详情（实时读取 iTunesMetadata.plist，优先查找同级目录）
 - (void)showAppDetails:(UIButton *)sender {
     NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
     if (!appInfo) return;
     
-    NSString *bundlePath = appInfo[@"bundlePath"];
+    NSString *bundlePath = appInfo[@"bundlePath"];      // .app 路径
+    NSString *containerPath = appInfo[@"containerPath"]; // UUID 目录路径
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *version = appInfo[@"version"];
     
-    // 实时读取 iTunesMetadata.plist
-    NSString *metadataPath = [bundlePath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
-    BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:metadataPath];
-    NSString *accountInfo;
+    // 1. 优先在 UUID 目录下查找 iTunesMetadata.plist（与 .app 同级）
+    NSString *metadataPath1 = [containerPath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
+    // 2. 其次在 .app 内部查找
+    NSString *metadataPath2 = [bundlePath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
     
+    NSString *metadataPath = nil;
+    BOOL fileExists = NO;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:metadataPath1]) {
+        metadataPath = metadataPath1;
+        fileExists = YES;
+    } else if ([[NSFileManager defaultManager] fileExistsAtPath:metadataPath2]) {
+        metadataPath = metadataPath2;
+        fileExists = YES;
+    }
+    
+    NSString *accountInfo;
     if (!fileExists) {
-        accountInfo = [NSString stringWithFormat:@"文件不存在:\n%@", metadataPath];
+        accountInfo = [NSString stringWithFormat:@"未找到 iTunesMetadata.plist\n尝试路径:\n%@\n%@", metadataPath1, metadataPath2];
     } else {
         NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
         if (metadata) {
@@ -223,7 +248,7 @@ static NSCache *iconCache = nil;
     return nil;
 }
 
-#pragma mark - 原有功能（下载等，完全保留）
+#pragma mark - 下载相关功能（所有提示已中文化）
 
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
@@ -234,7 +259,7 @@ static NSCache *iconCache = nil;
     NSURLSessionDataTask* task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
         if(error) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlert:@"Error" message:error.localizedDescription];
+                [self showAlert:@"错误" message:error.localizedDescription];
             });
             return;
         }
@@ -242,14 +267,14 @@ static NSCache *iconCache = nil;
         NSDictionary* json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
         if(jsonError) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlert:@"JSON Error" message:jsonError.localizedDescription];
+                [self showAlert:@"JSON解析错误" message:jsonError.localizedDescription];
             });
             return;
         }
         NSArray* results = json[@"results"];
         if(results.count == 0) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlert:@"Error" message:@"No results"];
+                [self showAlert:@"错误" message:@"无结果"];
             });
             return;
         }
@@ -260,13 +285,13 @@ static NSCache *iconCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2\nMade by Mineek\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.2\n作者 Mineek\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController* alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
     });
 }
@@ -278,7 +303,7 @@ static NSCache *iconCache = nil;
     NSURLSessionDataTask* task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
         if(error) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlert:@"Error" message:error.localizedDescription];
+                [self showAlert:@"错误" message:error.localizedDescription];
             });
             return;
         }
@@ -286,26 +311,26 @@ static NSCache *iconCache = nil;
         NSDictionary* json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
         if(jsonError) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlert:@"JSON Error" message:jsonError.debugDescription];
+                [self showAlert:@"JSON解析错误" message:jsonError.debugDescription];
             });
             return;
         }
         NSArray* versionIds = json[@"data"];
         if(versionIds.count == 0) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlert:@"Error" message:@"No version IDs, internal error maybe?"];
+                [self showAlert:@"错误" message:@"没有获取到版本ID，可能是内部错误"];
             });
             return;
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"Version ID" message:@"Select the version ID of the app you want to download" preferredStyle:UIAlertControllerStyleActionSheet];
+            UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请选择要下载的应用版本ID" preferredStyle:UIAlertControllerStyleActionSheet];
             for(NSDictionary* versionId in versionIds) {
                 UIAlertAction* versionAction = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@", versionId[@"bundle_version"]] style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
                     [self downloadAppWithAppId:appId versionId:[versionId[@"external_identifier"] longLongValue]];
                 }];
                 [versionAlert addAction:versionAction];
             }
-            UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+            UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
             [versionAlert addAction:cancelAction];
             if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
                 versionAlert.popoverPresentationController.sourceView = self.view;
@@ -319,30 +344,30 @@ static NSCache *iconCache = nil;
 
 - (void)promptForVersionId:(long long)appId {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"Version ID" message:@"Enter the version ID of the app you want to download" preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请输入要下载的应用版本ID" preferredStyle:UIAlertControllerStyleAlert];
         [versionAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
-            textField.placeholder = @"Version ID";
+            textField.placeholder = @"版本ID";
         }];
-        UIAlertAction* downloadAction = [UIAlertAction actionWithTitle:@"Download" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        UIAlertAction* downloadAction = [UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
             long long versionId = [versionAlert.textFields.firstObject.text longLongValue];
             [self downloadAppWithAppId:appId versionId:versionId];
         }];
         [versionAlert addAction:downloadAction];
-        [versionAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [versionAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:versionAlert animated:YES completion:nil];
     });
 }
 
 - (void)getAllAppVersionIdsAndPrompt:(long long)appId {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController* promptAlert = [UIAlertController alertControllerWithTitle:@"Version ID" message:@"Do you want to enter the version ID manually or request the list of version IDs from the server?" preferredStyle:UIAlertControllerStyleAlert];
-        [promptAlert addAction:[UIAlertAction actionWithTitle:@"Manual" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        UIAlertController* promptAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"您想手动输入版本ID还是从服务器获取版本列表？" preferredStyle:UIAlertControllerStyleAlert];
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"手动" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
             [self promptForVersionId:appId];
         }]];
-        [promptAlert addAction:[UIAlertAction actionWithTitle:@"Server" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"服务器" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
             [self getAllAppVersionIdsFromServer:appId];
         }]];
-        [promptAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:promptAlert animated:YES completion:nil];
     });
 }
@@ -379,13 +404,13 @@ static NSCache *iconCache = nil;
     if([link containsString:@"id"]) {
         NSArray* components = [link componentsSeparatedByString:@"id"];
         if(components.count < 2) {
-            [self showAlert:@"Error" message:@"Invalid link"];
+            [self showAlert:@"错误" message:@"无效链接"];
             return;
         }
         NSArray* idComponents = [components[1] componentsSeparatedByString:@"?"];
         targetAppIdParsed = idComponents[0];
     } else {
-        [self showAlert:@"Error" message:@"Invalid link"];
+        [self showAlert:@"错误" message:@"无效链接"];
         return;
     }
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -394,14 +419,14 @@ static NSCache *iconCache = nil;
 }
 
 - (void)downloadApp {
-    UIAlertController* linkAlert = [UIAlertController alertControllerWithTitle:@"App Link" message:@"Enter the link to the app you want to download" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController* linkAlert = [UIAlertController alertControllerWithTitle:@"应用链接" message:@"请输入要下载的应用链接" preferredStyle:UIAlertControllerStyleAlert];
     [linkAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
-        textField.placeholder = @"App Link";
+        textField.placeholder = @"应用链接";
     }];
-    [linkAlert addAction:[UIAlertAction actionWithTitle:@"Download" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+    [linkAlert addAction:[UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         [self downloadAppWithLink:linkAlert.textFields.firstObject.text];
     }]];
-    [linkAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [linkAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:linkAlert animated:YES completion:nil];
 }
 
