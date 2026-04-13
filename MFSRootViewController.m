@@ -66,7 +66,7 @@ static NSCache *iconCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 长按菜单（启动、数据目录、应用组目录、清理数据、在 Filza 中显示）
+#pragma mark - 长按菜单（图一格式：启动、应用目录、数据目录、应用组目录、清理数据、取消）
 - (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
     UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
     if (existingGesture) {
@@ -84,20 +84,27 @@ static NSCache *iconCache = nil;
     if (gesture.state != UIGestureRecognizerStateBegan) return;
     UITableViewCell *cell = (UITableViewCell *)gesture.view;
     NSDictionary *appInfo = objc_getAssociatedObject(cell, "appInfo");
-    PSSpecifier *specifier = objc_getAssociatedObject(cell, "specifier");
     if (!appInfo) return;
     
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *bundlePath = appInfo[@"bundlePath"];
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     
-    UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:nil preferredStyle:UIAlertControllerStyleActionSheet];
     
-    // 启动应用
+    // 1. 启动
     UIAlertAction *launchAction = [UIAlertAction actionWithTitle:@"启动" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self launchAppWithBundleId:bundleId];
     }];
-    // 数据目录（具体应用的数据目录）
+    // 2. 应用目录（在 Filza 中显示）- 放在启动下方
+    UIAlertAction *appDirAction = [UIAlertAction actionWithTitle:@"应用目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        if (bundlePath && [[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) {
+            [self openInFilza:bundlePath];
+        } else {
+            [self showAlert:@"错误" message:@"应用目录不存在"];
+        }
+    }];
+    // 3. 数据目录
     UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         NSString *dataPath = nil;
         NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
@@ -113,29 +120,22 @@ static NSCache *iconCache = nil;
             [self showAlert:@"错误" message:@"无法找到数据目录，请确保应用已运行过"];
         }
     }];
-    // 应用组目录（固定根目录）
+    // 4. 应用组目录
     UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self openInFilza:@"/var/mobile/Containers/Shared/AppGroup"];
     }];
-    // 清理数据
+    // 5. 清理数据
     UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"清理数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self confirmClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
-    // 在 Filza 中显示（应用目录 /var/containers/Bundle/Application/...）
-    UIAlertAction *showInFilzaAction = [UIAlertAction actionWithTitle:@"应用目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        if (bundlePath && [[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) {
-            [self openInFilza:bundlePath];
-        } else {
-            [self showAlert:@"错误" message:@"应用目录不存在"];
-        }
-    }];
     UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     
+    // 按照图一顺序添加：启动 -> 应用目录 -> 数据目录 -> 应用组目录 -> 清理数据 -> 取消
     [actionSheet addAction:launchAction];
+    [actionSheet addAction:appDirAction];
     [actionSheet addAction:dataAction];
     [actionSheet addAction:appGroupAction];
     [actionSheet addAction:clearDataAction];
-    [actionSheet addAction:showInFilzaAction];
     [actionSheet addAction:cancelAction];
     
     if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
@@ -179,13 +179,10 @@ static NSCache *iconCache = nil;
         [self showAlert:@"错误" message:@"路径无效"];
         return;
     }
-    // 确保路径存在
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
         [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不存在:\n%@", path]];
         return;
     }
-    // Filza URL Scheme: filza:///absolute/path （三个斜杠）
-    // 需要确保 path 以 / 开头，然后整体编码
     NSString *encodedPath = [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
     NSString *urlString = [NSString stringWithFormat:@"filza://%@", encodedPath];
     NSURL *url = [NSURL URLWithString:urlString];
