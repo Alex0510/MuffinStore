@@ -3,6 +3,15 @@
 #import "CoreServices.h"
 #import <objc/runtime.h>
 
+// 私有扩展，添加搜索控制器和过滤数据源
+@interface MFSRootViewController () <UISearchResultsUpdating>
+@property (nonatomic, strong) NSMutableArray *originalSpecifiers;   // 所有原始 specifiers
+@property (nonatomic, strong) NSMutableArray *filteredAppSpecifiers; // 过滤后的应用 specifiers
+@property (nonatomic, strong) UISearchController *searchController;
+@property (nonatomic, copy) NSString *searchText;
+@end
+
+// 以下是原有的私有类声明（保持不变）
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
 - (id)_newPurchasesWithItems:(id)items;
@@ -25,13 +34,6 @@
 static NSCache *iconCache = nil;
 static NSCache *groupPathCache = nil;
 
-@interface MFSRootViewController () <UISearchBarDelegate>
-@property (nonatomic, strong) NSMutableArray *originalSpecifiers;   // 完整的 specifiers 列表
-@property (nonatomic, strong) NSMutableArray *filteredAppSpecifiers; // 过滤后的应用 specifiers
-@property (nonatomic, strong) UISearchBar *searchBar;
-@property (nonatomic, copy) NSString *searchText;
-@end
-
 @implementation MFSRootViewController
 
 + (void)initialize {
@@ -39,6 +41,19 @@ static NSCache *groupPathCache = nil;
         iconCache = [[NSCache alloc] init];
         groupPathCache = [[NSCache alloc] init];
     }
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    // 配置搜索控制器
+    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.searchController.searchResultsUpdater = self;
+    self.searchController.obscuresBackgroundDuringPresentation = NO;
+    self.searchController.searchBar.placeholder = @"搜索应用";
+    self.searchController.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.navigationItem.searchController = self.searchController;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+    self.definesPresentationContext = YES;
 }
 
 - (void)loadView {
@@ -52,35 +67,11 @@ static NSCache *groupPathCache = nil;
     // 左上角：直接输入软件ID下载按钮
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
-    
-    // 初始化搜索栏
-    [self setupSearchBar];
 }
 
-- (void)setupSearchBar {
-    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
-    self.searchBar.placeholder = @"搜索应用";
-    self.searchBar.delegate = self;
-    self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
-    self.tableView.tableHeaderView = self.searchBar;
-}
-
-#pragma mark - UISearchBarDelegate
-- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
-    self.searchText = searchText;
-    [self filterAppSpecifiers];
-    [self reloadSpecifiers];
-}
-
-- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
-    [searchBar resignFirstResponder];
-}
-
-- (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar {
-    self.searchText = @"";
-    searchBar.text = @"";
-    [searchBar resignFirstResponder];
+#pragma mark - UISearchResultsUpdating
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
+    self.searchText = searchController.searchBar.text;
     [self filterAppSpecifiers];
     [self reloadSpecifiers];
 }
@@ -97,7 +88,6 @@ static NSCache *groupPathCache = nil;
     self.filteredAppSpecifiers = [NSMutableArray array];
     NSString *lowerSearch = [self.searchText lowercaseString];
     for (PSSpecifier *spec in self.originalSpecifiers) {
-        // 只过滤应用 specifiers（有 appInfo 的）
         NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
         if (appInfo) {
             NSString *appName = appInfo[@"localizedName"];
@@ -107,12 +97,13 @@ static NSCache *groupPathCache = nil;
                 [self.filteredAppSpecifiers addObject:spec];
             }
         } else {
-            // 非应用的 specifier（下载组、标题组）保留
+            // 非应用的 specifier（下载组、标题组）始终显示
             [self.filteredAppSpecifiers addObject:spec];
         }
     }
 }
 
+#pragma mark - 刷新列表（重置所有缓存）
 - (void)refreshAppList {
     _specifiers = nil;
     _originalSpecifiers = nil;
@@ -120,7 +111,7 @@ static NSCache *groupPathCache = nil;
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
     self.searchText = @"";
-    self.searchBar.text = @"";
+    self.searchController.searchBar.text = @"";
     [self reloadSpecifiers];
 }
 
@@ -146,10 +137,8 @@ static NSCache *groupPathCache = nil;
     [specifiers addObject:installedGroupSpecifier];
     
     NSMutableArray *appSpecifiers = [NSMutableArray new];
-    // 枚举所有应用（包括用户应用和系统应用，type:0 表示所有）
+    // 枚举所有应用（包括用户应用和系统应用）
     [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
-        // 过滤掉一些不需要显示的系统应用（可选）
-        // 如果 bundleIdentifier 以 com.apple. 开头且不希望显示，可以跳过，但为了完整，先全部添加
         NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
         appInfo[@"bundleURL"] = appProxy.bundleURL;
         appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
@@ -188,14 +177,12 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSMutableArray*)specifiers {
-    // 首次加载或刷新时构建原始列表
     if (!_originalSpecifiers) {
         _originalSpecifiers = [self buildOriginalSpecifiers];
         _filteredAppSpecifiers = [_originalSpecifiers mutableCopy];
     }
-    // 根据当前搜索过滤
+    // 根据搜索返回过滤后的结果
     if (self.searchText.length) {
-        [self filterAppSpecifiers]; // 确保过滤
         return _filteredAppSpecifiers;
     } else {
         return _originalSpecifiers;
@@ -361,7 +348,6 @@ static NSCache *groupPathCache = nil;
                 NSString *identifier = metadata[@"MCMMetadataIdentifier"];
                 if (identifier) {
                     NSString *identifierLower = [identifier lowercaseString];
-                    // 完全匹配 或 后缀匹配 或 包含匹配（大小写不敏感）
                     if ([identifierLower isEqualToString:bundleIdLower] ||
                         [identifierLower hasSuffix:bundleIdLower] ||
                         [identifierLower rangeOfString:bundleIdLower].location != NSNotFound) {
@@ -392,20 +378,16 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// 修复 Filza 跳转：使用 filza:// 绝对路径格式（三个斜杠）
 - (void)openInFilza:(NSString *)path {
     if (!path || path.length == 0) {
         [self showAlert:@"错误" message:@"路径无效"];
         return;
     }
-    // 检查路径是否存在
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
         [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不存在:\n%@", path]];
         return;
     }
-    // 对路径进行 URL 编码，确保特殊字符（如空格、中文）正确处理
     NSString *encodedPath = [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
-    // Filza URL Scheme 格式：filza:///absolute/path
     NSString *urlString = [NSString stringWithFormat:@"filza://%@", encodedPath];
     NSURL *url = [NSURL URLWithString:urlString];
     if ([[UIApplication sharedApplication] canOpenURL:url]) {
@@ -421,7 +403,6 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// 确认清理数据
 - (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
@@ -444,7 +425,7 @@ static NSCache *groupPathCache = nil;
                 [fm removeItemAtPath:fullPath error:nil];
             }
         }
-        // 应用组目录（清理所有关联的组目录内容）
+        // 应用组目录
         NSArray *groupURLs = nil;
         @try {
             if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
@@ -611,7 +592,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-#pragma mark - 原有下载功能（完全保留）
+#pragma mark - 下载功能（完全保留）
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
