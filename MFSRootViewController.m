@@ -66,7 +66,7 @@ static NSCache *iconCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 长按菜单（图一格式：启动、应用目录、数据目录、应用组目录、清理数据、取消）
+#pragma mark - 长按菜单（动态显示应用组目录）
 - (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
     UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
     if (existingGesture) {
@@ -96,7 +96,7 @@ static NSCache *iconCache = nil;
     UIAlertAction *launchAction = [UIAlertAction actionWithTitle:@"启动" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self launchAppWithBundleId:bundleId];
     }];
-    // 2. 应用目录（在 Filza 中显示）- 放在启动下方
+    // 2. 应用目录
     UIAlertAction *appDirAction = [UIAlertAction actionWithTitle:@"应用目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         if (bundlePath && [[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) {
             [self openInFilza:bundlePath];
@@ -120,21 +120,29 @@ static NSCache *iconCache = nil;
             [self showAlert:@"错误" message:@"无法找到数据目录，请确保应用已运行过"];
         }
     }];
-    // 4. 应用组目录
-    UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [self openInFilza:@"/var/mobile/Containers/Shared/AppGroup"];
-    }];
-    // 5. 清理数据
+    
+    // 检查是否有应用组目录
+    NSArray *groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+    BOOL hasAppGroup = [groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0;
+    
+    // 按照顺序添加按钮：启动 -> 应用目录 -> 数据目录 -> 应用组目录（如果有）-> 清理数据 -> 取消
+    [actionSheet addAction:launchAction];
+    [actionSheet addAction:appDirAction];
+    [actionSheet addAction:dataAction];
+    
+    if (hasAppGroup) {
+        UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            [self openInFilza:@"/var/mobile/Containers/Shared/AppGroup"];
+        }];
+        [actionSheet addAction:appGroupAction];
+    }
+    
+    // 清理数据
     UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"清理数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self confirmClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
     UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     
-    // 按照图一顺序添加：启动 -> 应用目录 -> 数据目录 -> 应用组目录 -> 清理数据 -> 取消
-    [actionSheet addAction:launchAction];
-    [actionSheet addAction:appDirAction];
-    [actionSheet addAction:dataAction];
-    [actionSheet addAction:appGroupAction];
     [actionSheet addAction:clearDataAction];
     [actionSheet addAction:cancelAction];
     
