@@ -36,10 +36,201 @@ static NSCache *iconCache = nil;
     [super loadView];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reloadSpecifiers) name:UIApplicationWillEnterForegroundNotification object:nil];
     
+    // 右上角刷新按钮
     UIBarButtonItem *refreshButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshAppList)];
     self.navigationItem.rightBarButtonItem = refreshButton;
+    
+    // 左上角：直接输入软件ID下载按钮
+    UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
+    self.navigationItem.leftBarButtonItem = idDownloadButton;
 }
 
+#pragma mark - 左上角按钮：直接输入软件ID查询版本并下载
+- (void)promptForAppIdDownload {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"输入软件ID" message:@"请输入App的Apple ID (trackId)" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"例如: 310633997";
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    UIAlertAction *confirmAction = [UIAlertAction actionWithTitle:@"查询版本" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *appIdStr = alert.textFields.firstObject.text;
+        if (appIdStr.length > 0) {
+            long long appId = [appIdStr longLongValue];
+            [self getAllAppVersionIdsAndPrompt:appId];
+        } else {
+            [self showAlert:@"错误" message:@"软件ID不能为空"];
+        }
+    }];
+    [alert addAction:confirmAction];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - 长按菜单：应用目录、数据目录、应用组目录、清除数据、应用降级
+- (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
+    // 移除已存在的手势，避免重复添加
+    UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
+    if (existingGesture) {
+        [cell removeGestureRecognizer:existingGesture];
+    }
+    UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPress:)];
+    longPress.minimumPressDuration = 0.6;
+    [cell addGestureRecognizer:longPress];
+    objc_setAssociatedObject(cell, "longPressGesture", longPress, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // 保存appInfo和specifier到cell
+    objc_setAssociatedObject(cell, "appInfo", appInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(cell, "specifier", specifier, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+- (void)handleLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+    UITableViewCell *cell = (UITableViewCell *)gesture.view;
+    NSDictionary *appInfo = objc_getAssociatedObject(cell, "appInfo");
+    PSSpecifier *specifier = objc_getAssociatedObject(cell, "specifier");
+    if (!appInfo) return;
+    
+    NSString *bundleId = appInfo[@"bundleIdentifier"];
+    NSString *bundlePath = appInfo[@"bundlePath"];
+    NSURL *bundleURL = [specifier propertyForKey:@"bundleURL"];
+    
+    // 获取数据目录
+    LSApplicationProxy *appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    NSURL *dataContainerURL = appProxy.dataContainerURL;
+    NSString *dataPath = dataContainerURL ? dataContainerURL.path : @"未找到";
+    
+    UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
+    
+    // 应用目录 (Bundle目录)
+    UIAlertAction *bundleAction = [UIAlertAction actionWithTitle:@"📁 应用目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self openInFilza:bundlePath];
+    }];
+    // 数据目录
+    UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"🗄️ 数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        if (dataContainerURL) {
+            [self openInFilza:dataPath];
+        } else {
+            [self showAlert:@"错误" message:@"无法获取数据目录路径"];
+        }
+    }];
+    // 应用组目录 (跳转到固定路径 /var/mobile/Containers/Shared/AppGroup)
+    UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"👥 应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self openInFilza:@"/var/mobile/Containers/Shared/AppGroup"];
+    }];
+    // 清除数据 (清除数据目录 + 关联的应用组目录)
+    UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"⚠️ 清除数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self confirmClearDataForAppProxy:appProxy dataPath:dataPath bundleId:bundleId];
+    }];
+    // 应用降级 (选择历史版本覆盖安装)
+    UIAlertAction *downgradeAction = [UIAlertAction actionWithTitle:@"🔄 应用降级" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self downgradeAppWithBundleId:bundleId];
+    }];
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    
+    [actionSheet addAction:bundleAction];
+    [actionSheet addAction:dataAction];
+    [actionSheet addAction:appGroupAction];
+    [actionSheet addAction:clearDataAction];
+    [actionSheet addAction:downgradeAction];
+    [actionSheet addAction:cancelAction];
+    
+    // iPad适配
+    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+        actionSheet.popoverPresentationController.sourceView = cell;
+        actionSheet.popoverPresentationController.sourceRect = cell.bounds;
+    }
+    [self presentViewController:actionSheet animated:YES completion:nil];
+}
+
+#pragma mark - 辅助功能实现
+// 打开Filza指定路径
+- (void)openInFilza:(NSString *)path {
+    NSString *encodedPath = [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+    NSString *urlString = [NSString stringWithFormat:@"filza://view?path=%@", encodedPath];
+    NSURL *url = [NSURL URLWithString:urlString];
+    if ([[UIApplication sharedApplication] canOpenURL:url]) {
+        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+    } else {
+        [self showAlert:@"错误" message:@"未安装Filza文件管理器，请先安装Filza"];
+    }
+}
+
+// 确认清除数据
+- (void)confirmClearDataForAppProxy:(LSApplicationProxy *)appProxy dataPath:(NSString *)dataPath bundleId:(NSString *)bundleId {
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清除数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self performClearDataForAppProxy:appProxy dataPath:dataPath bundleId:bundleId];
+    }];
+    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    [confirm addAction:clear];
+    [confirm addAction:cancel];
+    [self presentViewController:confirm animated:YES completion:nil];
+}
+
+- (void)performClearDataForAppProxy:(LSApplicationProxy *)appProxy dataPath:(NSString *)dataPath bundleId:(NSString *)bundleId {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSError *error = nil;
+        // 1. 清除数据目录
+        if (dataPath && ![dataPath isEqualToString:@"未找到"] && [fm fileExistsAtPath:dataPath]) {
+            for (NSString *item in [fm contentsOfDirectoryAtPath:dataPath error:nil]) {
+                NSString *fullPath = [dataPath stringByAppendingPathComponent:item];
+                [fm removeItemAtPath:fullPath error:nil];
+            }
+        }
+        // 2. 清除应用组目录 (通过KVC获取groupContainerURLs)
+        NSArray<NSURL *> *groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+        if (groupURLs.count) {
+            for (NSURL *groupURL in groupURLs) {
+                if ([fm fileExistsAtPath:groupURL.path]) {
+                    for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
+                        NSString *fullPath = [groupURL.path stringByAppendingPathComponent:item];
+                        [fm removeItemAtPath:fullPath error:nil];
+                    }
+                }
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showAlert:@"完成" message:@"数据已清除，应用可能需要重启才能生效"];
+        });
+    });
+}
+
+// 应用降级: 根据bundleId获取trackId，然后选择历史版本下载覆盖
+- (void)downgradeAppWithBundleId:(NSString *)bundleId {
+    [self showAlert:@"提示" message:@"正在获取应用信息..."];
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software", bundleId]];
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlert:@"错误" message:error.localizedDescription];
+            });
+            return;
+        }
+        NSError *jsonError = nil;
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+        if (jsonError) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlert:@"错误" message:jsonError.localizedDescription];
+            });
+            return;
+        }
+        NSArray *results = json[@"results"];
+        if (results.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self showAlert:@"错误" message:@"未找到对应的App Store信息"];
+            });
+            return;
+        }
+        NSDictionary *app = results[0];
+        long long trackId = [app[@"trackId"] longLongValue];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self getAllAppVersionIdsAndPrompt:trackId];
+        });
+    }];
+    [task resume];
+}
+
+#pragma mark - 原有代码（保持功能不变，仅增加长按手势注入）
 - (void)refreshAppList {
     _specifiers = nil;
     [iconCache removeAllObjects];
@@ -73,18 +264,15 @@ static NSCache *iconCache = nil;
             appInfo[@"bundleURL"] = appProxy.bundleURL;
             appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
             
-            // 从 Info.plist 读取应用名称和版本号
             NSString *infoPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"];
             NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
             
-            // 应用名称：优先 CFBundleDisplayName，其次 CFBundleName，最后使用系统本地化名称或 Bundle ID
             NSString *displayName = infoPlist[@"CFBundleDisplayName"];
             NSString *bundleName = infoPlist[@"CFBundleName"];
             NSString *localizedName = appProxy.localizedName ?: appProxy.bundleIdentifier;
             NSString *appName = displayName ?: (bundleName ?: localizedName);
             appInfo[@"localizedName"] = appName;
             
-            // 版本号：优先 CFBundleShortVersionString，其次 CFBundleVersion
             NSString *shortVersion = infoPlist[@"CFBundleShortVersionString"];
             NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
             NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
@@ -111,7 +299,6 @@ static NSCache *iconCache = nil;
 }
 
 #pragma mark - UITableView 定制
-
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
     PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];
@@ -143,6 +330,9 @@ static NSCache *iconCache = nil;
         objc_setAssociatedObject(infoButton, "appInfo", appInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         cell.accessoryView = infoButton;
         cell.selectionStyle = UITableViewCellSelectionStyleBlue;
+        
+        // 添加长按手势（应用目录、数据目录、清除数据、降级等）
+        [self addLongPressGestureForCell:cell appInfo:appInfo specifier:specifier];
     } else {
         cell.accessoryView = nil;
         cell.detailTextLabel.text = nil;
@@ -151,7 +341,7 @@ static NSCache *iconCache = nil;
     return cell;
 }
 
-// 显示应用详情（iTunesMetadata.plist 解析）
+// 显示应用详情（保持不变）
 - (void)showAppDetails:(UIButton *)sender {
     NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
     if (!appInfo) return;
@@ -161,7 +351,6 @@ static NSCache *iconCache = nil;
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *version = appInfo[@"version"];
     
-    // 查找 iTunesMetadata.plist
     NSString *metadataPath1 = [containerPath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
     NSString *metadataPath2 = [bundlePath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
     
@@ -182,11 +371,9 @@ static NSCache *iconCache = nil;
         NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
         if (metadata) {
             NSString *artist = metadata[@"artistName"] ?: @"未知";
-            
             NSDictionary *downloadInfo = metadata[@"com.apple.iTunesStore.downloadInfo"];
             NSString *appleID = nil;
             NSString *purchaseDate = nil;
-            
             if (downloadInfo && [downloadInfo isKindOfClass:[NSDictionary class]]) {
                 NSDictionary *accountInfoDict = downloadInfo[@"accountInfo"];
                 if (accountInfoDict && [accountInfoDict isKindOfClass:[NSDictionary class]]) {
@@ -194,32 +381,23 @@ static NSCache *iconCache = nil;
                 }
                 purchaseDate = downloadInfo[@"purchaseDate"];
             }
-            // 兼容旧格式
             if (!appleID) appleID = metadata[@"AppleID"];
             if (!purchaseDate) purchaseDate = metadata[@"purchaseDate"];
-            
             if (!appleID) appleID = @"未知";
             if (!purchaseDate) purchaseDate = @"未知";
-            
             accountInfoStr = [NSString stringWithFormat:@"Apple ID: %@\n开发者: %@\n购买日期: %@", appleID, artist, purchaseDate];
         } else {
             accountInfoStr = [NSString stringWithFormat:@"文件存在但无法解析:\n%@", metadataPath];
         }
     }
     
-    NSString *message = [NSString stringWithFormat:
-                         @"路径: %@\n\nBundle ID: %@\n版本: %@\n\n%@",
-                         bundlePath, bundleId, version, accountInfoStr];
-    
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"应用详情"
-                                                                   message:message
-                                                            preferredStyle:UIAlertControllerStyleAlert];
+    NSString *message = [NSString stringWithFormat:@"路径: %@\n\nBundle ID: %@\n版本: %@\n\n%@", bundlePath, bundleId, version, accountInfoStr];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"应用详情" message:message preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 辅助方法：加载图标
-
+#pragma mark - 图标加载（保持不变）
 - (UIImage *)loadIconForAppAtPath:(NSString *)bundlePath {
     NSString *infoPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
     NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
@@ -263,8 +441,7 @@ static NSCache *iconCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能（中文化）
-
+#pragma mark - 原有下载功能（完全保留）
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
@@ -300,7 +477,7 @@ static NSCache *iconCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2\n作者 Mineek\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.2 (增强版)\n作者 Mineek\n长按应用可降级/清除数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
