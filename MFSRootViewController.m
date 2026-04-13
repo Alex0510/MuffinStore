@@ -90,16 +90,17 @@ static NSCache *iconCache = nil;
     if (!appInfo) return;
     
     NSString *bundleId = appInfo[@"bundleIdentifier"];
-    NSString *bundlePath = appInfo[@"bundlePath"];
+    NSString *bundlePath = appInfo[@"bundlePath"];   // 应用目录：/var/containers/Bundle/Application/.../xxx.app
     
-    // 获取应用代理和数据目录
+    // 获取数据目录：/var/mobile/Containers/Data/Application/.../
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     NSString *dataPath = nil;
     NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
     if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
         dataPath = [(NSURL *)dataContainerURL path];
     } else {
-        dataPath = @"未找到";
+        // 备用方案：手动拼接（极少情况）
+        dataPath = [NSString stringWithFormat:@"/var/mobile/Containers/Data/Application/%@", bundleId];
     }
     
     UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
@@ -108,15 +109,19 @@ static NSCache *iconCache = nil;
     UIAlertAction *launchAction = [UIAlertAction actionWithTitle:@"启动" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self launchAppWithBundleId:bundleId];
     }];
-    // 2. 数据目录
+    // 2. 数据目录（具体应用的数据目录）
     UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        if (dataPath && ![dataPath isEqualToString:@"未找到"]) {
+        if (dataPath && [dataPath length] > 0 && ![[NSFileManager defaultManager] fileExistsAtPath:dataPath]) {
+            // 路径不存在，尝试查找
+            dataPath = [self findDataContainerPathForBundleId:bundleId];
+        }
+        if (dataPath && [[NSFileManager defaultManager] fileExistsAtPath:dataPath]) {
             [self openInFilza:dataPath];
         } else {
-            [self showAlert:@"错误" message:@"无法获取数据目录路径"];
+            [self showAlert:@"错误" message:@"无法找到数据目录，请确保应用已运行过"];
         }
     }];
-    // 3. 应用组目录 (固定路径 /var/mobile/Containers/Shared/AppGroup)
+    // 3. 应用组目录（固定根目录）
     UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self openInFilza:@"/var/mobile/Containers/Shared/AppGroup"];
     }];
@@ -124,9 +129,13 @@ static NSCache *iconCache = nil;
     UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"清理数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self confirmClearDataForAppProxy:appProxy dataPath:dataPath bundleId:bundleId];
     }];
-    // 5. 在 Filza 中显示 (应用目录)
+    // 5. 在 Filza 中显示（应用目录）
     UIAlertAction *showInFilzaAction = [UIAlertAction actionWithTitle:@"在 Filza 中显示" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [self openInFilza:bundlePath];
+        if (bundlePath && [[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) {
+            [self openInFilza:bundlePath];
+        } else {
+            [self showAlert:@"错误" message:@"应用目录不存在"];
+        }
     }];
     UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     
@@ -145,6 +154,25 @@ static NSCache *iconCache = nil;
     [self presentViewController:actionSheet animated:YES completion:nil];
 }
 
+// 辅助方法：通过 bundleId 查找真实的数据容器路径
+- (NSString *)findDataContainerPathForBundleId:(NSString *)bundleId {
+    NSString *dataRoot = @"/var/mobile/Containers/Data/Application";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *subDirs = [fm contentsOfDirectoryAtPath:dataRoot error:nil];
+    for (NSString *dir in subDirs) {
+        NSString *appDir = [dataRoot stringByAppendingPathComponent:dir];
+        NSString *metadataPlist = [appDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        if ([fm fileExistsAtPath:metadataPlist]) {
+            NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPlist];
+            NSString *mcBundleId = metadata[@"MCMMetadataIdentifier"];
+            if ([mcBundleId isEqualToString:bundleId]) {
+                return appDir;
+            }
+        }
+    }
+    return nil;
+}
+
 #pragma mark - 辅助功能实现
 // 启动应用
 - (void)launchAppWithBundleId:(NSString *)bundleId {
@@ -155,13 +183,29 @@ static NSCache *iconCache = nil;
     }
 }
 
-// 打开Filza指定路径
+// 打开Filza指定路径（确保路径存在且正确编码）
 - (void)openInFilza:(NSString *)path {
+    if (!path || path.length == 0) {
+        [self showAlert:@"错误" message:@"路径无效"];
+        return;
+    }
+    // 检查路径是否存在
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不存在:\n%@", path]];
+        return;
+    }
+    // URL 编码
     NSString *encodedPath = [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
     NSString *urlString = [NSString stringWithFormat:@"filza://view?path=%@", encodedPath];
     NSURL *url = [NSURL URLWithString:urlString];
     if ([[UIApplication sharedApplication] canOpenURL:url]) {
-        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL success) {
+            if (!success) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装 Filza 文件管理器"];
+                });
+            }
+        }];
     } else {
         [self showAlert:@"错误" message:@"未安装Filza文件管理器，请先安装Filza"];
     }
@@ -169,8 +213,8 @@ static NSCache *iconCache = nil;
 
 // 确认清除数据
 - (void)confirmClearDataForAppProxy:(id)appProxy dataPath:(NSString *)dataPath bundleId:(NSString *)bundleId {
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清除数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self performClearDataForAppProxy:appProxy dataPath:dataPath bundleId:bundleId];
     }];
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
@@ -183,13 +227,13 @@ static NSCache *iconCache = nil;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         // 1. 清除数据目录
-        if (dataPath && ![dataPath isEqualToString:@"未找到"] && [fm fileExistsAtPath:dataPath]) {
+        if (dataPath && [fm fileExistsAtPath:dataPath]) {
             for (NSString *item in [fm contentsOfDirectoryAtPath:dataPath error:nil]) {
                 NSString *fullPath = [dataPath stringByAppendingPathComponent:item];
                 [fm removeItemAtPath:fullPath error:nil];
             }
         }
-        // 2. 清除应用组目录 (通过KVC获取groupContainerURLs)
+        // 2. 清除应用组目录（该应用关联的 AppGroup）
         NSArray *groupURLs = [(id)appProxy valueForKey:@"groupContainerURLs"];
         if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
             for (NSURL *groupURL in groupURLs) {
@@ -202,7 +246,7 @@ static NSCache *iconCache = nil;
             }
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self showAlert:@"完成" message:@"数据已清除，应用可能需要重启才能生效"];
+            [self showAlert:@"完成" message:@"数据已清理，应用可能需要重启才能生效"];
         });
     });
 }
@@ -454,7 +498,7 @@ static NSCache *iconCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2 (增强版)\n作者 Mineek\n长按应用可启动/清除数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.2 (增强版)\n作者 Mineek\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
