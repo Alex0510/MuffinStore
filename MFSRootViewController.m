@@ -1,13 +1,33 @@
-// MFSRootViewController.m 终极增强版
+// MFSRootViewController.m （终极完整融合版）
 
 #import "MFSRootViewController.h"
 #import "CoreServices.h"
 #import <objc/runtime.h>
 
+@interface SKUIItemStateCenter : NSObject
++ (id)defaultCenter;
+- (id)_newPurchasesWithItems:(id)items;
+- (void)_performPurchases:(id)purchases hasBundlePurchase:(_Bool)purchase withClientContext:(id)context completionBlock:(id)block;
+@end
+
+@interface SKUIItem : NSObject
+- (id)initWithLookupDictionary:(id)dictionary;
+@end
+
+@interface SKUIItemOffer : NSObject
+- (id)initWithLookupDictionary:(id)dictionary;
+@end
+
+@interface SKUIClientContext : NSObject
++ (id)defaultContext;
+@end
+
 static NSCache *iconCache;
 static NSCache *groupPathCache;
 
 @implementation MFSRootViewController
+
+#pragma mark - 初始化
 
 + (void)initialize {
     if (self == [MFSRootViewController class]) {
@@ -16,7 +36,34 @@ static NSCache *groupPathCache;
     }
 }
 
-#pragma mark - Filza 修复（核心）
+#pragma mark - UI
+
+- (void)loadView {
+    [super loadView];
+
+    UIBarButtonItem *refresh = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+        target:self
+        action:@selector(refreshAppList)];
+
+    UIBarButtonItem *idDownload = [[UIBarButtonItem alloc]
+        initWithTitle:@"ID下载"
+        style:UIBarButtonItemStylePlain
+        target:self
+        action:@selector(promptForAppIdDownload)];
+
+    self.navigationItem.rightBarButtonItem = refresh;
+    self.navigationItem.leftBarButtonItem = idDownload;
+}
+
+- (void)refreshAppList {
+    _specifiers = nil;
+    [iconCache removeAllObjects];
+    [groupPathCache removeAllObjects];
+    [self reloadSpecifiers];
+}
+
+#pragma mark - Filza 修复（关键）
 
 - (void)openInFilza:(NSString *)path {
     if (!path.length) {
@@ -42,7 +89,7 @@ static NSCache *groupPathCache;
     }
 }
 
-#pragma mark - AppGroup 全获取
+#pragma mark - AppGroup（增强）
 
 - (NSArray *)getAllGroupPaths:(NSString *)bundleId appProxy:(id)appProxy {
     NSMutableArray *arr = [NSMutableArray array];
@@ -64,9 +111,10 @@ static NSCache *groupPathCache;
     for (NSString *dir in dirs) {
         NSString *full = [root stringByAppendingPathComponent:dir];
         NSString *meta = [full stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-        NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:meta];
 
+        NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:meta];
         NSString *idStr = [plist[@"MCMMetadataIdentifier"] lowercaseString];
+
         if (!idStr) continue;
 
         if ([idStr containsString:lower] || [lower containsString:idStr]) {
@@ -78,8 +126,6 @@ static NSCache *groupPathCache;
 
     return arr;
 }
-
-#pragma mark - AppGroup UI
 
 - (void)showAllAppGroups:(NSString *)bundleId appProxy:(id)appProxy {
     NSArray *groups = [self getAllGroupPaths:bundleId appProxy:appProxy];
@@ -115,7 +161,7 @@ static NSCache *groupPathCache;
     return nil;
 }
 
-#pragma mark - 备份
+#pragma mark - 备份 & 恢复
 
 - (void)backupAppData:(NSString *)bundleId appProxy:(id)appProxy {
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
@@ -138,8 +184,6 @@ static NSCache *groupPathCache;
     });
 }
 
-#pragma mark - 恢复
-
 - (void)restoreAppData:(NSString *)bundleId appProxy:(id)appProxy {
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         NSString *backup = [@"/var/mobile/Documents/MuffinBackup" stringByAppendingPathComponent:bundleId];
@@ -154,13 +198,13 @@ static NSCache *groupPathCache;
             return;
         }
 
-        for (NSString *file in [fm contentsOfDirectoryAtPath:data error:nil]) {
-            [fm removeItemAtPath:[data stringByAppendingPathComponent:file] error:nil];
+        for (NSString *f in [fm contentsOfDirectoryAtPath:data error:nil]) {
+            [fm removeItemAtPath:[data stringByAppendingPathComponent:f] error:nil];
         }
 
-        for (NSString *file in [fm contentsOfDirectoryAtPath:backup error:nil]) {
-            [fm copyItemAtPath:[backup stringByAppendingPathComponent:file]
-                        toPath:[data stringByAppendingPathComponent:file]
+        for (NSString *f in [fm contentsOfDirectoryAtPath:backup error:nil]) {
+            [fm copyItemAtPath:[backup stringByAppendingPathComponent:f]
+                        toPath:[data stringByAppendingPathComponent:f]
                          error:nil];
         }
 
@@ -170,7 +214,7 @@ static NSCache *groupPathCache;
     });
 }
 
-#pragma mark - 长按菜单（终极版）
+#pragma mark - 长按菜单（增强）
 
 - (void)handleLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
@@ -218,21 +262,32 @@ static NSCache *groupPathCache;
     [self presentViewController:menu animated:YES completion:nil];
 }
 
-#pragma mark - 清理数据
+#pragma mark - 下载功能（完整保留）
 
-- (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
-    dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        NSString *path = [self getDataContainerPathForBundleId:bundleId appProxy:appProxy];
-        NSFileManager *fm = NSFileManager.defaultManager;
+- (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId {
 
-        for (NSString *f in [fm contentsOfDirectoryAtPath:path error:nil]) {
-            [fm removeItemAtPath:[path stringByAppendingPathComponent:f] error:nil];
-        }
+    NSString *adamId = [NSString stringWithFormat:@"%lld", appId];
+    NSString *offer = [NSString stringWithFormat:
+        @"productType=C&price=0&salableAdamId=%@&appExtVrsId=%lld",
+        adamId, versionId];
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self showAlert:@"完成" message:@"已清理"];
-        });
-    });
+    NSDictionary *offerDict = @{@"buyParams": offer};
+    NSDictionary *itemDict = @{@"_itemOffer": adamId};
+
+    SKUIItemOffer *o = [[SKUIItemOffer alloc] initWithLookupDictionary:offerDict];
+    SKUIItem *item = [[SKUIItem alloc] initWithLookupDictionary:itemDict];
+
+    [item setValue:o forKey:@"_itemOffer"];
+    [item setValue:@"iosSoftware" forKey:@"_itemKindString"];
+    [item setValue:@(versionId) forKey:@"_versionIdentifier"];
+
+    SKUIItemStateCenter *center = [SKUIItemStateCenter defaultCenter];
+
+    [center _performPurchases:
+        [center _newPurchasesWithItems:@[item]]
+        hasBundlePurchase:0
+        withClientContext:[SKUIClientContext defaultContext]
+        completionBlock:^(id x){}];
 }
 
 #pragma mark - Alert
