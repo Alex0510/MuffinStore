@@ -42,7 +42,6 @@ static NSCache *iconCache = nil;
 }
 
 - (void)refreshAppList {
-    // 清除缓存，强制重新构建 specifiers
     _specifiers = nil;
     [iconCache removeAllObjects];
     [self reloadSpecifiers];
@@ -52,7 +51,6 @@ static NSCache *iconCache = nil;
     if(!_specifiers) {
         _specifiers = [NSMutableArray new];
         
-        // Download 分组
         PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         downloadGroupSpecifier.name = @"下载";
         [_specifiers addObject:downloadGroupSpecifier];
@@ -66,7 +64,6 @@ static NSCache *iconCache = nil;
         NSString* aboutText = [self getAboutText];
         [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
         
-        // Installed Apps 分组
         PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         installedGroupSpecifier.name = @"已安装应用";
         [_specifiers addObject:installedGroupSpecifier];
@@ -78,15 +75,11 @@ static NSCache *iconCache = nil;
             appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
             appInfo[@"localizedName"] = appProxy.localizedName ?: @"未知";
             
-            // 获取版本号
             NSString *infoPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"];
             NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
             NSString *version = infoPlist[@"CFBundleShortVersionString"] ?: infoPlist[@"CFBundleVersion"] ?: @"N/A";
             appInfo[@"version"] = version;
-            
-            // 存储应用路径（.app 目录）
             appInfo[@"bundlePath"] = appProxy.bundleURL.path;
-            // 存储 .app 所在的上层目录（UUID 目录），用于查找 iTunesMetadata.plist
             appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
             
             PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appProxy.localizedName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
@@ -106,7 +99,7 @@ static NSCache *iconCache = nil;
     return _specifiers;
 }
 
-#pragma mark - UITableView 定制（显示图标、版本号、Bundle ID）
+#pragma mark - UITableView 定制
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
@@ -114,17 +107,13 @@ static NSCache *iconCache = nil;
     NSDictionary *appInfo = [specifier propertyForKey:@"appInfo"];
     
     if (appInfo && specifier.identifier != nil && ![specifier.identifier isEqualToString:@"download"]) {
-        // 应用名称
         cell.textLabel.text = appInfo[@"localizedName"];
-        
-        // 副标题：版本号 + Bundle ID
         NSString *version = appInfo[@"version"];
         NSString *bundleId = appInfo[@"bundleIdentifier"];
         cell.detailTextLabel.text = [NSString stringWithFormat:@"v%@ • %@", version, bundleId];
         cell.detailTextLabel.textColor = [UIColor grayColor];
         cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
         
-        // 图标（缓存）
         UIImage *icon = [iconCache objectForKey:bundleId];
         if (!icon) {
             icon = [self loadIconForAppAtPath:appInfo[@"bundlePath"]];
@@ -138,7 +127,6 @@ static NSCache *iconCache = nil;
         cell.imageView.layer.cornerRadius = 8;
         cell.imageView.clipsToBounds = YES;
         
-        // 详情按钮
         UIButton *infoButton = [UIButton buttonWithType:UIButtonTypeDetailDisclosure];
         [infoButton addTarget:self action:@selector(showAppDetails:) forControlEvents:UIControlEventTouchUpInside];
         objc_setAssociatedObject(infoButton, "appInfo", appInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -152,19 +140,18 @@ static NSCache *iconCache = nil;
     return cell;
 }
 
-// 显示应用详情（实时读取 iTunesMetadata.plist，优先查找同级目录）
+// 关键修改：正确解析嵌套的 accountInfo 和 purchaseDate
 - (void)showAppDetails:(UIButton *)sender {
     NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
     if (!appInfo) return;
     
-    NSString *bundlePath = appInfo[@"bundlePath"];      // .app 路径
-    NSString *containerPath = appInfo[@"containerPath"]; // UUID 目录路径
+    NSString *bundlePath = appInfo[@"bundlePath"];
+    NSString *containerPath = appInfo[@"containerPath"];
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *version = appInfo[@"version"];
     
-    // 1. 优先在 UUID 目录下查找 iTunesMetadata.plist（与 .app 同级）
+    // 查找 iTunesMetadata.plist
     NSString *metadataPath1 = [containerPath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
-    // 2. 其次在 .app 内部查找
     NSString *metadataPath2 = [bundlePath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
     
     NSString *metadataPath = nil;
@@ -177,24 +164,41 @@ static NSCache *iconCache = nil;
         fileExists = YES;
     }
     
-    NSString *accountInfo;
+    NSString *accountInfoStr;
     if (!fileExists) {
-        accountInfo = [NSString stringWithFormat:@"未找到 iTunesMetadata.plist\n尝试路径:\n%@\n%@", metadataPath1, metadataPath2];
+        accountInfoStr = [NSString stringWithFormat:@"未找到 iTunesMetadata.plist\n尝试路径:\n%@\n%@", metadataPath1, metadataPath2];
     } else {
         NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
         if (metadata) {
-            NSString *appleID = metadata[@"AppleID"] ?: @"未知";
+            // 尝试从根目录获取 artistName
             NSString *artist = metadata[@"artistName"] ?: @"未知";
-            NSString *purchaseDate = metadata[@"purchaseDate"] ?: @"未知";
-            accountInfo = [NSString stringWithFormat:@"Apple ID: %@\n开发者: %@\n购买日期: %@", appleID, artist, purchaseDate];
+            
+            // 获取 downloadInfo 和 accountInfo
+            NSDictionary *downloadInfo = metadata[@"com.apple.iTunesStore.downloadInfo"];
+            NSDictionary *accountInfoDict = downloadInfo[@"accountInfo"];
+            NSString *appleID = nil;
+            NSString *purchaseDate = nil;
+            
+            if (accountInfoDict && [accountInfoDict isKindOfClass:[NSDictionary class]]) {
+                appleID = accountInfoDict[@"AppleID"];
+                purchaseDate = accountInfoDict[@"purchaseDate"];
+            }
+            // 如果嵌套结构不存在，尝试直接从根目录读取（兼容旧格式）
+            if (!appleID) appleID = metadata[@"AppleID"];
+            if (!purchaseDate) purchaseDate = metadata[@"purchaseDate"];
+            
+            if (!appleID) appleID = @"未知";
+            if (!purchaseDate) purchaseDate = @"未知";
+            
+            accountInfoStr = [NSString stringWithFormat:@"Apple ID: %@\n开发者: %@\n购买日期: %@", appleID, artist, purchaseDate];
         } else {
-            accountInfo = [NSString stringWithFormat:@"文件存在但无法解析:\n%@", metadataPath];
+            accountInfoStr = [NSString stringWithFormat:@"文件存在但无法解析:\n%@", metadataPath];
         }
     }
     
     NSString *message = [NSString stringWithFormat:
                          @"路径: %@\n\nBundle ID: %@\n版本: %@\n\n%@",
-                         bundlePath, bundleId, version, accountInfo];
+                         bundlePath, bundleId, version, accountInfoStr];
     
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"应用详情"
                                                                    message:message
@@ -203,7 +207,7 @@ static NSCache *iconCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 辅助方法：加载应用图标
+#pragma mark - 辅助方法：加载图标
 
 - (UIImage *)loadIconForAppAtPath:(NSString *)bundlePath {
     NSString *infoPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
@@ -248,7 +252,7 @@ static NSCache *iconCache = nil;
     return nil;
 }
 
-#pragma mark - 下载相关功能（所有提示已中文化）
+#pragma mark - 下载功能（中文化，无修改）
 
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
