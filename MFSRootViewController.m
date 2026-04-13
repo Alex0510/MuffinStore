@@ -66,7 +66,7 @@ static NSCache *iconCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 长按菜单（动态显示应用组目录，修复所有应用目录跳转）
+#pragma mark - 长按菜单（显示应用组目录，使用多级检测）
 - (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
     UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
     if (existingGesture) {
@@ -96,7 +96,7 @@ static NSCache *iconCache = nil;
     UIAlertAction *launchAction = [UIAlertAction actionWithTitle:@"启动" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self launchAppWithBundleId:bundleId];
     }];
-    // 2. 应用目录（修复所有应用跳转，使用绝对路径和正确的 URL 编码）
+    // 2. 应用目录
     UIAlertAction *appDirAction = [UIAlertAction actionWithTitle:@"应用目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         if (bundlePath && [[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) {
             [self openInFilza:bundlePath];
@@ -106,14 +106,7 @@ static NSCache *iconCache = nil;
     }];
     // 3. 数据目录
     UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *dataPath = nil;
-        NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
-        if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
-            dataPath = [(NSURL *)dataContainerURL path];
-        }
-        if (!dataPath || ![[NSFileManager defaultManager] fileExistsAtPath:dataPath]) {
-            dataPath = [self findDataContainerPathForBundleId:bundleId];
-        }
+        NSString *dataPath = [self getDataContainerPathForBundleId:bundleId appProxy:appProxy];
         if (dataPath && [[NSFileManager defaultManager] fileExistsAtPath:dataPath]) {
             [self openInFilza:dataPath];
         } else {
@@ -121,7 +114,7 @@ static NSCache *iconCache = nil;
         }
     }];
     
-    // 检查是否有应用组目录（增强版：同时使用 KVC 和文件扫描）
+    // 检测是否有应用组目录（使用强力检测）
     BOOL hasAppGroup = [self appHasGroupContainer:bundleId appProxy:appProxy];
     
     // 按顺序添加按钮
@@ -131,6 +124,7 @@ static NSCache *iconCache = nil;
     
     if (hasAppGroup) {
         UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            // 打开应用组根目录，用户可以自己找到对应的组文件夹
             [self openInFilza:@"/var/mobile/Containers/Shared/AppGroup"];
         }];
         [actionSheet addAction:appGroupAction];
@@ -152,44 +146,21 @@ static NSCache *iconCache = nil;
     [self presentViewController:actionSheet animated:YES completion:nil];
 }
 
-// 增强版应用组检测（支持更多 App）
-- (BOOL)appHasGroupContainer:(NSString *)bundleId appProxy:(id)appProxy {
-    // 方法1：通过 LSApplicationProxy 的 groupContainerURLs
-    NSArray *groupURLs = nil;
-    @try {
-        if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-            groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-        } else {
-            groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-        }
-    } @catch (NSException *exception) {
-        groupURLs = nil;
-    }
-    if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
-        return YES;
-    }
-    
-    // 方法2：扫描 /var/mobile/Containers/Shared/AppGroup 目录
-    NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:appGroupRoot]) {
-        NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
-        for (NSString *dir in subDirs) {
-            NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
-            NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-            if ([fm fileExistsAtPath:metadataPath]) {
-                NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
-                NSString *identifier = metadata[@"MCMMetadataIdentifier"];
-                if ([identifier isEqualToString:bundleId]) {
-                    return YES;
-                }
-            }
+// 获取数据容器路径（增强版）
+- (NSString *)getDataContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
+    // 尝试 KVC
+    NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
+    if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
+        NSString *path = [(NSURL *)dataContainerURL path];
+        if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            return path;
         }
     }
-    return NO;
+    // 扫描 /var/mobile/Containers/Data/Application
+    return [self findDataContainerPathForBundleId:bundleId];
 }
 
-// 查找数据容器路径
+// 查找数据容器路径（通过扫描 metadata）
 - (NSString *)findDataContainerPathForBundleId:(NSString *)bundleId {
     NSString *dataRoot = @"/var/mobile/Containers/Data/Application";
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -206,6 +177,50 @@ static NSCache *iconCache = nil;
         }
     }
     return nil;
+}
+
+// 增强版应用组检测（保证能检测到，如 58同城）
+- (BOOL)appHasGroupContainer:(NSString *)bundleId appProxy:(id)appProxy {
+    // 方法1：通过 LSApplicationProxy 的 groupContainerURLs 属性
+    NSArray *groupURLs = nil;
+    @try {
+        if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+            groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+        } else {
+            groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+        }
+    } @catch (NSException *exception) {
+        groupURLs = nil;
+    }
+    if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
+        return YES;
+    }
+    
+    // 方法2：扫描 /var/mobile/Containers/Shared/AppGroup 目录，匹配 bundleId 前缀或完整匹配
+    NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:appGroupRoot]) {
+        NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
+        for (NSString *dir in subDirs) {
+            NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
+            NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+            if ([fm fileExistsAtPath:metadataPath]) {
+                NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+                NSString *identifier = metadata[@"MCMMetadataIdentifier"];
+                // 匹配 bundleId 或者包含 bundleId 的组标识（如 group.com.taofang, group.com.taofang.iphone.widget）
+                if ([identifier isEqualToString:bundleId] || [identifier hasSuffix:bundleId] || [identifier rangeOfString:bundleId].location != NSNotFound) {
+                    return YES;
+                }
+            }
+        }
+        // 方法3：如果没有 metadata 文件，尝试直接匹配目录名是否包含 bundleId（降级方案）
+        for (NSString *dir in subDirs) {
+            if ([dir containsString:bundleId]) {
+                return YES;
+            }
+        }
+    }
+    return NO;
 }
 
 #pragma mark - 辅助功能
@@ -262,14 +277,7 @@ static NSCache *iconCache = nil;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         // 数据目录
-        NSString *dataPath = nil;
-        NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
-        if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
-            dataPath = [(NSURL *)dataContainerURL path];
-        }
-        if (!dataPath || ![fm fileExistsAtPath:dataPath]) {
-            dataPath = [self findDataContainerPathForBundleId:bundleId];
-        }
+        NSString *dataPath = [self getDataContainerPathForBundleId:bundleId appProxy:appProxy];
         if (dataPath && [fm fileExistsAtPath:dataPath]) {
             for (NSString *item in [fm contentsOfDirectoryAtPath:dataPath error:nil]) {
                 NSString *fullPath = [dataPath stringByAppendingPathComponent:item];
