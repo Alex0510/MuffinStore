@@ -92,16 +92,8 @@ static NSCache *iconCache = nil;
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *bundlePath = appInfo[@"bundlePath"];   // 应用目录：/var/containers/Bundle/Application/.../xxx.app
     
-    // 获取数据目录：/var/mobile/Containers/Data/Application/.../
+    // 获取应用代理
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
-    NSString *dataPath = nil;
-    NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
-    if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
-        dataPath = [(NSURL *)dataContainerURL path];
-    } else {
-        // 备用方案：手动拼接（极少情况）
-        dataPath = [NSString stringWithFormat:@"/var/mobile/Containers/Data/Application/%@", bundleId];
-    }
     
     UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     
@@ -111,8 +103,13 @@ static NSCache *iconCache = nil;
     }];
     // 2. 数据目录（具体应用的数据目录）
     UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        if (dataPath && [dataPath length] > 0 && ![[NSFileManager defaultManager] fileExistsAtPath:dataPath]) {
-            // 路径不存在，尝试查找
+        // 在block内部独立获取数据路径
+        NSString *dataPath = nil;
+        NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
+        if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
+            dataPath = [(NSURL *)dataContainerURL path];
+        }
+        if (!dataPath || ![[NSFileManager defaultManager] fileExistsAtPath:dataPath]) {
             dataPath = [self findDataContainerPathForBundleId:bundleId];
         }
         if (dataPath && [[NSFileManager defaultManager] fileExistsAtPath:dataPath]) {
@@ -127,7 +124,7 @@ static NSCache *iconCache = nil;
     }];
     // 4. 清理数据
     UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"清理数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self confirmClearDataForAppProxy:appProxy dataPath:dataPath bundleId:bundleId];
+        [self confirmClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
     // 5. 在 Filza 中显示（应用目录）
     UIAlertAction *showInFilzaAction = [UIAlertAction actionWithTitle:@"在 Filza 中显示" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
@@ -183,7 +180,7 @@ static NSCache *iconCache = nil;
     }
 }
 
-// 打开Filza指定路径（确保路径存在且正确编码）
+// 打开Filza指定路径
 - (void)openInFilza:(NSString *)path {
     if (!path || path.length == 0) {
         [self showAlert:@"错误" message:@"路径无效"];
@@ -211,11 +208,11 @@ static NSCache *iconCache = nil;
     }
 }
 
-// 确认清除数据
-- (void)confirmClearDataForAppProxy:(id)appProxy dataPath:(NSString *)dataPath bundleId:(NSString *)bundleId {
+// 确认清除数据（不再依赖外部 dataPath）
+- (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self performClearDataForAppProxy:appProxy dataPath:dataPath bundleId:bundleId];
+        [self performClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     [confirm addAction:clear];
@@ -223,17 +220,25 @@ static NSCache *iconCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-- (void)performClearDataForAppProxy:(id)appProxy dataPath:(NSString *)dataPath bundleId:(NSString *)bundleId {
+- (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        // 1. 清除数据目录
+        // 1. 获取数据目录并清除
+        NSString *dataPath = nil;
+        NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
+        if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
+            dataPath = [(NSURL *)dataContainerURL path];
+        }
+        if (!dataPath || ![fm fileExistsAtPath:dataPath]) {
+            dataPath = [self findDataContainerPathForBundleId:bundleId];
+        }
         if (dataPath && [fm fileExistsAtPath:dataPath]) {
             for (NSString *item in [fm contentsOfDirectoryAtPath:dataPath error:nil]) {
                 NSString *fullPath = [dataPath stringByAppendingPathComponent:item];
                 [fm removeItemAtPath:fullPath error:nil];
             }
         }
-        // 2. 清除应用组目录（该应用关联的 AppGroup）
+        // 2. 清除应用组目录
         NSArray *groupURLs = [(id)appProxy valueForKey:@"groupContainerURLs"];
         if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
             for (NSURL *groupURL in groupURLs) {
