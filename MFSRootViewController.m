@@ -66,9 +66,8 @@ static NSCache *iconCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 长按菜单（与图二样式一致：启动、数据目录、应用组目录、清理数据、在 Filza 中显示）
+#pragma mark - 长按菜单（启动、数据目录、应用组目录、清理数据、在 Filza 中显示）
 - (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
-    // 移除已存在的手势，避免重复添加
     UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
     if (existingGesture) {
         [cell removeGestureRecognizer:existingGesture];
@@ -77,7 +76,6 @@ static NSCache *iconCache = nil;
     longPress.minimumPressDuration = 0.6;
     [cell addGestureRecognizer:longPress];
     objc_setAssociatedObject(cell, "longPressGesture", longPress, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    // 保存appInfo和specifier到cell
     objc_setAssociatedObject(cell, "appInfo", appInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(cell, "specifier", specifier, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -90,20 +88,17 @@ static NSCache *iconCache = nil;
     if (!appInfo) return;
     
     NSString *bundleId = appInfo[@"bundleIdentifier"];
-    NSString *bundlePath = appInfo[@"bundlePath"];   // 应用目录：/var/containers/Bundle/Application/.../xxx.app
-    
-    // 获取应用代理
+    NSString *bundlePath = appInfo[@"bundlePath"];
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     
     UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     
-    // 1. 启动应用
+    // 启动应用
     UIAlertAction *launchAction = [UIAlertAction actionWithTitle:@"启动" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self launchAppWithBundleId:bundleId];
     }];
-    // 2. 数据目录（具体应用的数据目录）
+    // 数据目录（具体应用的数据目录）
     UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        // 在block内部独立获取数据路径
         NSString *dataPath = nil;
         NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
         if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
@@ -118,16 +113,16 @@ static NSCache *iconCache = nil;
             [self showAlert:@"错误" message:@"无法找到数据目录，请确保应用已运行过"];
         }
     }];
-    // 3. 应用组目录（固定根目录）
+    // 应用组目录（固定根目录）
     UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self openInFilza:@"/var/mobile/Containers/Shared/AppGroup"];
     }];
-    // 4. 清理数据
+    // 清理数据
     UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"清理数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self confirmClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
-    // 5. 在 Filza 中显示（应用目录）
-    UIAlertAction *showInFilzaAction = [UIAlertAction actionWithTitle:@"在 Filza 中显示" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    // 在 Filza 中显示（应用目录 /var/containers/Bundle/Application/...）
+    UIAlertAction *showInFilzaAction = [UIAlertAction actionWithTitle:@"应用目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         if (bundlePath && [[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) {
             [self openInFilza:bundlePath];
         } else {
@@ -143,7 +138,6 @@ static NSCache *iconCache = nil;
     [actionSheet addAction:showInFilzaAction];
     [actionSheet addAction:cancelAction];
     
-    // iPad适配
     if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         actionSheet.popoverPresentationController.sourceView = cell;
         actionSheet.popoverPresentationController.sourceRect = cell.bounds;
@@ -151,7 +145,7 @@ static NSCache *iconCache = nil;
     [self presentViewController:actionSheet animated:YES completion:nil];
 }
 
-// 辅助方法：通过 bundleId 查找真实的数据容器路径
+// 查找数据容器路径
 - (NSString *)findDataContainerPathForBundleId:(NSString *)bundleId {
     NSString *dataRoot = @"/var/mobile/Containers/Data/Application";
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -170,8 +164,7 @@ static NSCache *iconCache = nil;
     return nil;
 }
 
-#pragma mark - 辅助功能实现
-// 启动应用
+#pragma mark - 辅助功能
 - (void)launchAppWithBundleId:(NSString *)bundleId {
     LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
     BOOL success = [workspace openApplicationWithBundleID:bundleId];
@@ -180,26 +173,27 @@ static NSCache *iconCache = nil;
     }
 }
 
-// 打开Filza指定路径
+// 修复 Filza 跳转：使用 filza:/// 绝对路径格式
 - (void)openInFilza:(NSString *)path {
     if (!path || path.length == 0) {
         [self showAlert:@"错误" message:@"路径无效"];
         return;
     }
-    // 检查路径是否存在
+    // 确保路径存在
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
         [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不存在:\n%@", path]];
         return;
     }
-    // URL 编码
-    NSString *encodedPath = [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-    NSString *urlString = [NSString stringWithFormat:@"filza://view?path=%@", encodedPath];
+    // Filza URL Scheme: filza:///absolute/path （三个斜杠）
+    // 需要确保 path 以 / 开头，然后整体编码
+    NSString *encodedPath = [path stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+    NSString *urlString = [NSString stringWithFormat:@"filza://%@", encodedPath];
     NSURL *url = [NSURL URLWithString:urlString];
     if ([[UIApplication sharedApplication] canOpenURL:url]) {
         [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:^(BOOL success) {
             if (!success) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装 Filza 文件管理器"];
+                    [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装最新版Filza"];
                 });
             }
         }];
@@ -208,7 +202,7 @@ static NSCache *iconCache = nil;
     }
 }
 
-// 确认清除数据（不再依赖外部 dataPath）
+// 确认清理数据
 - (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
@@ -223,7 +217,7 @@ static NSCache *iconCache = nil;
 - (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        // 1. 获取数据目录并清除
+        // 数据目录
         NSString *dataPath = nil;
         NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
         if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
@@ -238,7 +232,7 @@ static NSCache *iconCache = nil;
                 [fm removeItemAtPath:fullPath error:nil];
             }
         }
-        // 2. 清除应用组目录
+        // 应用组目录
         NSArray *groupURLs = [(id)appProxy valueForKey:@"groupContainerURLs"];
         if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
             for (NSURL *groupURL in groupURLs) {
@@ -256,7 +250,7 @@ static NSCache *iconCache = nil;
     });
 }
 
-#pragma mark - 原有代码（保持功能不变）
+#pragma mark - 原有代码（保持不变）
 - (void)refreshAppList {
     _specifiers = nil;
     [iconCache removeAllObjects];
@@ -324,7 +318,6 @@ static NSCache *iconCache = nil;
     return _specifiers;
 }
 
-#pragma mark - UITableView 定制
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
     PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];
@@ -357,7 +350,6 @@ static NSCache *iconCache = nil;
         cell.accessoryView = infoButton;
         cell.selectionStyle = UITableViewCellSelectionStyleBlue;
         
-        // 添加长按手势
         [self addLongPressGestureForCell:cell appInfo:appInfo specifier:specifier];
     } else {
         cell.accessoryView = nil;
@@ -367,7 +359,6 @@ static NSCache *iconCache = nil;
     return cell;
 }
 
-// 显示应用详情（保持不变）
 - (void)showAppDetails:(UIButton *)sender {
     NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
     if (!appInfo) return;
@@ -423,7 +414,6 @@ static NSCache *iconCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 图标加载（保持不变）
 - (UIImage *)loadIconForAppAtPath:(NSString *)bundlePath {
     NSString *infoPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
     NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
