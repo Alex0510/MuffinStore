@@ -3,12 +3,13 @@
 #import "CoreServices.h"
 #import <objc/runtime.h>
 
-// 私有扩展，添加简单的搜索栏作为 tableHeaderView
+// 私有扩展
 @interface MFSRootViewController () <UISearchBarDelegate>
 @property (nonatomic, strong) NSMutableArray *originalSpecifiers;   // 所有原始 specifiers
 @property (nonatomic, strong) NSMutableArray *filteredAppSpecifiers; // 过滤后的应用 specifiers
-@property (nonatomic, strong) UISearchBar *searchBar;
 @property (nonatomic, copy) NSString *searchText;
+@property (nonatomic, strong) UIBarButtonItem *searchButton;
+@property (nonatomic, strong) UIBarButtonItem *cancelSearchButton;
 @end
 
 // 私有类声明（保持不变）
@@ -49,30 +50,60 @@ static NSCache *groupPathCache = nil;
     
     // 右上角刷新按钮
     UIBarButtonItem *refreshButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshAppList)];
-    self.navigationItem.rightBarButtonItem = refreshButton;
+    
+    // 搜索按钮
+    self.searchButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemSearch target:self action:@selector(showSearchDialog)];
+    self.cancelSearchButton = [[UIBarButtonItem alloc] initWithTitle:@"取消" style:UIBarButtonItemStylePlain target:self action:@selector(cancelSearch)];
+    
+    self.navigationItem.rightBarButtonItems = @[refreshButton, self.searchButton];
     
     // 左上角：直接输入软件ID下载按钮
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
-    
-    // 初始化搜索栏（作为 tableHeaderView，避免与 PSViewController 冲突）
-    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
-    self.searchBar.placeholder = @"搜索应用";
-    self.searchBar.delegate = self;
-    self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
-    self.tableView.tableHeaderView = self.searchBar;
 }
 
-#pragma mark - UISearchBarDelegate
-- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
-    self.searchText = searchText;
+#pragma mark - 搜索功能（使用对话框，稳定不闪退）
+- (void)showSearchDialog {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"搜索应用" message:@"输入应用名称或 Bundle ID" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"搜索...";
+        textField.text = self.searchText;
+        textField.clearButtonMode = UITextFieldViewModeWhileEditing;
+        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        // 实时监听文本变化需要使用通知或代理，但 UIAlertController 的 textField 实时监听较复杂，采用简单方式：点击搜索后应用过滤
+    }];
+    UIAlertAction *searchAction = [UIAlertAction actionWithTitle:@"搜索" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *text = alert.textFields.firstObject.text;
+        self.searchText = text;
+        [self filterAppSpecifiers];
+        [self reloadSpecifiers];
+        // 更新导航栏按钮状态
+        if (self.searchText.length > 0) {
+            self.navigationItem.rightBarButtonItems = @[self.searchButton, self.cancelSearchButton];
+        } else {
+            self.navigationItem.rightBarButtonItems = @[self.searchButton];
+        }
+    }];
+    UIAlertAction *clearAction = [UIAlertAction actionWithTitle:@"清除搜索" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        self.searchText = @"";
+        [self filterAppSpecifiers];
+        [self reloadSpecifiers];
+        self.navigationItem.rightBarButtonItems = @[self.searchButton];
+    }];
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    [alert addAction:searchAction];
+    if (self.searchText.length > 0) {
+        [alert addAction:clearAction];
+    }
+    [alert addAction:cancelAction];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)cancelSearch {
+    self.searchText = @"";
     [self filterAppSpecifiers];
     [self reloadSpecifiers];
-}
-
-- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
-    [searchBar resignFirstResponder];
+    self.navigationItem.rightBarButtonItems = @[self.searchButton];
 }
 
 #pragma mark - 过滤应用
@@ -110,8 +141,9 @@ static NSCache *groupPathCache = nil;
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
     self.searchText = @"";
-    self.searchBar.text = @"";
+    [self filterAppSpecifiers];
     [self reloadSpecifiers];
+    self.navigationItem.rightBarButtonItems = @[self.searchButton];
 }
 
 #pragma mark - 构建原始 specifiers（包含所有应用）
@@ -176,7 +208,6 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSMutableArray*)specifiers {
-    // 懒加载原始数据
     if (!_originalSpecifiers) {
         _originalSpecifiers = [self buildOriginalSpecifiers];
         _filteredAppSpecifiers = [_originalSpecifiers mutableCopy];
@@ -348,7 +379,6 @@ static NSCache *groupPathCache = nil;
                 NSString *identifier = metadata[@"MCMMetadataIdentifier"];
                 if (identifier) {
                     NSString *identifierLower = [identifier lowercaseString];
-                    // 完全匹配 或 后缀匹配 或 包含匹配（大小写不敏感）
                     if ([identifierLower isEqualToString:bundleIdLower] ||
                         [identifierLower hasSuffix:bundleIdLower] ||
                         [identifierLower rangeOfString:bundleIdLower].location != NSNotFound) {
@@ -593,7 +623,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能（完全保留，确保所有 UI 操作在主线程）
+#pragma mark - 原有下载功能（完全保留）
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
