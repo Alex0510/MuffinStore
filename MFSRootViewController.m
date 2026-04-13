@@ -1,7 +1,7 @@
 // MFSRootViewController.m
 #import "MFSRootViewController.h"
 #import "CoreServices.h"
-#import "objc/runtime.h"
+#import <objc/runtime.h>
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -22,7 +22,6 @@
 + (id)defaultContext;
 @end
 
-// 用于缓存应用图标
 static NSCache *iconCache = nil;
 
 @implementation MFSRootViewController
@@ -63,7 +62,6 @@ static NSCache *iconCache = nil;
         
         NSMutableArray *appSpecifiers = [NSMutableArray new];
         [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
-            // 收集应用详细信息
             NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
             appInfo[@"bundleURL"] = appProxy.bundleURL;
             appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
@@ -75,31 +73,13 @@ static NSCache *iconCache = nil;
             NSString *version = infoPlist[@"CFBundleShortVersionString"] ?: infoPlist[@"CFBundleVersion"] ?: @"N/A";
             appInfo[@"version"] = version;
             
-            // 获取应用路径
+            // 存储应用路径（用于详情弹窗实时读取 iTunesMetadata.plist）
             appInfo[@"bundlePath"] = appProxy.bundleURL.path;
-            
-            // 读取 iTunesMetadata.plist
-            NSString *metadataPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"iTunesMetadata.plist"];
-            NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
-            if (metadata) {
-                NSMutableDictionary *accountInfo = [NSMutableDictionary dictionary];
-                if (metadata[@"AppleID"]) accountInfo[@"AppleID"] = metadata[@"AppleID"];
-                if (metadata[@"artistName"]) accountInfo[@"artistName"] = metadata[@"artistName"];
-                if (metadata[@"purchaseDate"]) accountInfo[@"purchaseDate"] = metadata[@"purchaseDate"];
-                if (metadata[@"bundleShortVersionString"]) accountInfo[@"storeVersion"] = metadata[@"bundleShortVersionString"];
-                appInfo[@"iTunesMetadata"] = accountInfo;
-            } else {
-                appInfo[@"iTunesMetadata"] = @{};
-            }
-            
-            // 获取图标（延迟加载，在 cell 中实际获取）
-            appInfo[@"icon"] = nil; // 稍后加载
             
             PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appProxy.localizedName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
             [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
             [appSpecifier setProperty:@YES forKey:@"enabled"];
             appSpecifier.buttonAction = @selector(downloadAppShortcut:);
-            // 存储应用详细信息
             [appSpecifier setProperty:appInfo forKey:@"appInfo"];
             [appSpecifiers addObject:appSpecifier];
         }];
@@ -113,61 +93,53 @@ static NSCache *iconCache = nil;
     return _specifiers;
 }
 
-#pragma mark - TableView 定制 (显示图标、版本号、Bundle ID，添加详情按钮)
+#pragma mark - UITableView 定制（显示图标、版本号、Bundle ID）
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    // 获取原始 cell
     UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
     PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];
     NSDictionary *appInfo = [specifier propertyForKey:@"appInfo"];
     
-    // 只对应用列表项进行定制，排除分组和下载按钮
-    if (appInfo && [specifier identifier] != nil && ![[specifier identifier] isEqualToString:@"download"]) {
-        // 设置主标题为应用名称
+    if (appInfo && specifier.identifier != nil && ![specifier.identifier isEqualToString:@"download"]) {
+        // 应用名称
         cell.textLabel.text = appInfo[@"localizedName"];
         
-        // 设置副标题：版本号 + Bundle ID
+        // 副标题：版本号 + Bundle ID
         NSString *version = appInfo[@"version"];
         NSString *bundleId = appInfo[@"bundleIdentifier"];
         cell.detailTextLabel.text = [NSString stringWithFormat:@"v%@ • %@", version, bundleId];
         cell.detailTextLabel.textColor = [UIColor grayColor];
         cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
         
-        // 加载并设置图标
+        // 图标（缓存）
         UIImage *icon = [iconCache objectForKey:bundleId];
         if (!icon) {
             icon = [self loadIconForAppAtPath:appInfo[@"bundlePath"]];
             if (icon) {
                 [iconCache setObject:icon forKey:bundleId];
             } else {
-                icon = [UIImage imageNamed:@"AppIconPlaceholder"]; // 默认占位图
+                icon = [UIImage imageNamed:@"AppIconPlaceholder"];
             }
         }
         cell.imageView.image = icon;
         cell.imageView.layer.cornerRadius = 8;
         cell.imageView.clipsToBounds = YES;
         
-        // 添加详情按钮 (accessory view)
+        // 详情按钮
         UIButton *infoButton = [UIButton buttonWithType:UIButtonTypeDetailDisclosure];
         [infoButton addTarget:self action:@selector(showAppDetails:) forControlEvents:UIControlEventTouchUpInside];
-        infoButton.tag = indexPath.row;
-        // 存储 appInfo 到按钮，避免依赖 indexPath 变动
         objc_setAssociatedObject(infoButton, "appInfo", appInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         cell.accessoryView = infoButton;
-        
-        // 确保 cell 可点击
         cell.selectionStyle = UITableViewCellSelectionStyleBlue;
     } else {
-        // 其他 cell（分组头、下载按钮）保持原样
         cell.accessoryView = nil;
         cell.detailTextLabel.text = nil;
         cell.imageView.image = nil;
     }
-    
     return cell;
 }
 
-// 显示应用详细信息（路径、账号信息等）
+// 显示应用详情（实时读取 iTunesMetadata.plist）
 - (void)showAppDetails:(UIButton *)sender {
     NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
     if (!appInfo) return;
@@ -175,14 +147,24 @@ static NSCache *iconCache = nil;
     NSString *bundlePath = appInfo[@"bundlePath"];
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *version = appInfo[@"version"];
-    NSDictionary *metadata = appInfo[@"iTunesMetadata"];
     
-    NSString *accountInfo = @"未找到 iTunesMetadata.plist";
-    if (metadata.count > 0) {
-        NSString *appleID = metadata[@"AppleID"] ?: @"未知";
-        NSString *artist = metadata[@"artistName"] ?: @"未知";
-        NSString *purchaseDate = metadata[@"purchaseDate"] ?: @"未知";
-        accountInfo = [NSString stringWithFormat:@"Apple ID: %@\n开发者: %@\n购买日期: %@", appleID, artist, purchaseDate];
+    // 实时读取 iTunesMetadata.plist
+    NSString *metadataPath = [bundlePath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
+    BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:metadataPath];
+    NSString *accountInfo;
+    
+    if (!fileExists) {
+        accountInfo = [NSString stringWithFormat:@"文件不存在:\n%@", metadataPath];
+    } else {
+        NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+        if (metadata) {
+            NSString *appleID = metadata[@"AppleID"] ?: @"未知";
+            NSString *artist = metadata[@"artistName"] ?: @"未知";
+            NSString *purchaseDate = metadata[@"purchaseDate"] ?: @"未知";
+            accountInfo = [NSString stringWithFormat:@"Apple ID: %@\n开发者: %@\n购买日期: %@", appleID, artist, purchaseDate];
+        } else {
+            accountInfo = [NSString stringWithFormat:@"文件存在但无法解析:\n%@", metadataPath];
+        }
     }
     
     NSString *message = [NSString stringWithFormat:
@@ -192,8 +174,7 @@ static NSCache *iconCache = nil;
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"应用详情"
                                                                    message:message
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *ok = [UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil];
-    [alert addAction:ok];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -204,18 +185,16 @@ static NSCache *iconCache = nil;
     NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
     if (!infoPlist) return nil;
     
-    // 获取图标文件名
     NSArray *iconFiles = nil;
     NSDictionary *bundleIcons = infoPlist[@"CFBundleIcons"];
     if (bundleIcons) {
         NSDictionary *primaryIcon = bundleIcons[@"CFBundlePrimaryIcon"];
         iconFiles = primaryIcon[@"CFBundleIconFiles"];
     }
-    if (!iconFiles || iconFiles.count == 0) {
+    if (!iconFiles.count) {
         iconFiles = infoPlist[@"CFBundleIconFiles"];
     }
-    if (!iconFiles || iconFiles.count == 0) {
-        // 尝试现代 Assets.car 中的 AppIcon，简单处理：查找包含 "AppIcon" 的 png
+    if (!iconFiles.count) {
         NSArray *contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:bundlePath error:nil];
         for (NSString *file in contents) {
             if ([file containsString:@"AppIcon"] && [file hasSuffix:@".png"]) {
@@ -225,8 +204,7 @@ static NSCache *iconCache = nil;
         }
     }
     
-    if (iconFiles && iconFiles.count > 0) {
-        // 按分辨率优先级选择图标（取最后一个通常为最高分辨率）
+    if (iconFiles.count) {
         NSString *iconName = [iconFiles lastObject];
         if (![iconName containsString:@".png"]) {
             iconName = [iconName stringByAppendingString:@".png"];
@@ -234,7 +212,6 @@ static NSCache *iconCache = nil;
         NSString *iconPath = [bundlePath stringByAppendingPathComponent:iconName];
         UIImage *icon = [UIImage imageWithContentsOfFile:iconPath];
         if (icon) {
-            // 缩放至合适大小（30x30）
             CGSize newSize = CGSizeMake(30, 30);
             UIGraphicsBeginImageContextWithOptions(newSize, NO, 0.0);
             [icon drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
@@ -243,12 +220,10 @@ static NSCache *iconCache = nil;
             return scaledIcon;
         }
     }
-    
-    // 如果找不到，尝试读取 Assets.car 中的图标（更复杂，此处简单返回 nil）
     return nil;
 }
 
-#pragma mark - 原有功能（未改动）
+#pragma mark - 原有功能（下载等，完全保留）
 
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
@@ -291,8 +266,7 @@ static NSCache *iconCache = nil;
 - (void)showAlert:(NSString*)title message:(NSString*)message {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController* alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil];
-        [alert addAction:okAction];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
     });
 }
@@ -354,8 +328,7 @@ static NSCache *iconCache = nil;
             [self downloadAppWithAppId:appId versionId:versionId];
         }];
         [versionAlert addAction:downloadAction];
-        UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
-        [versionAlert addAction:cancelAction];
+        [versionAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:versionAlert animated:YES completion:nil];
     });
 }
@@ -363,16 +336,13 @@ static NSCache *iconCache = nil;
 - (void)getAllAppVersionIdsAndPrompt:(long long)appId {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController* promptAlert = [UIAlertController alertControllerWithTitle:@"Version ID" message:@"Do you want to enter the version ID manually or request the list of version IDs from the server?" preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction* manualAction = [UIAlertAction actionWithTitle:@"Manual" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"Manual" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
             [self promptForVersionId:appId];
-        }];
-        [promptAlert addAction:manualAction];
-        UIAlertAction* serverAction = [UIAlertAction actionWithTitle:@"Server" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        }]];
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"Server" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
             [self getAllAppVersionIdsFromServer:appId];
-        }];
-        [promptAlert addAction:serverAction];
-        UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
-        [promptAlert addAction:cancelAction];
+        }]];
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:promptAlert animated:YES completion:nil];
     });
 }
@@ -428,12 +398,10 @@ static NSCache *iconCache = nil;
     [linkAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
         textField.placeholder = @"App Link";
     }];
-    UIAlertAction* downloadAction = [UIAlertAction actionWithTitle:@"Download" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+    [linkAlert addAction:[UIAlertAction actionWithTitle:@"Download" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
         [self downloadAppWithLink:linkAlert.textFields.firstObject.text];
-    }];
-    [linkAlert addAction:downloadAction];
-    UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
-    [linkAlert addAction:cancelAction];
+    }]];
+    [linkAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:linkAlert animated:YES completion:nil];
 }
 
