@@ -176,7 +176,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 增强版应用组路径查找 - 支持 QQ 等复杂匹配
+// 终极增强版：支持 QQ 等复杂应用组匹配
 - (NSString *)getFirstGroupContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     // 缓存
     NSString *cached = [groupPathCache objectForKey:bundleId];
@@ -223,34 +223,37 @@ static NSCache *groupPathCache = nil;
         
         NSString *idLower = [identifier lowercaseString];
         
-        // 1. 完全匹配
-        if ([idLower isEqualToString:bundleIdLower]) {
+        // ----- 标准化：去除常见前缀（group., appgroup., extension. 等）-----
+        NSString *cleanId = idLower;
+        NSArray *prefixes = @[@"group.", @"appgroup.", @"extension.", @"plugin."];
+        for (NSString *prefix in prefixes) {
+            if ([cleanId hasPrefix:prefix]) {
+                cleanId = [cleanId substringFromIndex:prefix.length];
+                break;
+            }
+        }
+        
+        // 1. 完全匹配（标准化后）
+        if ([cleanId isEqualToString:bundleIdLower]) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
         
-        // 2. 去掉 "group." 前缀后匹配
-        NSString *idWithoutGroup = [idLower hasPrefix:@"group."] ? [idLower substringFromIndex:6] : idLower;
-        if ([idWithoutGroup isEqualToString:bundleIdLower]) {
+        // 2. 后缀匹配：cleanId 以 bundleIdLower 结尾
+        if ([cleanId hasSuffix:bundleIdLower]) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
         
-        // 3. 后缀匹配
-        if ([idLower hasSuffix:bundleIdLower]) {
+        // 3. 前缀匹配：bundleIdLower 以 cleanId 开头 或 反过来
+        if ([bundleIdLower hasPrefix:cleanId] || [cleanId hasPrefix:bundleIdLower]) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
         
-        // 4. 前缀匹配
-        if ([bundleIdLower hasPrefix:idLower] || [idLower hasPrefix:bundleIdLower]) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
-        }
-        
-        // 5. 按点分割，比较公共前缀段数（至少2段相同，如 com.tencent）
+        // 4. 关键：按点分段比较公共前缀（标准化后的 cleanId 与 bundleIdLower）
         NSArray *bundleParts = [bundleIdLower componentsSeparatedByString:@"."];
-        NSArray *groupParts = [idLower componentsSeparatedByString:@"."];
+        NSArray *groupParts = [cleanId componentsSeparatedByString:@"."];
         NSUInteger commonSegments = 0;
         NSUInteger minCount = MIN(bundleParts.count, groupParts.count);
         for (NSUInteger i = 0; i < minCount; i++) {
@@ -260,19 +263,20 @@ static NSCache *groupPathCache = nil;
                 break;
             }
         }
-        if (commonSegments >= 2) { // 例如 com.tencent 即可匹配
+        // 至少前两段相同（例如 com.tencent），且 bundleId 本身至少有两段，就算匹配
+        if (commonSegments >= 2 && bundleParts.count >= 2) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
         
-        // 6. 包含匹配（仅当 bundleId 长度足够，避免误判）
-        if (bundleIdLower.length >= 5 && [idLower rangeOfString:bundleIdLower].location != NSNotFound) {
+        // 5. 包含匹配（避免短字符串误判）
+        if (bundleIdLower.length >= 5 && [cleanId rangeOfString:bundleIdLower].location != NSNotFound) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
     }
     
-    // 降级：目录名包含 bundleId
+    // 降级：直接匹配目录名（大小写不敏感）
     for (NSString *dir in subDirs) {
         if ([[dir lowercaseString] containsString:bundleIdLower]) {
             NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
@@ -293,7 +297,6 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// 终极可靠的 Filza 跳转方法
 - (void)openInFilza:(NSString *)path {
     if (!path.length) {
         [self showAlert:@"错误" message:@"路径无效"];
@@ -305,9 +308,8 @@ static NSCache *groupPathCache = nil;
         return;
     }
     
-    // 先构造标准的 file:// URL，再替换 scheme 为 filza://
     NSURL *fileURL = [NSURL fileURLWithPath:path];
-    NSString *fileURLString = fileURL.absoluteString;  // 格式 file:///path
+    NSString *fileURLString = fileURL.absoluteString;
     NSString *filzaURLString = [fileURLString stringByReplacingOccurrencesOfString:@"file://" withString:@"filza://"];
     NSURL *filzaURL = [NSURL URLWithString:filzaURLString];
     
@@ -367,7 +369,7 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-#pragma mark - 原有代码（保持不变）
+#pragma mark - 原有代码（完全保留）
 - (NSMutableArray*)specifiers {
     if(!_specifiers) {
         _specifiers = [NSMutableArray new];
