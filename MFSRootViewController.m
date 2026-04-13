@@ -66,7 +66,7 @@ static NSCache *iconCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 长按菜单（显示应用组目录，使用多级检测）
+#pragma mark - 长按菜单（显示应用组目录，并跳转到具体组文件夹）
 - (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
     UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
     if (existingGesture) {
@@ -114,8 +114,9 @@ static NSCache *iconCache = nil;
         }
     }];
     
-    // 检测是否有应用组目录（使用强力检测）
-    BOOL hasAppGroup = [self appHasGroupContainer:bundleId appProxy:appProxy];
+    // 获取应用组具体路径（如果有）
+    NSString *groupPath = [self getFirstGroupContainerPathForBundleId:bundleId appProxy:appProxy];
+    BOOL hasAppGroup = (groupPath != nil);
     
     // 按顺序添加按钮
     [actionSheet addAction:launchAction];
@@ -124,8 +125,8 @@ static NSCache *iconCache = nil;
     
     if (hasAppGroup) {
         UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            // 打开应用组根目录，用户可以自己找到对应的组文件夹
-            [self openInFilza:@"/var/mobile/Containers/Shared/AppGroup"];
+            // 跳转到具体的应用组目录，而非根目录
+            [self openInFilza:groupPath];
         }];
         [actionSheet addAction:appGroupAction];
     }
@@ -179,8 +180,8 @@ static NSCache *iconCache = nil;
     return nil;
 }
 
-// 增强版应用组检测（保证能检测到，如 58同城）
-- (BOOL)appHasGroupContainer:(NSString *)bundleId appProxy:(id)appProxy {
+// 获取第一个应用组的具体路径（如果有多个，返回第一个；否则返回 nil）
+- (NSString *)getFirstGroupContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     // 方法1：通过 LSApplicationProxy 的 groupContainerURLs 属性
     NSArray *groupURLs = nil;
     @try {
@@ -193,7 +194,11 @@ static NSCache *iconCache = nil;
         groupURLs = nil;
     }
     if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
-        return YES;
+        for (NSURL *url in groupURLs) {
+            if ([url isKindOfClass:[NSURL class]] && [[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
+                return url.path;
+            }
+        }
     }
     
     // 方法2：扫描 /var/mobile/Containers/Shared/AppGroup 目录，匹配 bundleId 前缀或完整匹配
@@ -209,18 +214,18 @@ static NSCache *iconCache = nil;
                 NSString *identifier = metadata[@"MCMMetadataIdentifier"];
                 // 匹配 bundleId 或者包含 bundleId 的组标识（如 group.com.taofang, group.com.taofang.iphone.widget）
                 if ([identifier isEqualToString:bundleId] || [identifier hasSuffix:bundleId] || [identifier rangeOfString:bundleId].location != NSNotFound) {
-                    return YES;
+                    return groupDir;
                 }
             }
         }
-        // 方法3：如果没有 metadata 文件，尝试直接匹配目录名是否包含 bundleId（降级方案）
+        // 降级：直接匹配目录名是否包含 bundleId
         for (NSString *dir in subDirs) {
             if ([dir containsString:bundleId]) {
-                return YES;
+                return [appGroupRoot stringByAppendingPathComponent:dir];
             }
         }
     }
-    return NO;
+    return nil;
 }
 
 #pragma mark - 辅助功能
@@ -284,7 +289,7 @@ static NSCache *iconCache = nil;
                 [fm removeItemAtPath:fullPath error:nil];
             }
         }
-        // 应用组目录
+        // 应用组目录（清理所有关联的组目录内容）
         NSArray *groupURLs = nil;
         @try {
             if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
