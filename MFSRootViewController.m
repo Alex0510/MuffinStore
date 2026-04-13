@@ -23,7 +23,14 @@
 @end
 
 static NSCache *iconCache = nil;
-static NSCache *groupPathCache = nil;  // 缓存应用组路径，避免重复扫描
+static NSCache *groupPathCache = nil;
+
+@interface MFSRootViewController () <UISearchBarDelegate>
+@property (nonatomic, strong) NSMutableArray *originalSpecifiers;   // 完整的 specifiers 列表
+@property (nonatomic, strong) NSMutableArray *filteredAppSpecifiers; // 过滤后的应用 specifiers
+@property (nonatomic, strong) UISearchBar *searchBar;
+@property (nonatomic, copy) NSString *searchText;
+@end
 
 @implementation MFSRootViewController
 
@@ -45,34 +52,154 @@ static NSCache *groupPathCache = nil;  // 缓存应用组路径，避免重复�
     // 左上角：直接输入软件ID下载按钮
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
+    
+    // 初始化搜索栏
+    [self setupSearchBar];
+}
+
+- (void)setupSearchBar {
+    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
+    self.searchBar.placeholder = @"搜索应用";
+    self.searchBar.delegate = self;
+    self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
+    self.tableView.tableHeaderView = self.searchBar;
+}
+
+#pragma mark - UISearchBarDelegate
+- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+    self.searchText = searchText;
+    [self filterAppSpecifiers];
+    [self reloadSpecifiers];
+}
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
+    [searchBar resignFirstResponder];
+}
+
+- (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar {
+    self.searchText = @"";
+    searchBar.text = @"";
+    [searchBar resignFirstResponder];
+    [self filterAppSpecifiers];
+    [self reloadSpecifiers];
+}
+
+#pragma mark - 过滤应用
+- (void)filterAppSpecifiers {
+    if (!self.originalSpecifiers) {
+        return;
+    }
+    if (!self.searchText.length) {
+        self.filteredAppSpecifiers = [self.originalSpecifiers mutableCopy];
+        return;
+    }
+    self.filteredAppSpecifiers = [NSMutableArray array];
+    NSString *lowerSearch = [self.searchText lowercaseString];
+    for (PSSpecifier *spec in self.originalSpecifiers) {
+        // 只过滤应用 specifiers（有 appInfo 的）
+        NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
+        if (appInfo) {
+            NSString *appName = appInfo[@"localizedName"];
+            NSString *bundleId = appInfo[@"bundleIdentifier"];
+            if ([appName.lowercaseString containsString:lowerSearch] ||
+                [bundleId.lowercaseString containsString:lowerSearch]) {
+                [self.filteredAppSpecifiers addObject:spec];
+            }
+        } else {
+            // 非应用的 specifier（下载组、标题组）保留
+            [self.filteredAppSpecifiers addObject:spec];
+        }
+    }
 }
 
 - (void)refreshAppList {
     _specifiers = nil;
+    _originalSpecifiers = nil;
+    _filteredAppSpecifiers = nil;
     [iconCache removeAllObjects];
-    [groupPathCache removeAllObjects];  // 清除缓存，重新扫描
+    [groupPathCache removeAllObjects];
+    self.searchText = @"";
+    self.searchBar.text = @"";
     [self reloadSpecifiers];
 }
 
-#pragma mark - 左上角按钮：直接输入软件ID查询版本并下载
-- (void)promptForAppIdDownload {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"输入软件ID" message:@"请输入App的Apple ID (trackId)" preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = @"例如: 310633997";
-        textField.keyboardType = UIKeyboardTypeNumberPad;
+#pragma mark - 构建原始 specifiers（包含所有应用）
+- (NSMutableArray *)buildOriginalSpecifiers {
+    NSMutableArray *specifiers = [NSMutableArray new];
+    
+    PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+    downloadGroupSpecifier.name = @"下载";
+    [specifiers addObject:downloadGroupSpecifier];
+    
+    PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+    downloadSpecifier.identifier = @"download";
+    [downloadSpecifier setProperty:@YES forKey:@"enabled"];
+    downloadSpecifier.buttonAction = @selector(downloadApp);
+    [specifiers addObject:downloadSpecifier];
+    
+    NSString* aboutText = [self getAboutText];
+    [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
+    
+    PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+    installedGroupSpecifier.name = @"已安装应用";
+    [specifiers addObject:installedGroupSpecifier];
+    
+    NSMutableArray *appSpecifiers = [NSMutableArray new];
+    // 枚举所有应用（包括用户应用和系统应用，type:0 表示所有）
+    [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
+        // 过滤掉一些不需要显示的系统应用（可选）
+        // 如果 bundleIdentifier 以 com.apple. 开头且不希望显示，可以跳过，但为了完整，先全部添加
+        NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
+        appInfo[@"bundleURL"] = appProxy.bundleURL;
+        appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
+        
+        NSString *infoPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+        
+        NSString *displayName = infoPlist[@"CFBundleDisplayName"];
+        NSString *bundleName = infoPlist[@"CFBundleName"];
+        NSString *localizedName = appProxy.localizedName ?: appProxy.bundleIdentifier;
+        NSString *appName = displayName ?: (bundleName ?: localizedName);
+        appInfo[@"localizedName"] = appName;
+        
+        NSString *shortVersion = infoPlist[@"CFBundleShortVersionString"];
+        NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
+        NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
+        appInfo[@"version"] = version;
+        
+        appInfo[@"bundlePath"] = appProxy.bundleURL.path;
+        appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
+        
+        PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+        [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
+        [appSpecifier setProperty:@YES forKey:@"enabled"];
+        appSpecifier.buttonAction = @selector(downloadAppShortcut:);
+        [appSpecifier setProperty:appInfo forKey:@"appInfo"];
+        [appSpecifiers addObject:appSpecifier];
     }];
-    UIAlertAction *confirmAction = [UIAlertAction actionWithTitle:@"查询版本" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *appIdStr = alert.textFields.firstObject.text;
-        if (appIdStr.length > 0) {
-            long long appId = [appIdStr longLongValue];
-            [self getAllAppVersionIdsAndPrompt:appId];
-        } else {
-            [self showAlert:@"错误" message:@"软件ID不能为空"];
-        }
+    
+    [appSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier* a, PSSpecifier* b) {
+        return [a.name compare:b.name];
     }];
-    [alert addAction:confirmAction];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+    [specifiers addObjectsFromArray:appSpecifiers];
+    
+    return specifiers;
+}
+
+- (NSMutableArray*)specifiers {
+    // 首次加载或刷新时构建原始列表
+    if (!_originalSpecifiers) {
+        _originalSpecifiers = [self buildOriginalSpecifiers];
+        _filteredAppSpecifiers = [_originalSpecifiers mutableCopy];
+    }
+    // 根据当前搜索过滤
+    if (self.searchText.length) {
+        [self filterAppSpecifiers]; // 确保过滤
+        return _filteredAppSpecifiers;
+    } else {
+        return _originalSpecifiers;
+    }
 }
 
 #pragma mark - 长按菜单（显示应用组目录，跳转到具体组文件夹）
@@ -344,68 +471,7 @@ static NSCache *groupPathCache = nil;  // 缓存应用组路径，避免重复�
     });
 }
 
-#pragma mark - 原有代码（保持不变）
-- (NSMutableArray*)specifiers {
-    if(!_specifiers) {
-        _specifiers = [NSMutableArray new];
-        
-        PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
-        downloadGroupSpecifier.name = @"下载";
-        [_specifiers addObject:downloadGroupSpecifier];
-        
-        PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
-        downloadSpecifier.identifier = @"download";
-        [downloadSpecifier setProperty:@YES forKey:@"enabled"];
-        downloadSpecifier.buttonAction = @selector(downloadApp);
-        [_specifiers addObject:downloadSpecifier];
-        
-        NSString* aboutText = [self getAboutText];
-        [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
-        
-        PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
-        installedGroupSpecifier.name = @"已安装应用";
-        [_specifiers addObject:installedGroupSpecifier];
-        
-        NSMutableArray *appSpecifiers = [NSMutableArray new];
-        [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
-            NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
-            appInfo[@"bundleURL"] = appProxy.bundleURL;
-            appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
-            
-            NSString *infoPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"];
-            NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
-            
-            NSString *displayName = infoPlist[@"CFBundleDisplayName"];
-            NSString *bundleName = infoPlist[@"CFBundleName"];
-            NSString *localizedName = appProxy.localizedName ?: appProxy.bundleIdentifier;
-            NSString *appName = displayName ?: (bundleName ?: localizedName);
-            appInfo[@"localizedName"] = appName;
-            
-            NSString *shortVersion = infoPlist[@"CFBundleShortVersionString"];
-            NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
-            NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
-            appInfo[@"version"] = version;
-            
-            appInfo[@"bundlePath"] = appProxy.bundleURL.path;
-            appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
-            
-            PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
-            [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
-            [appSpecifier setProperty:@YES forKey:@"enabled"];
-            appSpecifier.buttonAction = @selector(downloadAppShortcut:);
-            [appSpecifier setProperty:appInfo forKey:@"appInfo"];
-            [appSpecifiers addObject:appSpecifier];
-        }];
-        
-        [appSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier* a, PSSpecifier* b) {
-            return [a.name compare:b.name];
-        }];
-        [_specifiers addObjectsFromArray:appSpecifiers];
-    }
-    self.navigationItem.title = @"MuffinStore";
-    return _specifiers;
-}
-
+#pragma mark - UITableView 定制
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
     PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];
