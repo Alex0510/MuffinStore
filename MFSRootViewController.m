@@ -121,11 +121,39 @@ static NSCache *iconCache = nil;
         }
     }];
     
-    // 检查是否有应用组目录
-    NSArray *groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-    BOOL hasAppGroup = [groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0;
+    // 检查是否有应用组目录（使用更可靠的方法）
+    BOOL hasAppGroup = NO;
+    // 方法1：通过 KVC 获取 groupContainerURLs
+    NSArray *groupURLs = nil;
+    if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+        groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+    } else {
+        groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+    }
+    if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
+        hasAppGroup = YES;
+    } else {
+        // 方法2：直接检查 /var/mobile/Containers/Shared/AppGroup 下是否有该应用的组目录（通过 metadata 文件）
+        NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if ([fm fileExistsAtPath:appGroupRoot]) {
+            NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
+            for (NSString *dir in subDirs) {
+                NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
+                NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+                if ([fm fileExistsAtPath:metadataPath]) {
+                    NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+                    NSString *identifier = metadata[@"MCMMetadataIdentifier"];
+                    if ([identifier isEqualToString:bundleId]) {
+                        hasAppGroup = YES;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     
-    // 按照顺序添加按钮：启动 -> 应用目录 -> 数据目录 -> 应用组目录（如果有）-> 清理数据 -> 取消
+    // 按顺序添加按钮
     [actionSheet addAction:launchAction];
     [actionSheet addAction:appDirAction];
     [actionSheet addAction:dataAction];
@@ -238,7 +266,12 @@ static NSCache *iconCache = nil;
             }
         }
         // 应用组目录
-        NSArray *groupURLs = [(id)appProxy valueForKey:@"groupContainerURLs"];
+        NSArray *groupURLs = nil;
+        if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+            groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+        } else {
+            groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+        }
         if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
             for (NSURL *groupURL in groupURLs) {
                 if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
