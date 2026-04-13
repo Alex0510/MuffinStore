@@ -23,12 +23,14 @@
 @end
 
 static NSCache *iconCache = nil;
+static NSCache *groupPathCache = nil;  // 缓存应用组路径，避免重复扫描
 
 @implementation MFSRootViewController
 
 + (void)initialize {
     if (self == [MFSRootViewController class]) {
         iconCache = [[NSCache alloc] init];
+        groupPathCache = [[NSCache alloc] init];
     }
 }
 
@@ -43,6 +45,13 @@ static NSCache *iconCache = nil;
     // 左上角：直接输入软件ID下载按钮
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
+}
+
+- (void)refreshAppList {
+    _specifiers = nil;
+    [iconCache removeAllObjects];
+    [groupPathCache removeAllObjects];  // 清除缓存，重新扫描
+    [self reloadSpecifiers];
 }
 
 #pragma mark - 左上角按钮：直接输入软件ID查询版本并下载
@@ -66,7 +75,7 @@ static NSCache *iconCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 长按菜单（显示应用组目录，并跳转到具体组文件夹）
+#pragma mark - 长按菜单（显示应用组目录，跳转到具体组文件夹）
 - (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
     UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
     if (existingGesture) {
@@ -114,7 +123,7 @@ static NSCache *iconCache = nil;
         }
     }];
     
-    // 获取应用组具体路径（如果有）
+    // 获取应用组具体路径（使用缓存）
     NSString *groupPath = [self getFirstGroupContainerPathForBundleId:bundleId appProxy:appProxy];
     BOOL hasAppGroup = (groupPath != nil);
     
@@ -125,7 +134,6 @@ static NSCache *iconCache = nil;
     
     if (hasAppGroup) {
         UIAlertAction *appGroupAction = [UIAlertAction actionWithTitle:@"应用组目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            // 跳转到具体的应用组目录，而非根目录
             [self openInFilza:groupPath];
         }];
         [actionSheet addAction:appGroupAction];
@@ -180,8 +188,18 @@ static NSCache *iconCache = nil;
     return nil;
 }
 
-// 获取第一个应用组的具体路径（如果有多个，返回第一个；否则返回 nil）
+// 获取第一个应用组的具体路径（带缓存，大小写不敏感匹配）
 - (NSString *)getFirstGroupContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
+    // 先从缓存获取
+    NSString *cachedPath = [groupPathCache objectForKey:bundleId];
+    if (cachedPath) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:cachedPath]) {
+            return cachedPath;
+        } else {
+            [groupPathCache removeObjectForKey:bundleId];
+        }
+    }
+    
     // 方法1：通过 LSApplicationProxy 的 groupContainerURLs 属性
     NSArray *groupURLs = nil;
     @try {
@@ -196,32 +214,42 @@ static NSCache *iconCache = nil;
     if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
         for (NSURL *url in groupURLs) {
             if ([url isKindOfClass:[NSURL class]] && [[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
+                [groupPathCache setObject:url.path forKey:bundleId];
                 return url.path;
             }
         }
     }
     
-    // 方法2：扫描 /var/mobile/Containers/Shared/AppGroup 目录，匹配 bundleId 前缀或完整匹配
+    // 方法2：扫描 /var/mobile/Containers/Shared/AppGroup 目录，匹配 bundleId（大小写不敏感）
     NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
     NSFileManager *fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:appGroupRoot]) {
         NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
+        NSString *bundleIdLower = [bundleId lowercaseString];
         for (NSString *dir in subDirs) {
             NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
             NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
             if ([fm fileExistsAtPath:metadataPath]) {
                 NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
                 NSString *identifier = metadata[@"MCMMetadataIdentifier"];
-                // 匹配 bundleId 或者包含 bundleId 的组标识（如 group.com.taofang, group.com.taofang.iphone.widget）
-                if ([identifier isEqualToString:bundleId] || [identifier hasSuffix:bundleId] || [identifier rangeOfString:bundleId].location != NSNotFound) {
-                    return groupDir;
+                if (identifier) {
+                    NSString *identifierLower = [identifier lowercaseString];
+                    // 完全匹配 或 后缀匹配 或 包含匹配（大小写不敏感）
+                    if ([identifierLower isEqualToString:bundleIdLower] ||
+                        [identifierLower hasSuffix:bundleIdLower] ||
+                        [identifierLower rangeOfString:bundleIdLower].location != NSNotFound) {
+                        [groupPathCache setObject:groupDir forKey:bundleId];
+                        return groupDir;
+                    }
                 }
             }
         }
-        // 降级：直接匹配目录名是否包含 bundleId
+        // 降级：直接匹配目录名是否包含 bundleId（大小写不敏感）
         for (NSString *dir in subDirs) {
-            if ([dir containsString:bundleId]) {
-                return [appGroupRoot stringByAppendingPathComponent:dir];
+            if ([[dir lowercaseString] containsString:bundleIdLower]) {
+                NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
+                [groupPathCache setObject:groupDir forKey:bundleId];
+                return groupDir;
             }
         }
     }
@@ -317,12 +345,6 @@ static NSCache *iconCache = nil;
 }
 
 #pragma mark - 原有代码（保持不变）
-- (void)refreshAppList {
-    _specifiers = nil;
-    [iconCache removeAllObjects];
-    [self reloadSpecifiers];
-}
-
 - (NSMutableArray*)specifiers {
     if(!_specifiers) {
         _specifiers = [NSMutableArray new];
