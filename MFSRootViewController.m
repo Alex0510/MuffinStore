@@ -176,9 +176,9 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 终极增强版：支持 QQ 等复杂应用组匹配
+// 修复后的应用组路径查找：避免错误匹配（如 QQ 匹配到微信）
 - (NSString *)getFirstGroupContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
-    // 缓存
+    // 缓存检查
     NSString *cached = [groupPathCache objectForKey:bundleId];
     if (cached && [[NSFileManager defaultManager] fileExistsAtPath:cached]) {
         return cached;
@@ -186,7 +186,7 @@ static NSCache *groupPathCache = nil;
         [groupPathCache removeObjectForKey:bundleId];
     }
     
-    // 方法1：官方 API
+    // 方法1：官方 API（最可靠）
     NSArray *groupURLs = nil;
     @try {
         if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
@@ -204,13 +204,18 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 方法2：扫描 AppGroup 目录
+    // 方法2：扫描 AppGroup 目录，采用严格匹配策略
     NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:appGroupRoot]) return nil;
     
     NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
     NSString *bundleIdLower = [bundleId lowercaseString];
+    
+    // 预先准备：移除 bundleId 中的常见扩展后缀（如 .QQExtension 并不属于 bundleId 的一部分，不需要移除）
+    // 但我们需要对应用组标识符进行标准化（去除常见前缀）
+    
+    NSMutableArray *candidates = [NSMutableArray array]; // 存储候选路径及匹配分数
     
     for (NSString *dir in subDirs) {
         NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
@@ -223,60 +228,68 @@ static NSCache *groupPathCache = nil;
         
         NSString *idLower = [identifier lowercaseString];
         
-        // ----- 标准化：去除常见前缀（group., appgroup., extension. 等）-----
+        // 标准化：去除 group. 前缀
         NSString *cleanId = idLower;
-        NSArray *prefixes = @[@"group.", @"appgroup.", @"extension.", @"plugin."];
-        for (NSString *prefix in prefixes) {
-            if ([cleanId hasPrefix:prefix]) {
-                cleanId = [cleanId substringFromIndex:prefix.length];
-                break;
-            }
+        if ([cleanId hasPrefix:@"group."]) {
+            cleanId = [cleanId substringFromIndex:6];
         }
         
-        // 1. 完全匹配（标准化后）
+        int score = 0;
+        
+        // 1. 完全匹配（最高分）
         if ([cleanId isEqualToString:bundleIdLower]) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
+            score = 100;
         }
-        
-        // 2. 后缀匹配：cleanId 以 bundleIdLower 结尾
-        if ([cleanId hasSuffix:bundleIdLower]) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
+        // 2. 后缀匹配：cleanId 以 bundleIdLower 结尾（例如 com.tencent.QQExtension 以 com.tencent.mqq 结尾？否，所以不会误判）
+        else if ([cleanId hasSuffix:bundleIdLower]) {
+            score = 90;
         }
-        
-        // 3. 前缀匹配：bundleIdLower 以 cleanId 开头 或 反过来
-        if ([bundleIdLower hasPrefix:cleanId] || [cleanId hasPrefix:bundleIdLower]) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
+        // 3. 包含匹配，但要求 bundleId 是完整的一段（即被点分隔包围），避免部分匹配
+        else if ([cleanId rangeOfString:[NSString stringWithFormat:@".%@.", bundleIdLower]].location != NSNotFound ||
+                 [cleanId hasSuffix:[NSString stringWithFormat:@".%@", bundleIdLower]] ||
+                 [cleanId hasPrefix:[NSString stringWithFormat:@"%@.", bundleIdLower]]) {
+            score = 80;
         }
-        
-        // 4. 关键：按点分段比较公共前缀（标准化后的 cleanId 与 bundleIdLower）
-        NSArray *bundleParts = [bundleIdLower componentsSeparatedByString:@"."];
-        NSArray *groupParts = [cleanId componentsSeparatedByString:@"."];
-        NSUInteger commonSegments = 0;
-        NSUInteger minCount = MIN(bundleParts.count, groupParts.count);
-        for (NSUInteger i = 0; i < minCount; i++) {
-            if ([bundleParts[i] isEqualToString:groupParts[i]]) {
-                commonSegments++;
-            } else {
-                break;
+        // 4. 去前缀后完全匹配（如 group.com.tencent.xin 去除 group. 后完全等于 com.tencent.xin）
+        else if ([idLower isEqualToString:bundleIdLower]) {
+            score = 100;
+        }
+        // 5. 后缀匹配原始标识符（带 group.）
+        else if ([idLower hasSuffix:bundleIdLower]) {
+            score = 85;
+        }
+        // 6. 降级：如果 bundleId 很短（如少于5个字符），避免匹配；否则再尝试前缀匹配（但限制严格）
+        // 为了防止腾讯系应用互串，不再使用简单的公共前缀匹配，而是要求 bundleId 作为完整单词出现在 cleanId 中
+        else if (bundleIdLower.length >= 5 && [cleanId rangeOfString:bundleIdLower].location != NSNotFound) {
+            // 检查是否作为独立组件出现
+            NSRange range = [cleanId rangeOfString:bundleIdLower];
+            if (range.location != NSNotFound) {
+                BOOL isIsolated = (range.location == 0 || [cleanId characterAtIndex:range.location-1] == '.') &&
+                                  (range.location+range.length == cleanId.length || [cleanId characterAtIndex:range.location+range.length] == '.');
+                if (isIsolated) {
+                    score = 70;
+                } else {
+                    score = 50; // 非独立包含，降低优先级
+                }
             }
         }
-        // 至少前两段相同（例如 com.tencent），且 bundleId 本身至少有两段，就算匹配
-        if (commonSegments >= 2 && bundleParts.count >= 2) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
-        }
         
-        // 5. 包含匹配（避免短字符串误判）
-        if (bundleIdLower.length >= 5 && [cleanId rangeOfString:bundleIdLower].location != NSNotFound) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
+        if (score > 0) {
+            [candidates addObject:@{@"path": groupDir, @"score": @(score), @"id": idLower}];
         }
     }
     
-    // 降级：直接匹配目录名（大小写不敏感）
+    // 按分数降序排序，返回最高分的路径
+    if (candidates.count > 0) {
+        [candidates sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [b[@"score"] compare:a[@"score"]];
+        }];
+        NSString *bestPath = candidates.firstObject[@"path"];
+        [groupPathCache setObject:bestPath forKey:bundleId];
+        return bestPath;
+    }
+    
+    // 最后的降级：目录名包含 bundleId（大小写不敏感，但尽量精确）
     for (NSString *dir in subDirs) {
         if ([[dir lowercaseString] containsString:bundleIdLower]) {
             NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
@@ -369,7 +382,7 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-#pragma mark - 原有代码（完全保留）
+#pragma mark - 原有代码（保持不变）
 - (NSMutableArray*)specifiers {
     if(!_specifiers) {
         _specifiers = [NSMutableArray new];
