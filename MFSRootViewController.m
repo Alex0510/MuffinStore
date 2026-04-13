@@ -102,6 +102,7 @@ static NSCache *groupPathCache = nil;
     UIAlertAction *launchAction = [UIAlertAction actionWithTitle:@"启动" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         [self launchAppWithBundleId:bundleId];
     }];
+    
     UIAlertAction *appDirAction = [UIAlertAction actionWithTitle:@"应用目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         if (bundlePath && [[NSFileManager defaultManager] fileExistsAtPath:bundlePath]) {
             [self openInFilza:bundlePath];
@@ -109,6 +110,7 @@ static NSCache *groupPathCache = nil;
             [self showAlert:@"错误" message:[NSString stringWithFormat:@"应用目录不存在:\n%@", bundlePath]];
         }
     }];
+    
     UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         NSString *dataPath = [self getDataContainerPathForBundleId:bundleId appProxy:appProxy];
         if (dataPath && [[NSFileManager defaultManager] fileExistsAtPath:dataPath]) {
@@ -119,7 +121,7 @@ static NSCache *groupPathCache = nil;
     }];
     
     NSString *groupPath = [self getFirstGroupContainerPathForBundleId:bundleId appProxy:appProxy];
-    BOOL hasAppGroup = (groupPath != nil);
+    BOOL hasAppGroup = (groupPath != nil && [[NSFileManager defaultManager] fileExistsAtPath:groupPath]);
     
     [actionSheet addAction:launchAction];
     [actionSheet addAction:appDirAction];
@@ -147,6 +149,7 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:actionSheet animated:YES completion:nil];
 }
 
+#pragma mark - 数据目录处理
 - (NSString *)getDataContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
     if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
@@ -176,91 +179,182 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 增强版应用组路径查找（支持QQ等）
+#pragma mark - 应用组目录处理 (改进版 - 支持QQ等多种场景)
 - (NSString *)getFirstGroupContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
-    // 缓存
+    // 优先使用缓存
     NSString *cached = [groupPathCache objectForKey:bundleId];
     if (cached && [[NSFileManager defaultManager] fileExistsAtPath:cached]) {
         return cached;
-    } else if (cached) {
+    }
+    if (cached) {
         [groupPathCache removeObjectForKey:bundleId];
     }
     
-    // 方法1：官方 API
+    // 方法1：官方 API 获取应用组URL
+    NSArray *groupURLs = [self getGroupContainerURLsFromAppProxy:appProxy];
+    if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
+        NSString *validPath = [self getValidPathFromURLs:groupURLs];
+        if (validPath) {
+            [groupPathCache setObject:validPath forKey:bundleId];
+            return validPath;
+        }
+    }
+    
+    // 方法2：智能扫描 AppGroup 目录并匹配
+    NSString *foundPath = [self smartScanAppGroupPathForBundleId:bundleId];
+    if (foundPath) {
+        [groupPathCache setObject:foundPath forKey:bundleId];
+        return foundPath;
+    }
+    
+    // 方法3：扫描 Shared Documents
+    NSString *sharedDocPath = [self findGroupPathInSharedDocumentsForBundleId:bundleId];
+    if (sharedDocPath) {
+        [groupPathCache setObject:sharedDocPath forKey:bundleId];
+        return sharedDocPath;
+    }
+    
+    return nil;
+}
+
+- (NSArray *)getGroupContainerURLsFromAppProxy:(id)appProxy {
     NSArray *groupURLs = nil;
     @try {
         if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
             groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+        } else if ([appProxy respondsToSelector:@selector(containerURLs)]) {
+            groupURLs = [appProxy performSelector:@selector(containerURLs)];
         } else {
             groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
         }
-    } @catch (NSException *e) {}
-    if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
-        for (NSURL *url in groupURLs) {
-            if ([url isKindOfClass:[NSURL class]] && [[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
-                [groupPathCache setObject:url.path forKey:bundleId];
-                return url.path;
+    } @catch (NSException *e) {
+        NSLog(@"Exception getting group container URLs: %@", e);
+    }
+    return groupURLs;
+}
+
+- (NSString *)getValidPathFromURLs:(NSArray *)urls {
+    for (id urlObj in urls) {
+        if ([urlObj isKindOfClass:[NSURL class]]) {
+            NSURL *url = (NSURL *)urlObj;
+            NSString *path = url.path;
+            if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+                return path;
             }
         }
     }
-    
-    // 方法2：扫描 AppGroup 目录
+    return nil;
+}
+
+- (NSString *)smartScanAppGroupPathForBundleId:(NSString *)bundleId {
     NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
     NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:appGroupRoot]) return nil;
+    
+    if (![fm fileExistsAtPath:appGroupRoot]) {
+        return nil;
+    }
     
     NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
-    NSString *bundleIdLower = [bundleId lowercaseString];
+    if (!subDirs || subDirs.count == 0) {
+        return nil;
+    }
     
+    NSString *bundleIdLower = [bundleId lowercaseString];
+    NSMutableArray *candidates = [NSMutableArray array];
+    
+    // 第一轮：精确匹配或直接关联
     for (NSString *dir in subDirs) {
         NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
         NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        
         if (![fm fileExistsAtPath:metadataPath]) continue;
         
         NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+        if (!metadata) continue;
+        
         NSString *identifier = metadata[@"MCMMetadataIdentifier"];
         if (!identifier) continue;
         
         NSString *idLower = [identifier lowercaseString];
         
-        // 多种匹配规则
+        // 精确匹配
         if ([idLower isEqualToString:bundleIdLower]) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
         
-        // 去掉 "group." 前缀
-        NSString *idWithoutGroup = [idLower hasPrefix:@"group."] ? [idLower substringFromIndex:6] : idLower;
-        if ([idWithoutGroup isEqualToString:bundleIdLower]) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
+        // group.bundleId 格式匹配
+        if ([idLower isEqualToString:[NSString stringWithFormat:@"group.%@", bundleIdLower]]) {
             return groupDir;
         }
+        
+        // 去掉 "group." 前缀后匹配
+        NSString *idWithoutGroup = [idLower hasPrefix:@"group."] ? [idLower substringFromIndex:6] : idLower;
+        if ([idWithoutGroup isEqualToString:bundleIdLower]) {
+            return groupDir;
+        }
+        
+        // 收集候选项（用于第二轮搜索）
+        [candidates addObject:@{@"dir": groupDir, @"id": idLower, @"bundleId": bundleIdLower}];
+    }
+    
+    // 第二轮：模糊匹配
+    for (NSDictionary *candidate in candidates) {
+        NSString *dir = candidate[@"dir"];
+        NSString *idLower = candidate[@"id"];
+        NSString *bundleIdLower = candidate[@"bundleId"];
         
         // 后缀匹配（如 group.com.tencent.QQExtension 匹配 com.tencent.qq）
         if ([idLower hasSuffix:bundleIdLower]) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
+            return dir;
+        }
+        
+        // 检查是否为主应用和扩展的关系
+        if ([idLower containsString:bundleIdLower] && idLower.length - bundleIdLower.length < 10) {
+            return dir;
         }
         
         // 前缀匹配
         if ([bundleIdLower hasPrefix:idLower] || [idLower hasPrefix:bundleIdLower]) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
-        }
-        
-        // 包含匹配（避免短ID误匹配，要求 bundleId 长度 >= 5）
-        if (bundleIdLower.length >= 5 && [idLower rangeOfString:bundleIdLower].location != NSNotFound) {
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
+            return dir;
         }
     }
     
-    // 降级：目录名包含 bundleId
+    // 第三轮：目录名称匹配
     for (NSString *dir in subDirs) {
-        if ([[dir lowercaseString] containsString:bundleIdLower]) {
+        NSString *dirLower = [dir lowercaseString];
+        if ([dirLower containsString:bundleIdLower] || [bundleIdLower containsString:dirLower]) {
             NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
-            [groupPathCache setObject:groupDir forKey:bundleId];
-            return groupDir;
+            if ([fm fileExistsAtPath:groupDir]) {
+                return groupDir;
+            }
+        }
+    }
+    
+    return nil;
+}
+
+- (NSString *)findGroupPathInSharedDocumentsForBundleId:(NSString *)bundleId {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *sharedRoot = @"/var/mobile/Containers/Shared";
+    
+    if (![fm fileExistsAtPath:sharedRoot]) {
+        return nil;
+    }
+    
+    NSArray *items = [fm contentsOfDirectoryAtPath:sharedRoot error:nil];
+    NSString *bundleIdLower = [bundleId lowercaseString];
+    
+    for (NSString *item in items) {
+        NSString *itemPath = [sharedRoot stringByAppendingPathComponent:item];
+        if (![fm fileExistsAtPath:itemPath]) continue;
+        
+        // 检查是否为目录
+        BOOL isDir;
+        if (![fm fileExistsAtPath:itemPath isDirectory:&isDir] || !isDir) continue;
+        
+        NSString *itemLower = [item lowercaseString];
+        if ([itemLower containsString:bundleIdLower]) {
+            return itemPath;
         }
     }
     
@@ -276,34 +370,47 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// 终极可靠的 Filza 跳转方法
+// 改进版 Filza 跳转方法
 - (void)openInFilza:(NSString *)path {
-    if (!path.length) {
+    if (!path || path.length == 0) {
         [self showAlert:@"错误" message:@"路径无效"];
         return;
     }
+    
     NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:path]) {
+    BOOL isDir;
+    if (![fm fileExistsAtPath:path isDirectory:&isDir]) {
         [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不存在:\n%@", path]];
         return;
     }
     
-    // 方法：先构造标准的 file:// URL，再替换 scheme 为 filza://
-    NSURL *fileURL = [NSURL fileURLWithPath:path];
-    NSString *fileURLString = fileURL.absoluteString;  // 格式 file:///path
+    if (!isDir) {
+        [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不是目录:\n%@", path]];
+        return;
+    }
+    
+    // 构造 filza:// URL
+    NSURL *fileURL = [NSURL fileURLWithPath:path isDirectory:YES];
+    NSString *fileURLString = fileURL.absoluteString;
     NSString *filzaURLString = [fileURLString stringByReplacingOccurrencesOfString:@"file://" withString:@"filza://"];
     NSURL *filzaURL = [NSURL URLWithString:filzaURLString];
     
-    if (filzaURL && [[UIApplication sharedApplication] canOpenURL:filzaURL]) {
+    if (!filzaURL) {
+        [self showAlert:@"错误" message:@"无法构造Filza URL"];
+        return;
+    }
+    
+    if ([[UIApplication sharedApplication] canOpenURL:filzaURL]) {
         [[UIApplication sharedApplication] openURL:filzaURL options:@{} completionHandler:^(BOOL success) {
             if (!success) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装最新版Filza并授权"];
+                    [self showAlert:@"错误" message:@"无法打开Filza，请确保已安装Filza"];
                 });
             }
         }];
     } else {
-        [self showAlert:@"错误" message:@"未安装Filza文件管理器或URL Scheme不支持"];
+        // 尝试备选方案：使用 file:// 协议或其他文件管理器
+        [self showAlert:@"提示" message:@"未安装Filza文件管理器\n\n建议安装Filza文件管理器以获得最佳体验"];
     }
 }
 
@@ -321,33 +428,47 @@ static NSCache *groupPathCache = nil;
 - (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
+        
+        // 清理数据目录
         NSString *dataPath = [self getDataContainerPathForBundleId:bundleId appProxy:appProxy];
         if (dataPath && [fm fileExistsAtPath:dataPath]) {
-            for (NSString *item in [fm contentsOfDirectoryAtPath:dataPath error:nil]) {
-                [fm removeItemAtPath:[dataPath stringByAppendingPathComponent:item] error:nil];
+            NSArray *contents = [fm contentsOfDirectoryAtPath:dataPath error:nil];
+            for (NSString *item in contents) {
+                NSString *itemPath = [dataPath stringByAppendingPathComponent:item];
+                [fm removeItemAtPath:itemPath error:nil];
             }
         }
-        NSArray *groupURLs = nil;
-        @try {
-            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-            } else {
-                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-            }
-        } @catch (NSException *e) {}
-        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
+        
+        // 清理应用组目录
+        NSArray *groupURLs = [self getGroupContainerURLsFromAppProxy:appProxy];
+        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
             for (NSURL *groupURL in groupURLs) {
                 if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
-                    for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
-                        [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
+                    NSArray *contents = [fm contentsOfDirectoryAtPath:groupURL.path error:nil];
+                    for (NSString *item in contents) {
+                        NSString *itemPath = [groupURL.path stringByAppendingPathComponent:item];
+                        [fm removeItemAtPath:itemPath error:nil];
                     }
                 }
             }
         }
+        
         dispatch_async(dispatch_get_main_queue(), ^{
             [self showAlert:@"完成" message:@"数据已清理，应用可能需要重启才能生效"];
         });
     });
+}
+
+- (NSArray *)getGroupContainerURLsFromAppProxy:(id)appProxy {
+    NSArray *groupURLs = nil;
+    @try {
+        if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+            groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+        } else {
+            groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+        }
+    } @catch (NSException *e) {}
+    return groupURLs;
 }
 
 #pragma mark - 原有代码（保持不变）
