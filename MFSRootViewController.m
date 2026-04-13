@@ -175,7 +175,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// ========== 彻底重写的应用组目录获取方法（完全参照 TrollFools 逻辑）==========
+// 增强版应用组目录获取（参照 TrollFools 逻辑）
 - (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     // 1. 检查缓存
     NSString *cachedPath = [groupPathCache objectForKey:bundleId];
@@ -187,7 +187,7 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 2. 优先使用官方 API：groupContainerURLs（与 TrollFools 完全一致）
+    // 2. 优先使用官方 API：groupContainerURLs
     NSArray *groupURLs = nil;
     @try {
         if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
@@ -208,7 +208,7 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 3. 降级方案：扫描 AppGroup 目录（增强版）
+    // 3. 降级方案：扫描 AppGroup 目录
     NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:appGroupRoot]) return nil;
@@ -221,46 +221,24 @@ static NSCache *groupPathCache = nil;
         NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
         NSString *identifier = nil;
         
-        // 尝试从 metadata 读取
         if ([fm fileExistsAtPath:metadataPath]) {
             NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
             identifier = metadata[@"MCMMetadataIdentifier"];
         }
         
-        // 如果 metadata 中没有，则使用目录名作为标识符（通常目录名就是 group identifier）
         if (!identifier) {
             identifier = dir;
         }
         
         NSString *idLower = [identifier lowercaseString];
-        
-        // 多种匹配规则
         BOOL matched = NO;
         
-        // 完全匹配
-        if ([idLower isEqualToString:bundleIdLower]) {
-            matched = YES;
-        }
-        // 去掉 "group." 前缀后匹配
-        else if ([idLower hasPrefix:@"group."] && [[idLower substringFromIndex:6] isEqualToString:bundleIdLower]) {
-            matched = YES;
-        }
-        // 后缀匹配（如 group.com.tencent.QQExtension 匹配 com.tencent.qq）
-        else if ([idLower hasSuffix:bundleIdLower]) {
-            matched = YES;
-        }
-        // 前缀匹配
-        else if ([bundleIdLower hasPrefix:idLower] || [idLower hasPrefix:bundleIdLower]) {
-            matched = YES;
-        }
-        // 包含匹配（要求 bundleId 长度 >= 5，避免误判）
-        else if (bundleIdLower.length >= 5 && [idLower rangeOfString:bundleIdLower].location != NSNotFound) {
-            matched = YES;
-        }
-        // 目录名直接包含 bundleId（最后的保障）
-        else if ([[dir lowercaseString] containsString:bundleIdLower]) {
-            matched = YES;
-        }
+        if ([idLower isEqualToString:bundleIdLower]) matched = YES;
+        else if ([idLower hasPrefix:@"group."] && [[idLower substringFromIndex:6] isEqualToString:bundleIdLower]) matched = YES;
+        else if ([idLower hasSuffix:bundleIdLower]) matched = YES;
+        else if ([bundleIdLower hasPrefix:idLower] || [idLower hasPrefix:bundleIdLower]) matched = YES;
+        else if (bundleIdLower.length >= 5 && [idLower rangeOfString:bundleIdLower].location != NSNotFound) matched = YES;
+        else if ([[dir lowercaseString] containsString:bundleIdLower]) matched = YES;
         
         if (matched) {
             [groupPathCache setObject:groupDir forKey:bundleId];
@@ -268,7 +246,7 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 4. 最后尝试：从 entitlements 中读取（与之前相同，保留）
+    // 4. 最后尝试：从 entitlements 中读取
     NSArray *entitlementGroups = [self getApplicationGroupsFromEntitlementsForBundleId:bundleId];
     for (NSString *groupID in entitlementGroups) {
         NSString *possiblePath = [self findGroupContainerPathForGroupIdentifier:groupID];
@@ -281,7 +259,6 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 从 entitlements 获取应用组ID列表（备用）
 - (NSArray<NSString *> *)getApplicationGroupsFromEntitlementsForBundleId:(NSString *)bundleId {
     NSMutableArray *groups = [NSMutableArray array];
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
@@ -640,11 +617,12 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能（保持不变）
+#pragma mark - 下载功能（核心修改：增加降级处理）
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
     NSString* bundleId = infoPlist[@"CFBundleIdentifier"];
+    
     NSURL* url = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software", bundleId]];
     NSURLRequest* request = [NSURLRequest requestWithURL:url];
     NSURLSessionDataTask* task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
@@ -664,15 +642,88 @@ static NSCache *groupPathCache = nil;
         }
         NSArray* results = json[@"results"];
         if(results.count == 0) {
+            // ========== 关键修改：API 无结果时提供降级选项 ==========
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlert:@"错误" message:@"无结果"];
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"未找到应用"
+                                                                               message:[NSString stringWithFormat:@"iTunes API 未返回结果。\n\n你可以手动输入版本ID，或从历史版本服务器获取列表。"]
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"手动输入版本ID" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                    // 由于没有 appId，先尝试通过 bundleId 获取一次 appId（备用的备用）
+                    [self fetchAppIdForBundleId:bundleId completion:^(long long appId) {
+                        if (appId != 0) {
+                            [self promptForVersionId:appId];
+                        } else {
+                            // 实在获取不到，直接让用户输入 appId 和 versionId
+                            [self promptForAppIdAndVersionIdManually];
+                        }
+                    }];
+                }]];
+                [alert addAction:[UIAlertAction actionWithTitle:@"从服务器获取列表" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                    [self fetchAppIdForBundleId:bundleId completion:^(long long appId) {
+                        if (appId != 0) {
+                            [self getAllAppVersionIdsFromServer:appId];
+                        } else {
+                            [self showAlert:@"错误" message:@"无法获取 App ID，请尝试手动输入。"];
+                        }
+                    }];
+                }]];
+                [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+                [self presentViewController:alert animated:YES completion:nil];
             });
             return;
         }
+        // 正常情况：有结果
         NSDictionary* app = results[0];
-        [self getAllAppVersionIdsAndPrompt:[app[@"trackId"] longLongValue]];
+        long long trackId = [app[@"trackId"] longLongValue];
+        [self getAllAppVersionIdsAndPrompt:trackId];
     }];
     [task resume];
+}
+
+// 新增辅助方法：通过 bundleId 获取 appId（备用）
+- (void)fetchAppIdForBundleId:(NSString *)bundleId completion:(void(^)(long long appId))completion {
+    NSURL* url = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software", bundleId]];
+    NSURLRequest* request = [NSURLRequest requestWithURL:url];
+    NSURLSessionDataTask* task = [[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+        long long appId = 0;
+        if (!error && data) {
+            NSDictionary* json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            NSArray* results = json[@"results"];
+            if (results.count > 0) {
+                appId = [results[0][@"trackId"] longLongValue];
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(appId);
+        });
+    }];
+    [task resume];
+}
+
+// 完全手动输入 App ID 和版本 ID
+- (void)promptForAppIdAndVersionIdManually {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"手动输入" message:@"请输入 App ID (trackId) 和版本 ID (external_identifier)" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.placeholder = @"App ID (例如 310633997)";
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.placeholder = @"版本 ID (留空则下载最新版)";
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        NSString *appIdStr = alert.textFields[0].text;
+        NSString *versionIdStr = alert.textFields[1].text;
+        long long appId = [appIdStr longLongValue];
+        long long versionId = [versionIdStr longLongValue];
+        if (appId == 0) {
+            [self showAlert:@"错误" message:@"App ID 不能为空"];
+            return;
+        }
+        [self downloadAppWithAppId:appId versionId:versionId];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (NSString*)getAboutText {
