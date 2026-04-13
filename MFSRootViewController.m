@@ -409,7 +409,6 @@ static NSCache *groupPathCache = nil;
             }
         }];
     } else {
-        // 尝试备选方案：使用 file:// 协议或其他文件管理器
         [self showAlert:@"提示" message:@"未安装Filza文件管理器\n\n建议安装Filza文件管理器以获得最佳体验"];
     }
 }
@@ -457,18 +456,6 @@ static NSCache *groupPathCache = nil;
             [self showAlert:@"完成" message:@"数据已清理，应用可能需要重启才能生效"];
         });
     });
-}
-
-- (NSArray *)getGroupContainerURLsFromAppProxy:(id)appProxy {
-    NSArray *groupURLs = nil;
-    @try {
-        if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-            groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-        } else {
-            groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-        }
-    } @catch (NSException *e) {}
-    return groupURLs;
 }
 
 #pragma mark - 原有代码（保持不变）
@@ -708,7 +695,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2 (增强版)\n作者 Mineek\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.3 (增强版)\n作者 Mineek\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
