@@ -176,7 +176,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 增强版应用组路径查找（支持QQ等）
+// 增强版应用组路径查找 - 支持 QQ 等复杂匹配
 - (NSString *)getFirstGroupContainerPathForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     // 缓存
     NSString *cached = [groupPathCache objectForKey:bundleId];
@@ -223,32 +223,49 @@ static NSCache *groupPathCache = nil;
         
         NSString *idLower = [identifier lowercaseString];
         
-        // 多种匹配规则
+        // 1. 完全匹配
         if ([idLower isEqualToString:bundleIdLower]) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
         
-        // 去掉 "group." 前缀
+        // 2. 去掉 "group." 前缀后匹配
         NSString *idWithoutGroup = [idLower hasPrefix:@"group."] ? [idLower substringFromIndex:6] : idLower;
         if ([idWithoutGroup isEqualToString:bundleIdLower]) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
         
-        // 后缀匹配（如 group.com.tencent.QQExtension 匹配 com.tencent.qq）
+        // 3. 后缀匹配
         if ([idLower hasSuffix:bundleIdLower]) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
         
-        // 前缀匹配
+        // 4. 前缀匹配
         if ([bundleIdLower hasPrefix:idLower] || [idLower hasPrefix:bundleIdLower]) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
         }
         
-        // 包含匹配（避免短ID误匹配，要求 bundleId 长度 >= 5）
+        // 5. 按点分割，比较公共前缀段数（至少2段相同，如 com.tencent）
+        NSArray *bundleParts = [bundleIdLower componentsSeparatedByString:@"."];
+        NSArray *groupParts = [idLower componentsSeparatedByString:@"."];
+        NSUInteger commonSegments = 0;
+        NSUInteger minCount = MIN(bundleParts.count, groupParts.count);
+        for (NSUInteger i = 0; i < minCount; i++) {
+            if ([bundleParts[i] isEqualToString:groupParts[i]]) {
+                commonSegments++;
+            } else {
+                break;
+            }
+        }
+        if (commonSegments >= 2) { // 例如 com.tencent 即可匹配
+            [groupPathCache setObject:groupDir forKey:bundleId];
+            return groupDir;
+        }
+        
+        // 6. 包含匹配（仅当 bundleId 长度足够，避免误判）
         if (bundleIdLower.length >= 5 && [idLower rangeOfString:bundleIdLower].location != NSNotFound) {
             [groupPathCache setObject:groupDir forKey:bundleId];
             return groupDir;
@@ -288,7 +305,7 @@ static NSCache *groupPathCache = nil;
         return;
     }
     
-    // 方法：先构造标准的 file:// URL，再替换 scheme 为 filza://
+    // 先构造标准的 file:// URL，再替换 scheme 为 filza://
     NSURL *fileURL = [NSURL fileURLWithPath:path];
     NSString *fileURLString = fileURL.absoluteString;  // 格式 file:///path
     NSString *filzaURLString = [fileURLString stringByReplacingOccurrencesOfString:@"file://" withString:@"filza://"];
