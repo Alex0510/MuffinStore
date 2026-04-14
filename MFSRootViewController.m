@@ -27,7 +27,7 @@ static NSCache *groupPathCache = nil;
 
 @interface MFSRootViewController () <UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;
-@property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers; // 完整应用列表备份
+@property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers;
 @property (nonatomic, assign) BOOL isSearching;
 @end
 
@@ -51,15 +51,12 @@ static NSCache *groupPathCache = nil;
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
     
-    // 创建搜索栏
     self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
     self.searchBar.delegate = self;
     self.searchBar.placeholder = @"搜索应用名称或 Bundle ID";
     self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
     self.searchBar.showsCancelButton = YES;
     self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
-    
-    // 设置表格头部
     self.table.tableHeaderView = self.searchBar;
 }
 
@@ -141,16 +138,12 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
-// 恢复完整列表（前3个固定条目 + 所有应用）
 - (void)resetToAllAppSpecifiers {
     if (!_specifiers) return;
-    
     if (!self.allAppSpecifiers) {
         self.allAppSpecifiers = [self generateAppSpecifiers];
     }
-    
     NSMutableArray *newSpecifiers = [NSMutableArray array];
-    // 保留前三个固定条目：下载组标题、下载按钮、已安装应用组标题
     NSInteger fixedCount = 3;
     for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
         [newSpecifiers addObject:_specifiers[i]];
@@ -159,22 +152,16 @@ static NSCache *groupPathCache = nil;
     _specifiers = newSpecifiers;
 }
 
-// 过滤应用列表（保留前3个固定条目 + 过滤后的应用）
 - (void)filterAppSpecifiersWithKeyword:(NSString *)keyword {
     if (!_specifiers) return;
-    
     if (!self.allAppSpecifiers) {
         self.allAppSpecifiers = [self generateAppSpecifiers];
     }
-    
     NSMutableArray *filtered = [NSMutableArray array];
-    // 保留前三个固定条目
     NSInteger fixedCount = 3;
     for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
         [filtered addObject:_specifiers[i]];
     }
-    
-    // 增强版过滤谓词：名称（忽略变音符号）或 Bundle ID
     NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(PSSpecifier *spec, NSDictionary *bindings) {
         NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
         if (!appInfo) return NO;
@@ -182,15 +169,12 @@ static NSCache *groupPathCache = nil;
         NSString *bundleId = appInfo[@"bundleIdentifier"];
         if (!appName) appName = @"";
         if (!bundleId) bundleId = @"";
-        
         BOOL nameMatch = [appName rangeOfString:keyword options:NSCaseInsensitiveSearch|NSDiacriticInsensitiveSearch].location != NSNotFound;
         BOOL idMatch = [bundleId rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound;
         return nameMatch || idMatch;
     }];
-    
     NSArray *filteredApps = [self.allAppSpecifiers filteredArrayUsingPredicate:predicate];
     [filtered addObjectsFromArray:filteredApps];
-    
     _specifiers = filtered;
 }
 
@@ -316,7 +300,6 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 应用组目录获取
 - (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     NSString *cachedPath = [groupPathCache objectForKey:bundleId];
     if (cachedPath) {
@@ -518,18 +501,18 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-#pragma mark - 清理数据（修改版：只删除文件，保留目录结构，并清空 Preferences 下的 plist）
+#pragma mark - 清理数据（保护元数据文件，保留目录结构，清空 Preferences plist 内容）
 - (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         
-        // 清理数据容器
+        // 清理数据容器（保护 .com.apple.mobile_container_manager.metadata.plist）
         NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
-            [self clearContentsAtPath:dataURL.path];
+            [self clearContentsAtPath:dataURL.path isRootContainer:YES];
         }
         
-        // 清理组容器
+        // 清理组容器（同样保护元数据文件）
         NSArray *groupURLs = nil;
         @try {
             if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
@@ -541,7 +524,7 @@ static NSCache *groupPathCache = nil;
         if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
             for (NSURL *groupURL in groupURLs) {
                 if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
-                    [self clearContentsAtPath:groupURL.path];
+                    [self clearContentsAtPath:groupURL.path isRootContainer:YES];
                 }
             }
         }
@@ -554,31 +537,41 @@ static NSCache *groupPathCache = nil;
 
 /**
  * 递归清理指定路径下的所有文件，但保留目录结构。
- * 对于 /Library/Preferences 目录下的 .plist 文件，只清空内容，不删除文件。
- * 其他文件直接删除。
+ * 保护规则：
+ *   - 根目录下的 .com.apple.mobile_container_manager.metadata.plist 不删除
+ *   - /Library/Preferences 下的 .plist 文件只清空内容，不删除
+ *   - 其他文件直接删除
  */
-- (void)clearContentsAtPath:(NSString *)path {
+- (void)clearContentsAtPath:(NSString *)path isRootContainer:(BOOL)isRoot {
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
     if (![fm fileExistsAtPath:path isDirectory:&isDir]) return;
     
     if (!isDir) {
-        // 如果是文件，直接删除（正常情况下传入的应该是目录，但防御处理）
+        // 文件：如果不是受保护的文件则删除
+        if ([self isProtectedMetadataFile:path]) {
+            // 保护元数据文件，不做任何操作
+            return;
+        }
         [fm removeItemAtPath:path error:nil];
         return;
     }
     
+    // 是目录：遍历内容
     NSArray *contents = [fm contentsOfDirectoryAtPath:path error:nil];
     for (NSString *item in contents) {
         NSString *fullPath = [path stringByAppendingPathComponent:item];
         BOOL itemIsDir = NO;
         if ([fm fileExistsAtPath:fullPath isDirectory:&itemIsDir]) {
             if (itemIsDir) {
-                // 递归处理子目录
-                [self clearContentsAtPath:fullPath];
-                // 注意：不删除空目录，保留目录结构
+                // 递归处理子目录，但标记不是根容器
+                [self clearContentsAtPath:fullPath isRootContainer:NO];
             } else {
-                // 文件处理：如果是 Preferences 下的 .plist，清空内容；否则删除
+                // 文件处理
+                if ([self isProtectedMetadataFile:fullPath]) {
+                    // 保护元数据文件
+                    continue;
+                }
                 if ([self isPreferencesPlistAtPath:fullPath]) {
                     [self clearPlistFileContent:fullPath];
                 } else {
@@ -590,11 +583,21 @@ static NSCache *groupPathCache = nil;
 }
 
 /**
+ * 判断文件是否为受保护的元数据文件（.com.apple.mobile_container_manager.metadata.plist）
+ */
+- (BOOL)isProtectedMetadataFile:(NSString *)path {
+    NSString *fileName = [path lastPathComponent];
+    if ([fileName isEqualToString:@".com.apple.mobile_container_manager.metadata.plist"]) {
+        return YES;
+    }
+    return NO;
+}
+
+/**
  * 判断路径是否属于应用数据目录下的 /Library/Preferences 中的 .plist 文件
  */
 - (BOOL)isPreferencesPlistAtPath:(NSString *)path {
     if (![path.pathExtension isEqualToString:@"plist"]) return NO;
-    // 检查路径中是否包含 /Library/Preferences/ 目录
     NSArray *pathComponents = [path pathComponents];
     NSUInteger count = pathComponents.count;
     for (NSUInteger i = 0; i < count - 1; i++) {
@@ -602,7 +605,7 @@ static NSCache *groupPathCache = nil;
             if (i + 1 < count && [pathComponents[i+1] isEqualToString:@"Preferences"]) {
                 return YES;
             }
-            break; // 只检查第一个 Library 后面的紧邻目录
+            break;
         }
     }
     return NO;
@@ -621,22 +624,19 @@ static NSCache *groupPathCache = nil;
     if (plistData) {
         [plistData writeToFile:path atomically:YES];
     } else {
-        // 如果序列化失败，尝试直接写入空字符串（极少发生）
         [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
 }
 
-#pragma mark - 构建 specifiers（固定前三项）
+#pragma mark - 构建 specifiers
 - (NSMutableArray*)specifiers {
     if(!_specifiers) {
         _specifiers = [NSMutableArray new];
         
-        // 0: 下载组标题
         PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         downloadGroupSpecifier.name = @"下载";
         [_specifiers addObject:downloadGroupSpecifier];
         
-        // 1: 下载按钮
         PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
         downloadSpecifier.identifier = @"download";
         [downloadSpecifier setProperty:@YES forKey:@"enabled"];
@@ -646,12 +646,10 @@ static NSCache *groupPathCache = nil;
         NSString* aboutText = [self getAboutText];
         [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
         
-        // 2: 已安装应用组标题
         PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         installedGroupSpecifier.name = @"已安装应用";
         [_specifiers addObject:installedGroupSpecifier];
         
-        // 生成并备份所有应用
         NSArray *appSpecifiers = [self generateAppSpecifiers];
         self.allAppSpecifiers = appSpecifiers;
         [_specifiers addObjectsFromArray:appSpecifiers];
