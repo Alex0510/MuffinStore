@@ -720,7 +720,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能（核心修改部分）
+#pragma mark - 下载功能
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
@@ -817,7 +817,6 @@ static NSCache *groupPathCache = nil;
             [self showAlert:@"错误" message:@"App ID 不能为空"];
             return;
         }
-        // 手动输入时，默认使用“新购买”模式（保持原行为）
         [self downloadAppWithAppId:appId versionId:versionId isRedownload:NO];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -867,7 +866,6 @@ static NSCache *groupPathCache = nil;
             for(NSDictionary* versionId in versionIds) {
                 UIAlertAction* versionAction = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@", versionId[@"bundle_version"]] style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
                     long long versionIdNum = [versionId[@"external_identifier"] longLongValue];
-                    // 选择版本后，询问下载类型
                     [self promptDownloadTypeForAppId:appId versionId:versionIdNum];
                 }];
                 [versionAlert addAction:versionAction];
@@ -884,7 +882,6 @@ static NSCache *groupPathCache = nil;
     [task resume];
 }
 
-// 新增：选择下载类型（新购买/重下载）
 - (void)promptDownloadTypeForAppId:(long long)appId versionId:(long long)versionId {
     UIAlertController* typeAlert = [UIAlertController alertControllerWithTitle:@"下载类型" message:@"请选择" preferredStyle:UIAlertControllerStyleActionSheet];
     UIAlertAction* newAction = [UIAlertAction actionWithTitle:@"新购买" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
@@ -929,7 +926,6 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-// 新增：输入版本号并下载
 - (void)promptForVersionIdInputWithAppId:(long long)appId isRedownload:(BOOL)isRedownload {
     UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请输入要下载的应用版本ID（留空则下载最新版）" preferredStyle:UIAlertControllerStyleAlert];
     [versionAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
@@ -960,23 +956,20 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-// 核心下载方法：增加 isRedownload 参数
+// 核心下载方法：修复崩溃（移除 KVC 设置），支持重下载标志
 - (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId isRedownload:(BOOL)isRedownload {
     NSString* adamId = [NSString stringWithFormat:@"%lld", appId];
     NSString* pricingParameters = @"pricingParameter";
-    NSString* appExtVrsId = [NSString stringWithFormat:@"%lld", versionId];
     NSString* installed = @"0";
     
     NSMutableString *offerString = [NSMutableString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, installed];
     
     if (versionId != 0) {
-        [offerString appendFormat:@"&appExtVrsId=%@", appExtVrsId];
+        [offerString appendFormat:@"&appExtVrsId=%lld", versionId];
     }
     
     if (isRedownload) {
         [offerString appendString:@"&isRedownload=1"];
-        // 可选附加参数（根据iOS版本可能需要）
-        // [offerString appendString:@"&isCloudDownload=1"];
     }
     
     NSDictionary* offerDict = @{@"buyParams": offerString};
@@ -985,17 +978,13 @@ static NSCache *groupPathCache = nil;
     SKUIItem* item = [[SKUIItem alloc] initWithLookupDictionary:itemDict];
     [item setValue:offer forKey:@"_itemOffer"];
     [item setValue:@"iosSoftware" forKey:@"_itemKindString"];
-    if (versionId != 0) {
-        [item setValue:@(versionId) forKey:@"_versionIdentifier"];
-    }
-    if (isRedownload) {
-        [item setValue:@YES forKey:@"_isRedownload"];
-    }
+    // 移除可能崩溃的 KVC 设置：不再设置 _versionIdentifier 和 _isRedownload
     
     SKUIItemStateCenter* center = [SKUIItemStateCenter defaultCenter];
     NSArray* items = @[item];
     dispatch_async(dispatch_get_main_queue(), ^{
-        [center _performPurchases:[center _newPurchasesWithItems:items] hasBundlePurchase:0 withClientContext:[SKUIClientContext defaultContext] completionBlock:^(id arg1){}];
+        // 使用 _performSoftwarePurchases 替代 _performPurchases 以提高兼容性
+        [center _performSoftwarePurchases:[center _newPurchasesWithItems:items] withClientContext:[SKUIClientContext defaultContext] completionBlock:^(id arg1){}];
     });
 }
 
