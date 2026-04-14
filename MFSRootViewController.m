@@ -73,7 +73,7 @@ static NSCache *groupPathCache = nil;
     [self reloadSpecifiers];
 }
 
-#pragma mark - 应用列表生成（独立，确保数据干净）
+#pragma mark - 应用列表生成
 - (NSArray<PSSpecifier *> *)generateAppSpecifiers {
     NSMutableArray *appSpecifiers = [NSMutableArray new];
     [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
@@ -88,7 +88,6 @@ static NSCache *groupPathCache = nil;
         NSString *bundleName = infoPlist[@"CFBundleName"];
         NSString *localizedName = appProxy.localizedName ?: appProxy.bundleIdentifier;
         NSString *appName = displayName ?: (bundleName ?: localizedName);
-        // 去除首尾空白，避免搜索干扰
         appName = [appName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (appName.length == 0) {
             appName = appProxy.bundleIdentifier;
@@ -142,46 +141,40 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
+// 恢复完整列表（前3个固定条目 + 所有应用）
 - (void)resetToAllAppSpecifiers {
     if (!_specifiers) return;
     
-    // 确保备份存在
     if (!self.allAppSpecifiers) {
         self.allAppSpecifiers = [self generateAppSpecifiers];
     }
     
     NSMutableArray *newSpecifiers = [NSMutableArray array];
-    // 保留前两个固定条目（下载组标题、下载按钮）
-    for (PSSpecifier *spec in _specifiers) {
-        if ([spec.identifier isEqualToString:@"download"] || spec == _specifiers.firstObject) {
-            [newSpecifiers addObject:spec];
-        } else {
-            break;
-        }
+    // 保留前三个固定条目：下载组标题、下载按钮、已安装应用组标题
+    NSInteger fixedCount = 3;
+    for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
+        [newSpecifiers addObject:_specifiers[i]];
     }
     [newSpecifiers addObjectsFromArray:self.allAppSpecifiers];
     _specifiers = newSpecifiers;
 }
 
+// 过滤应用列表（保留前3个固定条目 + 过滤后的应用）
 - (void)filterAppSpecifiersWithKeyword:(NSString *)keyword {
     if (!_specifiers) return;
     
-    // 确保备份存在
     if (!self.allAppSpecifiers) {
         self.allAppSpecifiers = [self generateAppSpecifiers];
     }
     
     NSMutableArray *filtered = [NSMutableArray array];
-    // 保留前两个固定条目
-    for (PSSpecifier *spec in _specifiers) {
-        if ([spec.identifier isEqualToString:@"download"] || spec == _specifiers.firstObject) {
-            [filtered addObject:spec];
-        } else {
-            break;
-        }
+    // 保留前三个固定条目
+    NSInteger fixedCount = 3;
+    for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
+        [filtered addObject:_specifiers[i]];
     }
     
-    // 增强版过滤谓词：同时匹配名称（忽略变音符号）和 Bundle ID
+    // 增强版过滤谓词：名称（忽略变音符号）或 Bundle ID
     NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(PSSpecifier *spec, NSDictionary *bindings) {
         NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
         if (!appInfo) return NO;
@@ -190,9 +183,7 @@ static NSCache *groupPathCache = nil;
         if (!appName) appName = @"";
         if (!bundleId) bundleId = @"";
         
-        // 名称匹配（忽略大小写与变音符号，如 é 匹配 e）
         BOOL nameMatch = [appName rangeOfString:keyword options:NSCaseInsensitiveSearch|NSDiacriticInsensitiveSearch].location != NSNotFound;
-        // Bundle ID 匹配（忽略大小写）
         BOOL idMatch = [bundleId rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound;
         return nameMatch || idMatch;
     }];
@@ -325,7 +316,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 应用组目录获取（与之前相同，略作保留）
+// 应用组目录获取
 - (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     NSString *cachedPath = [groupPathCache objectForKey:bundleId];
     if (cachedPath) {
@@ -559,15 +550,17 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-#pragma mark - 构建 specifiers
+#pragma mark - 构建 specifiers（固定前三项）
 - (NSMutableArray*)specifiers {
     if(!_specifiers) {
         _specifiers = [NSMutableArray new];
         
+        // 0: 下载组标题
         PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         downloadGroupSpecifier.name = @"下载";
         [_specifiers addObject:downloadGroupSpecifier];
         
+        // 1: 下载按钮
         PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
         downloadSpecifier.identifier = @"download";
         [downloadSpecifier setProperty:@YES forKey:@"enabled"];
@@ -577,6 +570,7 @@ static NSCache *groupPathCache = nil;
         NSString* aboutText = [self getAboutText];
         [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
         
+        // 2: 已安装应用组标题
         PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         installedGroupSpecifier.name = @"已安装应用";
         [_specifiers addObject:installedGroupSpecifier];
