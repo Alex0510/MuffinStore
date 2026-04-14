@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import <sys/sysctl.h>
 #import <spawn.h>
+#import <Security/Security.h>
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -554,9 +555,9 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-#pragma mark - 一键新机核心功能（杀进程+删除容器+删除AppGroup+清Keychain）
+#pragma mark - 一键新机核心功能（增强版）
 - (void)confirmNewDeviceForBundleId:(NSString *)bundleId {
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"一键新机" message:@"将彻底清除该应用的所有数据、钥匙串，并强制结束进程，使其恢复到全新安装状态（类似卸载重装）。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"一键新机" message:@"将彻底清除该应用的所有数据、钥匙串，并强制结束进程。操作后请手动重启应用，系统将自动生成全新的数据目录。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *reset = [UIAlertAction actionWithTitle:@"一键新机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self performNewDeviceResetForBundleId:bundleId];
     }];
@@ -570,72 +571,67 @@ static NSCache *groupPathCache = nil;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         
-        // 1. 杀进程（必须）
-        [self killApp:bundleId];
-        sleep(1); // 等待进程完全退出
+        // 1. 强力杀死应用及其扩展进程
+        [self killAppAndExtensions:bundleId];
+        sleep(2); // 等待进程完全退出
         
-        // 2. 删除 Data 容器（整个UUID目录）
+        // 2. 获取数据容器路径（绝对路径）
         NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
-            [fm removeItemAtPath:dataURL.path error:nil];
+            // 使用 system 命令确保删除（root 权限）
+            NSString *rmCmd = [NSString stringWithFormat:@"rm -rf \"%@\"", dataURL.path];
+            system([rmCmd UTF8String]);
+            NSLog(@"[一键新机] 删除数据目录: %@", dataURL.path);
         }
         
-        // 3. 删除所有该App相关的应用组容器
+        // 3. 删除所有应用组容器
         [self deleteAllGroupContainers:bundleId];
         
-        // 4. 清空 Keychain 中该App的条目
+        // 4. 清空 Keychain
         [self clearKeychainForBundleId:bundleId];
         
-        // 清除缓存
+        // 5. 清除系统缓存（调用私有 API）
+        [self invalidateApplicationCache];
+        
+        // 6. 清除本地缓存
         [groupPathCache removeObjectForKey:bundleId];
         [iconCache removeObjectForKey:bundleId];
         
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self showAlert:@"一键新机完成" message:@"该App已完全重置为全新状态，下次启动时将如同新安装的应用。"];
+            [self showAlert:@"一键新机完成" message:@"数据已彻底清除。请手动重启该应用（从后台划掉再打开），系统将自动生成全新的数据目录。"];
         });
     });
 }
 
-// 通过 bundleId 杀掉应用进程
-- (void)killApp:(NSString *)bundleId {
-    // 方法1：使用私有 API（SpringBoardServices） - 仅越狱可用
-    // 这里使用更通用的方法：通过 sysctl 获取进程列表，找到匹配的 bundleId 然后 kill
-    // 注意：由于应用可能未运行，忽略错误
-    pid_t pid = [self getPIDForBundleId:bundleId];
-    if (pid > 0) {
-        kill(pid, SIGKILL);
+// 杀死应用及其所有扩展进程
+- (void)killAppAndExtensions:(NSString *)bundleId {
+    // 获取主应用 PID
+    pid_t mainPid = [self getPIDForBundleId:bundleId];
+    if (mainPid > 0) {
+        kill(mainPid, SIGKILL);
+    }
+    // 使用系统命令杀死所有包含 bundleId 的进程
+    NSString *killCmd = [NSString stringWithFormat:@"killall -9 %@ 2>/dev/null", bundleId];
+    system([killCmd UTF8String]);
+    NSString *psCmd = [NSString stringWithFormat:@"ps aux | grep '%@' | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null", bundleId];
+    system([psCmd UTF8String]);
+}
+
+// 清除系统级应用缓存（私有 API）
+- (void)invalidateApplicationCache {
+    LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
+    if ([workspace respondsToSelector:@selector(invalidateCache)]) {
+        [workspace performSelector:@selector(invalidateCache)];
+    }
+    if ([workspace respondsToSelector:@selector(_clearCachedApplications)]) {
+        [workspace performSelector:@selector(_clearCachedApplications)];
+    }
+    if ([workspace respondsToSelector:@selector(invalidateIconCache)]) {
+        [workspace performSelector:@selector(invalidateIconCache)];
     }
 }
 
-// 获取指定 bundleId 的进程 PID
-- (pid_t)getPIDForBundleId:(NSString *)bundleId {
-    pid_t foundPid = -1;
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t miblen = 4;
-    
-    size_t size = 0;
-    sysctl(mib, miblen, NULL, &size, NULL, 0);
-    
-    struct kinfo_proc *processes = malloc(size);
-    if (processes == NULL) return -1;
-    
-    if (sysctl(mib, miblen, processes, &size, NULL, 0) == 0) {
-        size_t count = size / sizeof(struct kinfo_proc);
-        for (size_t i = 0; i < count; i++) {
-            NSString *processPath = [NSString stringWithFormat:@"%s", processes[i].kp_proc.p_comm];
-            // 更精确地匹配：可以通过 LSApplicationProxy 获取可执行路径
-            // 简单起见，这里只匹配进程名中包含 bundleId 的一部分（不完美，但实用）
-            if ([processPath containsString:bundleId] || [bundleId containsString:processPath]) {
-                foundPid = processes[i].kp_proc.p_pid;
-                break;
-            }
-        }
-    }
-    free(processes);
-    return foundPid;
-}
-
-// 删除所有属于该应用的应用组容器
+// 删除所有应用组容器（使用 system 确保删除）
 - (void)deleteAllGroupContainers:(NSString *)bundleId {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
@@ -653,31 +649,26 @@ static NSCache *groupPathCache = nil;
             NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
             identifier = metadata[@"MCMMetadataIdentifier"];
         }
-        
-        if (!identifier) {
-            identifier = dir;
-        }
+        if (!identifier) identifier = dir;
         
         NSString *idLower = [identifier lowercaseString];
-        BOOL matched = NO;
-        
-        if ([idLower isEqualToString:bundleIdLower]) matched = YES;
-        else if ([idLower hasPrefix:@"group."] && [[idLower substringFromIndex:6] isEqualToString:bundleIdLower]) matched = YES;
-        else if ([idLower hasSuffix:bundleIdLower]) matched = YES;
-        else if ([bundleIdLower hasPrefix:idLower] || [idLower hasPrefix:bundleIdLower]) matched = YES;
-        else if (bundleIdLower.length >= 5 && [idLower rangeOfString:bundleIdLower].location != NSNotFound) matched = YES;
-        else if ([[dir lowercaseString] containsString:bundleIdLower]) matched = YES;
+        BOOL matched = [idLower isEqualToString:bundleIdLower] ||
+                       [idLower hasPrefix:@"group."] && [[idLower substringFromIndex:6] isEqualToString:bundleIdLower] ||
+                       [idLower hasSuffix:bundleIdLower] ||
+                       [bundleIdLower hasPrefix:idLower] || [idLower hasPrefix:bundleIdLower] ||
+                       (bundleIdLower.length >= 5 && [idLower rangeOfString:bundleIdLower].location != NSNotFound) ||
+                       [[dir lowercaseString] containsString:bundleIdLower];
         
         if (matched) {
-            [fm removeItemAtPath:groupDir error:nil];
+            NSString *rmCmd = [NSString stringWithFormat:@"rm -rf \"%@\"", groupDir];
+            system([rmCmd UTF8String]);
+            NSLog(@"[一键新机] 删除应用组: %@", groupDir);
         }
     }
 }
 
-// 清空 Keychain 中该应用存储的所有条目
+// 清空 Keychain（增强版）
 - (void)clearKeychainForBundleId:(NSString *)bundleId {
-    // 方法：构造查询字典，删除所有匹配 accessGroup 包含 bundleId 的条目
-    // 注意：Keychain 中的条目可能属于不同的 accessGroup，需要遍历所有可能的组标识
     NSArray *secItemClasses = @[
         (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecClassInternetPassword,
@@ -694,7 +685,6 @@ static NSCache *groupPathCache = nil;
         };
         SecItemDelete((__bridge CFDictionaryRef)query);
         
-        // 也尝试删除所有关联该 bundleId 的通用条目（无 service 标签）
         NSDictionary *query2 = @{
             (__bridge id)kSecClass: secClass,
             (__bridge id)kSecAttrAccount: bundleId,
@@ -703,8 +693,36 @@ static NSCache *groupPathCache = nil;
         SecItemDelete((__bridge CFDictionaryRef)query2);
     }
     
-    // 额外：尝试删除带有 accessGroup 的条目（需要知道具体的 group 标识）
-    // 这里简单使用通配方式（越狱环境下可用更底层的方法，但上述已覆盖大部分情况）
+    // 额外尝试
+    NSDictionary *wildcardQuery = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrDescription: bundleId,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
+    };
+    SecItemDelete((__bridge CFDictionaryRef)wildcardQuery);
+}
+
+// 获取 PID（通过 sysctl）
+- (pid_t)getPIDForBundleId:(NSString *)bundleId {
+    pid_t foundPid = -1;
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t miblen = 4;
+    size_t size = 0;
+    sysctl(mib, miblen, NULL, &size, NULL, 0);
+    struct kinfo_proc *processes = malloc(size);
+    if (!processes) return -1;
+    if (sysctl(mib, miblen, processes, &size, NULL, 0) == 0) {
+        size_t count = size / sizeof(struct kinfo_proc);
+        for (size_t i = 0; i < count; i++) {
+            NSString *procName = [NSString stringWithUTF8String:processes[i].kp_proc.p_comm];
+            if ([procName containsString:bundleId] || [bundleId containsString:procName]) {
+                foundPid = processes[i].kp_proc.p_pid;
+                break;
+            }
+        }
+    }
+    free(processes);
+    return foundPid;
 }
 
 #pragma mark - 构建 specifiers
