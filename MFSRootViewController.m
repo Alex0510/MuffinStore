@@ -27,7 +27,7 @@ static NSCache *groupPathCache = nil;
 
 @interface MFSRootViewController () <UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;
-@property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers; // 所有应用 specifier 备份
+@property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers; // 完整应用列表备份
 @property (nonatomic, assign) BOOL isSearching;
 @end
 
@@ -54,9 +54,9 @@ static NSCache *groupPathCache = nil;
     // 创建搜索栏
     self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
     self.searchBar.delegate = self;
-    self.searchBar.placeholder = @"搜索应用名称";
+    self.searchBar.placeholder = @"搜索应用名称或 Bundle ID";
     self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
-    self.searchBar.showsCancelButton = NO;
+    self.searchBar.showsCancelButton = YES;
     self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
     
     // 设置表格头部
@@ -73,7 +73,7 @@ static NSCache *groupPathCache = nil;
     [self reloadSpecifiers];
 }
 
-#pragma mark - 应用列表生成（抽离独立方法）
+#pragma mark - 应用列表生成（独立，确保数据干净）
 - (NSArray<PSSpecifier *> *)generateAppSpecifiers {
     NSMutableArray *appSpecifiers = [NSMutableArray new];
     [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
@@ -88,6 +88,11 @@ static NSCache *groupPathCache = nil;
         NSString *bundleName = infoPlist[@"CFBundleName"];
         NSString *localizedName = appProxy.localizedName ?: appProxy.bundleIdentifier;
         NSString *appName = displayName ?: (bundleName ?: localizedName);
+        // 去除首尾空白，避免搜索干扰
+        appName = [appName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (appName.length == 0) {
+            appName = appProxy.bundleIdentifier;
+        }
         appInfo[@"localizedName"] = appName;
         
         NSString *shortVersion = infoPlist[@"CFBundleShortVersionString"];
@@ -125,6 +130,14 @@ static NSCache *groupPathCache = nil;
     [self.table reloadData];
 }
 
+- (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar {
+    searchBar.text = @"";
+    self.isSearching = NO;
+    [self resetToAllAppSpecifiers];
+    [self.table reloadData];
+    [searchBar resignFirstResponder];
+}
+
 - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
     [searchBar resignFirstResponder];
 }
@@ -153,15 +166,9 @@ static NSCache *groupPathCache = nil;
 - (void)filterAppSpecifiersWithKeyword:(NSString *)keyword {
     if (!_specifiers) return;
     
-    // 如果备份为空，尝试从当前 specifiers 中提取应用部分（降级方案）
+    // 确保备份存在
     if (!self.allAppSpecifiers) {
-        NSMutableArray *apps = [NSMutableArray array];
-        for (PSSpecifier *spec in _specifiers) {
-            if (![spec.identifier isEqualToString:@"download"] && spec != _specifiers.firstObject) {
-                [apps addObject:spec];
-            }
-        }
-        self.allAppSpecifiers = [apps copy];
+        self.allAppSpecifiers = [self generateAppSpecifiers];
     }
     
     NSMutableArray *filtered = [NSMutableArray array];
@@ -174,12 +181,20 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 从完整备份中过滤
+    // 增强版过滤谓词：同时匹配名称（忽略变音符号）和 Bundle ID
     NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(PSSpecifier *spec, NSDictionary *bindings) {
         NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
         if (!appInfo) return NO;
         NSString *appName = appInfo[@"localizedName"];
-        return appName && [appName rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound;
+        NSString *bundleId = appInfo[@"bundleIdentifier"];
+        if (!appName) appName = @"";
+        if (!bundleId) bundleId = @"";
+        
+        // 名称匹配（忽略大小写与变音符号，如 é 匹配 e）
+        BOOL nameMatch = [appName rangeOfString:keyword options:NSCaseInsensitiveSearch|NSDiacriticInsensitiveSearch].location != NSNotFound;
+        // Bundle ID 匹配（忽略大小写）
+        BOOL idMatch = [bundleId rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound;
+        return nameMatch || idMatch;
     }];
     
     NSArray *filteredApps = [self.allAppSpecifiers filteredArrayUsingPredicate:predicate];
@@ -310,7 +325,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 应用组目录获取
+// 应用组目录获取（与之前相同，略作保留）
 - (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     NSString *cachedPath = [groupPathCache objectForKey:bundleId];
     if (cachedPath) {
@@ -566,7 +581,7 @@ static NSCache *groupPathCache = nil;
         installedGroupSpecifier.name = @"已安装应用";
         [_specifiers addObject:installedGroupSpecifier];
         
-        // 生成所有应用 specifiers 并备份
+        // 生成并备份所有应用
         NSArray *appSpecifiers = [self generateAppSpecifiers];
         self.allAppSpecifiers = appSpecifiers;
         [_specifiers addObjectsFromArray:appSpecifiers];
@@ -723,7 +738,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能（含降级处理）
+#pragma mark - 下载功能
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
