@@ -2,7 +2,6 @@
 #import "MFSRootViewController.h"
 #import "CoreServices.h"
 #import <objc/runtime.h>
-#import <spawn.h>  // 用于执行 shell 命令（需要 root 权限）
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -223,8 +222,6 @@ static NSCache *groupPathCache = nil;
     
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *bundlePath = appInfo[@"bundlePath"];
-    // 每次重新获取最新的 appProxy，避免使用旧的
-    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     
     UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:nil preferredStyle:UIAlertControllerStyleActionSheet];
     
@@ -243,7 +240,7 @@ static NSCache *groupPathCache = nil;
         if (dataURL && [[NSFileManager defaultManager] fileExistsAtPath:dataURL.path]) {
             [self openInFilza:dataURL];
         } else {
-            [self showAlert:@"错误" message:@"无法找到数据目录，请确保应用已运行过"];
+            [self showAlert:@"错误" message:@"无法找到数据目录，请确保应用已运行过。如果刚执行了一键新机，请先手动重启应用一次。"];
         }
     }];
     
@@ -280,20 +277,30 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:actionSheet animated:YES completion:nil];
 }
 
-// 获取数据容器URL（每次实时获取，不使用缓存）
+// 获取数据容器URL（每次实时获取，不使用缓存，且验证路径存在性）
 - (NSURL *)getDataContainerURLForBundleId:(NSString *)bundleId {
+    // 先清除该应用的路径缓存，强制重新获取
+    [groupPathCache removeObjectForKey:bundleId];
+    
     // 获取最新的 LSApplicationProxy
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     if (!appProxy) return nil;
     
-    // 优先使用系统的 dataContainerURL
+    // 尝试系统的 dataContainerURL
     NSURL *dataURL = [appProxy valueForKey:@"dataContainerURL"];
-    if (dataURL && [dataURL isKindOfClass:[NSURL class]] && [[NSFileManager defaultManager] fileExistsAtPath:dataURL.path]) {
-        return dataURL;
+    if (dataURL && [dataURL isKindOfClass:[NSURL class]]) {
+        if ([[NSFileManager defaultManager] fileExistsAtPath:dataURL.path]) {
+            return dataURL;
+        } else {
+            // 路径不存在，说明目录已被删除，需要手动扫描
+            NSString *foundPath = [self findDataContainerPathForBundleId:bundleId];
+            if (foundPath) {
+                return [NSURL fileURLWithPath:foundPath];
+            }
+        }
     }
     
-    // 如果系统返回的路径无效，则手动扫描（并清除旧缓存）
-    [groupPathCache removeObjectForKey:bundleId];
+    // 手动扫描
     NSString *path = [self findDataContainerPathForBundleId:bundleId];
     return path ? [NSURL fileURLWithPath:path] : nil;
 }
@@ -455,7 +462,7 @@ static NSCache *groupPathCache = nil;
     
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:url.path]) {
-        [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不存在:\n%@", url.path]];
+        [self showAlert:@"错误" message:[NSString stringWithFormat:@"路径不存在:\n%@\n\n请先运行一次应用，系统会自动创建新目录。", url.path]];
         return;
     }
     
@@ -526,21 +533,18 @@ static NSCache *groupPathCache = nil;
 - (void)performClearDataForBundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        // 获取最新的数据目录
         NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
             for (NSString *item in [fm contentsOfDirectoryAtPath:dataURL.path error:nil]) {
                 [fm removeItemAtPath:[dataURL.path stringByAppendingPathComponent:item] error:nil];
             }
         }
-        // 清除应用组目录
         NSURL *groupURL = [self getFirstGroupContainerURLForBundleId:bundleId];
         if (groupURL && [fm fileExistsAtPath:groupURL.path]) {
             for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
                 [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
             }
         }
-        // 清除缓存
         [groupPathCache removeObjectForKey:bundleId];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self showAlert:@"完成" message:@"数据已清理，应用可能需要重启才能生效"];
@@ -564,10 +568,9 @@ static NSCache *groupPathCache = nil;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         
-        // 1. 获取数据容器目录（整个 UUID 目录）
+        // 1. 获取数据容器目录并删除整个目录
         NSURL *dataContainerURL = [self getDataContainerURLForBundleId:bundleId];
         if (dataContainerURL && [fm fileExistsAtPath:dataContainerURL.path]) {
-            // 删除整个目录（而不是内部文件）
             NSError *error = nil;
             [fm removeItemAtPath:dataContainerURL.path error:&error];
             if (error) {
@@ -589,17 +592,16 @@ static NSCache *groupPathCache = nil;
             }
         }
         
-        // 3. 清除所有缓存（路径缓存和图标缓存）
-        [groupPathCache removeObjectForKey:bundleId];
-        [iconCache removeObjectForKey:bundleId];
+        // 3. 清除所有缓存
+        [groupPathCache removeAllObjects];
+        [iconCache removeAllObjects];
         
-        // 4. 由于删除了目录，系统可能会在应用下次启动时自动创建新的 UUID 目录
-        //    但为了彻底，可以尝试通过 LSApplicationWorkspace 通知系统应用数据已更改
-        //    这里简单提示用户手动重启应用
+        // 4. 尝试通知系统刷新应用信息
+        [[LSApplicationWorkspace defaultWorkspace] invalidateCache];
         
         dispatch_async(dispatch_get_main_queue(), ^{
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"一键新机完成"
-                                                                           message:@"数据目录已彻底删除。请手动重启该应用（从后台划掉再打开），系统将自动生成全新的数据目录，效果如同新设备。\n\n注意：如果应用仍显示旧目录，请重启设备。"
+                                                                           message:@"数据目录已彻底删除。请手动重启该应用（从后台划掉再打开），系统将自动生成全新的数据目录。\n\n重启应用后，再次点击「数据目录」即可看到新目录。"
                                                                     preferredStyle:UIAlertControllerStyleAlert];
             [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:alert animated:YES completion:nil];
