@@ -3,7 +3,6 @@
 #import "CoreServices.h"
 #import <objc/runtime.h>
 #import <sys/sysctl.h>
-#import <spawn.h>
 #import <Security/Security.h>
 
 @interface SKUIItemStateCenter : NSObject
@@ -555,7 +554,7 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-#pragma mark - 一键新机核心功能（增强版）
+#pragma mark - 一键新机核心功能（无 system 调用）
 - (void)confirmNewDeviceForBundleId:(NSString *)bundleId {
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"一键新机" message:@"将彻底清除该应用的所有数据、钥匙串，并强制结束进程。操作后请手动重启应用，系统将自动生成全新的数据目录。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *reset = [UIAlertAction actionWithTitle:@"一键新机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
@@ -575,13 +574,16 @@ static NSCache *groupPathCache = nil;
         [self killAppAndExtensions:bundleId];
         sleep(2); // 等待进程完全退出
         
-        // 2. 获取数据容器路径（绝对路径）
+        // 2. 获取数据容器路径并删除整个目录
         NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
-            // 使用 system 命令确保删除（root 权限）
-            NSString *rmCmd = [NSString stringWithFormat:@"rm -rf \"%@\"", dataURL.path];
-            system([rmCmd UTF8String]);
-            NSLog(@"[一键新机] 删除数据目录: %@", dataURL.path);
+            NSError *error = nil;
+            [fm removeItemAtPath:dataURL.path error:&error];
+            if (error) {
+                NSLog(@"[一键新机] 删除数据目录失败: %@", error);
+            } else {
+                NSLog(@"[一键新机] 成功删除数据目录: %@", dataURL.path);
+            }
         }
         
         // 3. 删除所有应用组容器
@@ -603,18 +605,33 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-// 杀死应用及其所有扩展进程
+// 杀死应用及其所有扩展进程（使用 sysctl 和 kill）
 - (void)killAppAndExtensions:(NSString *)bundleId {
-    // 获取主应用 PID
-    pid_t mainPid = [self getPIDForBundleId:bundleId];
-    if (mainPid > 0) {
-        kill(mainPid, SIGKILL);
+    // 获取所有匹配的 PID
+    NSMutableArray *pids = [NSMutableArray array];
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t miblen = 4;
+    size_t size = 0;
+    sysctl(mib, miblen, NULL, &size, NULL, 0);
+    struct kinfo_proc *processes = malloc(size);
+    if (processes) {
+        if (sysctl(mib, miblen, processes, &size, NULL, 0) == 0) {
+            size_t count = size / sizeof(struct kinfo_proc);
+            for (size_t i = 0; i < count; i++) {
+                NSString *procName = [NSString stringWithUTF8String:processes[i].kp_proc.p_comm];
+                // 检查进程名是否包含 bundleId（简单匹配）
+                if ([procName containsString:bundleId] || [bundleId containsString:procName]) {
+                    pid_t pid = processes[i].kp_proc.p_pid;
+                    [pids addObject:@(pid)];
+                }
+            }
+        }
+        free(processes);
     }
-    // 使用系统命令杀死所有包含 bundleId 的进程
-    NSString *killCmd = [NSString stringWithFormat:@"killall -9 %@ 2>/dev/null", bundleId];
-    system([killCmd UTF8String]);
-    NSString *psCmd = [NSString stringWithFormat:@"ps aux | grep '%@' | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null", bundleId];
-    system([psCmd UTF8String]);
+    // 杀死所有找到的进程
+    for (NSNumber *pidNum in pids) {
+        kill([pidNum intValue], SIGKILL);
+    }
 }
 
 // 清除系统级应用缓存（私有 API）
@@ -631,7 +648,7 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// 删除所有应用组容器（使用 system 确保删除）
+// 删除所有应用组容器（使用 NSFileManager）
 - (void)deleteAllGroupContainers:(NSString *)bundleId {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
@@ -652,17 +669,20 @@ static NSCache *groupPathCache = nil;
         if (!identifier) identifier = dir;
         
         NSString *idLower = [identifier lowercaseString];
+        // 修复逻辑运算符警告：添加括号明确优先级
         BOOL matched = [idLower isEqualToString:bundleIdLower] ||
-                       [idLower hasPrefix:@"group."] && [[idLower substringFromIndex:6] isEqualToString:bundleIdLower] ||
+                       ([idLower hasPrefix:@"group."] && [[idLower substringFromIndex:6] isEqualToString:bundleIdLower]) ||
                        [idLower hasSuffix:bundleIdLower] ||
                        [bundleIdLower hasPrefix:idLower] || [idLower hasPrefix:bundleIdLower] ||
                        (bundleIdLower.length >= 5 && [idLower rangeOfString:bundleIdLower].location != NSNotFound) ||
                        [[dir lowercaseString] containsString:bundleIdLower];
         
         if (matched) {
-            NSString *rmCmd = [NSString stringWithFormat:@"rm -rf \"%@\"", groupDir];
-            system([rmCmd UTF8String]);
-            NSLog(@"[一键新机] 删除应用组: %@", groupDir);
+            NSError *error = nil;
+            [fm removeItemAtPath:groupDir error:&error];
+            if (!error) {
+                NSLog(@"[一键新机] 删除应用组: %@", groupDir);
+            }
         }
     }
 }
@@ -693,36 +713,12 @@ static NSCache *groupPathCache = nil;
         SecItemDelete((__bridge CFDictionaryRef)query2);
     }
     
-    // 额外尝试
     NSDictionary *wildcardQuery = @{
         (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecAttrDescription: bundleId,
         (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
     };
     SecItemDelete((__bridge CFDictionaryRef)wildcardQuery);
-}
-
-// 获取 PID（通过 sysctl）
-- (pid_t)getPIDForBundleId:(NSString *)bundleId {
-    pid_t foundPid = -1;
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t miblen = 4;
-    size_t size = 0;
-    sysctl(mib, miblen, NULL, &size, NULL, 0);
-    struct kinfo_proc *processes = malloc(size);
-    if (!processes) return -1;
-    if (sysctl(mib, miblen, processes, &size, NULL, 0) == 0) {
-        size_t count = size / sizeof(struct kinfo_proc);
-        for (size_t i = 0; i < count; i++) {
-            NSString *procName = [NSString stringWithUTF8String:processes[i].kp_proc.p_comm];
-            if ([procName containsString:bundleId] || [bundleId containsString:procName]) {
-                foundPid = processes[i].kp_proc.p_pid;
-                break;
-            }
-        }
-    }
-    free(processes);
-    return foundPid;
 }
 
 #pragma mark - 构建 specifiers
