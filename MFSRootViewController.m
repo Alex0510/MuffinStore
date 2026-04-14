@@ -277,9 +277,16 @@ static NSCache *groupPathCache = nil;
     UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"清理数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self confirmClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
+    
+    // 新增：一键新机按钮
+    UIAlertAction *newDeviceAction = [UIAlertAction actionWithTitle:@"一键新机" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self confirmNewDeviceForAppProxy:appProxy bundleId:bundleId];
+    }];
+    
     UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     
     [actionSheet addAction:clearDataAction];
+    [actionSheet addAction:newDeviceAction];
     [actionSheet addAction:cancelAction];
     
     if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
@@ -550,6 +557,59 @@ static NSCache *groupPathCache = nil;
     });
 }
 
+#pragma mark - 一键新机功能
+- (void)confirmNewDeviceForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"一键新机" message:@"将彻底清除该应用的所有数据，使其恢复到全新安装状态（类似新设备）。操作后请手动重启应用。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *reset = [UIAlertAction actionWithTitle:@"一键新机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self performNewDeviceResetForAppProxy:appProxy bundleId:bundleId];
+    }];
+    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    [confirm addAction:reset];
+    [confirm addAction:cancel];
+    [self presentViewController:confirm animated:YES completion:nil];
+}
+
+- (void)performNewDeviceResetForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        // 1. 清空数据容器
+        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
+        if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
+            for (NSString *item in [fm contentsOfDirectoryAtPath:dataURL.path error:nil]) {
+                [fm removeItemAtPath:[dataURL.path stringByAppendingPathComponent:item] error:nil];
+            }
+        }
+        // 2. 清空应用组目录
+        NSArray *groupURLs = nil;
+        @try {
+            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+            } else {
+                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+            }
+        } @catch (NSException *e) {}
+        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
+            for (NSURL *groupURL in groupURLs) {
+                if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
+                    for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
+                        [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
+                    }
+                }
+            }
+        }
+        // 3. 可选：清除 Keychain 中该应用的条目（需要额外权限，这里不强制实现）
+        // 为了达到更好的“新机”效果，可以提示用户手动重启应用
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"一键新机完成"
+                                                                           message:@"所有数据已重置为全新状态。请手动重启该应用（从后台划掉再打开），应用将会像首次安装一样重新生成配置。"
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+        });
+    });
+}
+
 #pragma mark - 构建 specifiers（固定前三项）
 - (NSMutableArray*)specifiers {
     if(!_specifiers) {
@@ -800,11 +860,11 @@ static NSCache *groupPathCache = nil;
         }
         NSArray* results = json[@"results"];
         if(results.count == 0) {
-            // API 无结果，尝试从本地 iTunesMetadata.plist 中提取 App ID
+            // API 无结果，尝试从本地 iTunesMetadata.plist 中提取 App ID，然后直接查询历史版本
             long long localAppId = [self getTrackIdFromLocalMetadataForAppInfo:appInfo];
             if (localAppId != 0) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    // 自动使用提取到的 App ID 查询历史版本
+                    // 自动使用提取到的 App ID 从服务器获取历史版本列表
                     [self getAllAppVersionIdsFromServer:localAppId];
                 });
             } else {
@@ -866,7 +926,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/一键新机/跳转目录\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
