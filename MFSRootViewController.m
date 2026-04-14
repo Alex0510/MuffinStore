@@ -27,7 +27,7 @@ static NSCache *groupPathCache = nil;
 
 @interface MFSRootViewController () <UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;
-@property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers; // 完整应用列表备份
+@property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers;
 @property (nonatomic, assign) BOOL isSearching;
 @end
 
@@ -51,7 +51,6 @@ static NSCache *groupPathCache = nil;
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
     
-    // 创建搜索栏
     self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
     self.searchBar.delegate = self;
     self.searchBar.placeholder = @"搜索应用名称或 Bundle ID";
@@ -59,7 +58,6 @@ static NSCache *groupPathCache = nil;
     self.searchBar.showsCancelButton = YES;
     self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
     
-    // 设置表格头部
     self.table.tableHeaderView = self.searchBar;
 }
 
@@ -141,7 +139,6 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
-// 恢复完整列表（前3个固定条目 + 所有应用）
 - (void)resetToAllAppSpecifiers {
     if (!_specifiers) return;
     
@@ -150,7 +147,6 @@ static NSCache *groupPathCache = nil;
     }
     
     NSMutableArray *newSpecifiers = [NSMutableArray array];
-    // 保留前三个固定条目：下载组标题、下载按钮、已安装应用组标题
     NSInteger fixedCount = 3;
     for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
         [newSpecifiers addObject:_specifiers[i]];
@@ -159,7 +155,6 @@ static NSCache *groupPathCache = nil;
     _specifiers = newSpecifiers;
 }
 
-// 过滤应用列表（保留前3个固定条目 + 过滤后的应用）
 - (void)filterAppSpecifiersWithKeyword:(NSString *)keyword {
     if (!_specifiers) return;
     
@@ -168,13 +163,11 @@ static NSCache *groupPathCache = nil;
     }
     
     NSMutableArray *filtered = [NSMutableArray array];
-    // 保留前三个固定条目
     NSInteger fixedCount = 3;
     for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
         [filtered addObject:_specifiers[i]];
     }
     
-    // 增强版过滤谓词：名称（忽略变音符号）或 Bundle ID
     NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(PSSpecifier *spec, NSDictionary *bindings) {
         NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
         if (!appInfo) return NO;
@@ -316,7 +309,6 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 应用组目录获取
 - (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     NSString *cachedPath = [groupPathCache objectForKey:bundleId];
     if (cachedPath) {
@@ -555,12 +547,10 @@ static NSCache *groupPathCache = nil;
     if(!_specifiers) {
         _specifiers = [NSMutableArray new];
         
-        // 0: 下载组标题
         PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         downloadGroupSpecifier.name = @"下载";
         [_specifiers addObject:downloadGroupSpecifier];
         
-        // 1: 下载按钮
         PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
         downloadSpecifier.identifier = @"download";
         [downloadSpecifier setProperty:@YES forKey:@"enabled"];
@@ -570,12 +560,10 @@ static NSCache *groupPathCache = nil;
         NSString* aboutText = [self getAboutText];
         [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
         
-        // 2: 已安装应用组标题
         PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         installedGroupSpecifier.name = @"已安装应用";
         [_specifiers addObject:installedGroupSpecifier];
         
-        // 生成并备份所有应用
         NSArray *appSpecifiers = [self generateAppSpecifiers];
         self.allAppSpecifiers = appSpecifiers;
         [_specifiers addObjectsFromArray:appSpecifiers];
@@ -732,7 +720,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能
+#pragma mark - 下载功能（核心修改部分）
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
@@ -829,14 +817,15 @@ static NSCache *groupPathCache = nil;
             [self showAlert:@"错误" message:@"App ID 不能为空"];
             return;
         }
-        [self downloadAppWithAppId:appId versionId:versionId];
+        // 手动输入时，默认使用“新购买”模式（保持原行为）
+        [self downloadAppWithAppId:appId versionId:versionId isRedownload:NO];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.3 (支持已购重下载)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
@@ -877,7 +866,9 @@ static NSCache *groupPathCache = nil;
             UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请选择要下载的应用版本ID" preferredStyle:UIAlertControllerStyleActionSheet];
             for(NSDictionary* versionId in versionIds) {
                 UIAlertAction* versionAction = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@", versionId[@"bundle_version"]] style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
-                    [self downloadAppWithAppId:appId versionId:[versionId[@"external_identifier"] longLongValue]];
+                    long long versionIdNum = [versionId[@"external_identifier"] longLongValue];
+                    // 选择版本后，询问下载类型
+                    [self promptDownloadTypeForAppId:appId versionId:versionIdNum];
                 }];
                 [versionAlert addAction:versionAction];
             }
@@ -893,29 +884,75 @@ static NSCache *groupPathCache = nil;
     [task resume];
 }
 
+// 新增：选择下载类型（新购买/重下载）
+- (void)promptDownloadTypeForAppId:(long long)appId versionId:(long long)versionId {
+    UIAlertController* typeAlert = [UIAlertController alertControllerWithTitle:@"下载类型" message:@"请选择" preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertAction* newAction = [UIAlertAction actionWithTitle:@"新购买" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self downloadAppWithAppId:appId versionId:versionId isRedownload:NO];
+    }];
+    UIAlertAction* redownloadAction = [UIAlertAction actionWithTitle:@"已购买重下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self downloadAppWithAppId:appId versionId:versionId isRedownload:YES];
+    }];
+    UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    [typeAlert addAction:newAction];
+    [typeAlert addAction:redownloadAction];
+    [typeAlert addAction:cancelAction];
+    
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        typeAlert.popoverPresentationController.sourceView = self.view;
+        typeAlert.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 0, 0);
+    }
+    [self presentViewController:typeAlert animated:YES completion:nil];
+}
+
 - (void)promptForVersionId:(long long)appId {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请输入要下载的应用版本ID" preferredStyle:UIAlertControllerStyleAlert];
-        [versionAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
-            textField.placeholder = @"版本ID";
+        UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"下载选项" message:@"请选择下载类型" preferredStyle:UIAlertControllerStyleActionSheet];
+        
+        UIAlertAction* newPurchaseAction = [UIAlertAction actionWithTitle:@"新购买（未购买过）" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            [self promptForVersionIdInputWithAppId:appId isRedownload:NO];
         }];
-        UIAlertAction* downloadAction = [UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
-            long long versionId = [versionAlert.textFields.firstObject.text longLongValue];
-            [self downloadAppWithAppId:appId versionId:versionId];
+        UIAlertAction* redownloadAction = [UIAlertAction actionWithTitle:@"已购买重下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            [self promptForVersionIdInputWithAppId:appId isRedownload:YES];
         }];
-        [versionAlert addAction:downloadAction];
-        [versionAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-        [self presentViewController:versionAlert animated:YES completion:nil];
+        UIAlertAction* cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+        
+        [alert addAction:newPurchaseAction];
+        [alert addAction:redownloadAction];
+        [alert addAction:cancelAction];
+        
+        if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+            alert.popoverPresentationController.sourceView = self.view;
+            alert.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 0, 0);
+        }
+        [self presentViewController:alert animated:YES completion:nil];
     });
+}
+
+// 新增：输入版本号并下载
+- (void)promptForVersionIdInputWithAppId:(long long)appId isRedownload:(BOOL)isRedownload {
+    UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请输入要下载的应用版本ID（留空则下载最新版）" preferredStyle:UIAlertControllerStyleAlert];
+    [versionAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
+        textField.placeholder = @"版本ID（可选）";
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    UIAlertAction* downloadAction = [UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        NSString* versionStr = versionAlert.textFields.firstObject.text;
+        long long versionId = versionStr.length ? [versionStr longLongValue] : 0;
+        [self downloadAppWithAppId:appId versionId:versionId isRedownload:isRedownload];
+    }];
+    [versionAlert addAction:downloadAction];
+    [versionAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:versionAlert animated:YES completion:nil];
 }
 
 - (void)getAllAppVersionIdsAndPrompt:(long long)appId {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController* promptAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"您想手动输入版本ID还是从服务器获取版本列表？" preferredStyle:UIAlertControllerStyleAlert];
-        [promptAlert addAction:[UIAlertAction actionWithTitle:@"手动" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        UIAlertController* promptAlert = [UIAlertController alertControllerWithTitle:@"选择方式" message:@"请选择版本获取方式" preferredStyle:UIAlertControllerStyleAlert];
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"手动输入版本" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
             [self promptForVersionId:appId];
         }]];
-        [promptAlert addAction:[UIAlertAction actionWithTitle:@"服务器" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
+        [promptAlert addAction:[UIAlertAction actionWithTitle:@"从服务器获取版本列表" style:UIAlertActionStyleDefault handler:^(UIAlertAction* action) {
             [self getAllAppVersionIdsFromServer:appId];
         }]];
         [promptAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -923,26 +960,38 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-- (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId {
+// 核心下载方法：增加 isRedownload 参数
+- (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId isRedownload:(BOOL)isRedownload {
     NSString* adamId = [NSString stringWithFormat:@"%lld", appId];
     NSString* pricingParameters = @"pricingParameter";
     NSString* appExtVrsId = [NSString stringWithFormat:@"%lld", versionId];
     NSString* installed = @"0";
-    NSString* offerString = nil;
-    if (versionId == 0) {
-        offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, installed];
-    } else {
-        offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&appExtVrsId=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, appExtVrsId, installed];
+    
+    NSMutableString *offerString = [NSMutableString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, installed];
+    
+    if (versionId != 0) {
+        [offerString appendFormat:@"&appExtVrsId=%@", appExtVrsId];
     }
+    
+    if (isRedownload) {
+        [offerString appendString:@"&isRedownload=1"];
+        // 可选附加参数（根据iOS版本可能需要）
+        // [offerString appendString:@"&isCloudDownload=1"];
+    }
+    
     NSDictionary* offerDict = @{@"buyParams": offerString};
     NSDictionary* itemDict = @{@"_itemOffer": adamId};
     SKUIItemOffer* offer = [[SKUIItemOffer alloc] initWithLookupDictionary:offerDict];
     SKUIItem* item = [[SKUIItem alloc] initWithLookupDictionary:itemDict];
     [item setValue:offer forKey:@"_itemOffer"];
     [item setValue:@"iosSoftware" forKey:@"_itemKindString"];
-    if(versionId != 0) {
+    if (versionId != 0) {
         [item setValue:@(versionId) forKey:@"_versionIdentifier"];
     }
+    if (isRedownload) {
+        [item setValue:@YES forKey:@"_isRedownload"];
+    }
+    
     SKUIItemStateCenter* center = [SKUIItemStateCenter defaultCenter];
     NSArray* items = @[item];
     dispatch_async(dispatch_get_main_queue(), ^{
