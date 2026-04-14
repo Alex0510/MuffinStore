@@ -733,10 +733,53 @@ static NSCache *groupPathCache = nil;
 }
 
 #pragma mark - 下载功能
+// 从本地 iTunesMetadata.plist 中提取 trackId (App ID)
+- (long long)getTrackIdFromLocalMetadataForAppInfo:(NSDictionary *)appInfo {
+    if (!appInfo) return 0;
+    NSString *bundlePath = appInfo[@"bundlePath"];
+    NSString *containerPath = appInfo[@"containerPath"];
+    
+    NSString *metadataPath1 = [containerPath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
+    NSString *metadataPath2 = [bundlePath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
+    
+    NSString *metadataPath = nil;
+    if ([[NSFileManager defaultManager] fileExistsAtPath:metadataPath1]) {
+        metadataPath = metadataPath1;
+    } else if ([[NSFileManager defaultManager] fileExistsAtPath:metadataPath2]) {
+        metadataPath = metadataPath2;
+    } else {
+        return 0;
+    }
+    
+    NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+    if (!metadata) return 0;
+    
+    // 尝试多种可能的键名
+    NSNumber *itemId = nil;
+    if (metadata[@"itemId"]) {
+        itemId = metadata[@"itemId"];
+    } else if (metadata[@"appleId"]) {
+        itemId = metadata[@"appleId"];
+    } else if (metadata[@"adamId"]) {
+        itemId = metadata[@"adamId"];
+    } else {
+        NSDictionary *downloadInfo = metadata[@"com.apple.iTunesStore.downloadInfo"];
+        if (downloadInfo && downloadInfo[@"itemId"]) {
+            itemId = downloadInfo[@"itemId"];
+        }
+    }
+    
+    if (itemId && [itemId respondsToSelector:@selector(longLongValue)]) {
+        return [itemId longLongValue];
+    }
+    return 0;
+}
+
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
     NSString* bundleId = infoPlist[@"CFBundleIdentifier"];
+    NSDictionary *appInfo = [specifier propertyForKey:@"appInfo"];
     
     NSURL* url = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software", bundleId]];
     NSURLRequest* request = [NSURLRequest requestWithURL:url];
@@ -757,31 +800,18 @@ static NSCache *groupPathCache = nil;
         }
         NSArray* results = json[@"results"];
         if(results.count == 0) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"未找到应用"
-                                                                               message:[NSString stringWithFormat:@"iTunes API 未返回结果。\n\n你可以手动输入版本ID，或从历史版本服务器获取列表。"]
-                                                                        preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:@"手动输入版本ID" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    [self fetchAppIdForBundleId:bundleId completion:^(long long appId) {
-                        if (appId != 0) {
-                            [self promptForVersionId:appId];
-                        } else {
-                            [self promptForAppIdAndVersionIdManually];
-                        }
-                    }];
-                }]];
-                [alert addAction:[UIAlertAction actionWithTitle:@"从服务器获取列表" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    [self fetchAppIdForBundleId:bundleId completion:^(long long appId) {
-                        if (appId != 0) {
-                            [self getAllAppVersionIdsFromServer:appId];
-                        } else {
-                            [self showAlert:@"错误" message:@"无法获取 App ID，请尝试手动输入。"];
-                        }
-                    }];
-                }]];
-                [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-                [self presentViewController:alert animated:YES completion:nil];
-            });
+            // API 无结果，尝试从本地 iTunesMetadata.plist 中提取 App ID
+            long long localAppId = [self getTrackIdFromLocalMetadataForAppInfo:appInfo];
+            if (localAppId != 0) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    // 自动使用提取到的 App ID 查询历史版本
+                    [self getAllAppVersionIdsFromServer:localAppId];
+                });
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self showAlert:@"未找到应用" message:@"iTunes API 无返回结果，且无法从本地 iTunesMetadata.plist 中提取 App ID。"];
+                });
+            }
             return;
         }
         NSDictionary* app = results[0];
