@@ -2,6 +2,7 @@
 #import "MFSRootViewController.h"
 #import "CoreServices.h"
 #import <objc/runtime.h>
+#import <spawn.h>  // 用于执行 shell 命令（需要 root 权限）
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -27,7 +28,7 @@ static NSCache *groupPathCache = nil;
 
 @interface MFSRootViewController () <UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;
-@property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers; // 完整应用列表备份
+@property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers;
 @property (nonatomic, assign) BOOL isSearching;
 @end
 
@@ -51,7 +52,6 @@ static NSCache *groupPathCache = nil;
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
     
-    // 创建搜索栏
     self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
     self.searchBar.delegate = self;
     self.searchBar.placeholder = @"搜索应用名称或 Bundle ID";
@@ -59,7 +59,6 @@ static NSCache *groupPathCache = nil;
     self.searchBar.showsCancelButton = YES;
     self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
     
-    // 设置表格头部
     self.table.tableHeaderView = self.searchBar;
 }
 
@@ -141,16 +140,12 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
-// 恢复完整列表（前3个固定条目 + 所有应用）
 - (void)resetToAllAppSpecifiers {
     if (!_specifiers) return;
-    
     if (!self.allAppSpecifiers) {
         self.allAppSpecifiers = [self generateAppSpecifiers];
     }
-    
     NSMutableArray *newSpecifiers = [NSMutableArray array];
-    // 保留前三个固定条目：下载组标题、下载按钮、已安装应用组标题
     NSInteger fixedCount = 3;
     for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
         [newSpecifiers addObject:_specifiers[i]];
@@ -159,22 +154,16 @@ static NSCache *groupPathCache = nil;
     _specifiers = newSpecifiers;
 }
 
-// 过滤应用列表（保留前3个固定条目 + 过滤后的应用）
 - (void)filterAppSpecifiersWithKeyword:(NSString *)keyword {
     if (!_specifiers) return;
-    
     if (!self.allAppSpecifiers) {
         self.allAppSpecifiers = [self generateAppSpecifiers];
     }
-    
     NSMutableArray *filtered = [NSMutableArray array];
-    // 保留前三个固定条目
     NSInteger fixedCount = 3;
     for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
         [filtered addObject:_specifiers[i]];
     }
-    
-    // 增强版过滤谓词：名称（忽略变音符号）或 Bundle ID
     NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(PSSpecifier *spec, NSDictionary *bindings) {
         NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
         if (!appInfo) return NO;
@@ -182,19 +171,16 @@ static NSCache *groupPathCache = nil;
         NSString *bundleId = appInfo[@"bundleIdentifier"];
         if (!appName) appName = @"";
         if (!bundleId) bundleId = @"";
-        
         BOOL nameMatch = [appName rangeOfString:keyword options:NSCaseInsensitiveSearch|NSDiacriticInsensitiveSearch].location != NSNotFound;
         BOOL idMatch = [bundleId rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound;
         return nameMatch || idMatch;
     }];
-    
     NSArray *filteredApps = [self.allAppSpecifiers filteredArrayUsingPredicate:predicate];
     [filtered addObjectsFromArray:filteredApps];
-    
     _specifiers = filtered;
 }
 
-#pragma mark - 左上角按钮：直接输入软件ID查询版本并下载
+#pragma mark - 左上角按钮
 - (void)promptForAppIdDownload {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"输入软件ID" message:@"请输入App的Apple ID (trackId)" preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
@@ -237,6 +223,7 @@ static NSCache *groupPathCache = nil;
     
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *bundlePath = appInfo[@"bundlePath"];
+    // 每次重新获取最新的 appProxy，避免使用旧的
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     
     UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:nil preferredStyle:UIAlertControllerStyleActionSheet];
@@ -252,7 +239,7 @@ static NSCache *groupPathCache = nil;
         }
     }];
     UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
+        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId];
         if (dataURL && [[NSFileManager defaultManager] fileExistsAtPath:dataURL.path]) {
             [self openInFilza:dataURL];
         } else {
@@ -260,7 +247,7 @@ static NSCache *groupPathCache = nil;
         }
     }];
     
-    NSURL *groupURL = [self getFirstGroupContainerURLForBundleId:bundleId appProxy:appProxy];
+    NSURL *groupURL = [self getFirstGroupContainerURLForBundleId:bundleId];
     BOOL hasAppGroup = (groupURL != nil);
     
     [actionSheet addAction:launchAction];
@@ -275,11 +262,15 @@ static NSCache *groupPathCache = nil;
     }
     
     UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"清理数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self confirmClearDataForAppProxy:appProxy bundleId:bundleId];
+        [self confirmClearDataForBundleId:bundleId];
+    }];
+    UIAlertAction *newDeviceAction = [UIAlertAction actionWithTitle:@"一键新机" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self confirmNewDeviceForBundleId:bundleId];
     }];
     UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     
     [actionSheet addAction:clearDataAction];
+    [actionSheet addAction:newDeviceAction];
     [actionSheet addAction:cancelAction];
     
     if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
@@ -289,11 +280,20 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:actionSheet animated:YES completion:nil];
 }
 
-- (NSURL *)getDataContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
-    NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
-    if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
-        return dataContainerURL;
+// 获取数据容器URL（每次实时获取，不使用缓存）
+- (NSURL *)getDataContainerURLForBundleId:(NSString *)bundleId {
+    // 获取最新的 LSApplicationProxy
+    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    if (!appProxy) return nil;
+    
+    // 优先使用系统的 dataContainerURL
+    NSURL *dataURL = [appProxy valueForKey:@"dataContainerURL"];
+    if (dataURL && [dataURL isKindOfClass:[NSURL class]] && [[NSFileManager defaultManager] fileExistsAtPath:dataURL.path]) {
+        return dataURL;
     }
+    
+    // 如果系统返回的路径无效，则手动扫描（并清除旧缓存）
+    [groupPathCache removeObjectForKey:bundleId];
     NSString *path = [self findDataContainerPathForBundleId:bundleId];
     return path ? [NSURL fileURLWithPath:path] : nil;
 }
@@ -316,8 +316,8 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 应用组目录获取
-- (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
+- (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId {
+    // 先检查缓存是否有效
     NSString *cachedPath = [groupPathCache objectForKey:bundleId];
     if (cachedPath) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:cachedPath]) {
@@ -326,6 +326,9 @@ static NSCache *groupPathCache = nil;
             [groupPathCache removeObjectForKey:bundleId];
         }
     }
+    
+    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    if (!appProxy) return nil;
     
     NSArray *groupURLs = nil;
     @try {
@@ -345,6 +348,7 @@ static NSCache *groupPathCache = nil;
         }
     }
     
+    // 手动扫描应用组目录
     NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:appGroupRoot]) return nil;
@@ -382,6 +386,7 @@ static NSCache *groupPathCache = nil;
         }
     }
     
+    // 从 entitlement 中获取组标识再尝试
     NSArray *entitlementGroups = [self getApplicationGroupsFromEntitlementsForBundleId:bundleId];
     for (NSString *groupID in entitlementGroups) {
         NSString *possiblePath = [self findGroupContainerPathForGroupIdentifier:groupID];
@@ -507,10 +512,10 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
+- (void)confirmClearDataForBundleId:(NSString *)bundleId {
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self performClearDataForAppProxy:appProxy bundleId:bundleId];
+        [self performClearDataForBundleId:bundleId];
     }];
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     [confirm addAction:clear];
@@ -518,49 +523,99 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-- (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
+- (void)performClearDataForBundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
+        // 获取最新的数据目录
+        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
             for (NSString *item in [fm contentsOfDirectoryAtPath:dataURL.path error:nil]) {
                 [fm removeItemAtPath:[dataURL.path stringByAppendingPathComponent:item] error:nil];
             }
         }
-        NSArray *groupURLs = nil;
-        @try {
-            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-            } else {
-                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-            }
-        } @catch (NSException *e) {}
-        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
-            for (NSURL *groupURL in groupURLs) {
-                if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
-                    for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
-                        [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
-                    }
-                }
+        // 清除应用组目录
+        NSURL *groupURL = [self getFirstGroupContainerURLForBundleId:bundleId];
+        if (groupURL && [fm fileExistsAtPath:groupURL.path]) {
+            for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
+                [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
             }
         }
+        // 清除缓存
+        [groupPathCache removeObjectForKey:bundleId];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self showAlert:@"完成" message:@"数据已清理，应用可能需要重启才能生效"];
         });
     });
 }
 
-#pragma mark - 构建 specifiers（固定前三项）
+#pragma mark - 一键新机功能（删除整个数据目录，触发系统重新生成 UUID）
+- (void)confirmNewDeviceForBundleId:(NSString *)bundleId {
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"一键新机" message:@"将彻底删除该应用的数据目录，系统会重新生成全新 UUID（类似卸载重装）。操作后请手动重启应用。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *reset = [UIAlertAction actionWithTitle:@"一键新机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self performNewDeviceResetForBundleId:bundleId];
+    }];
+    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    [confirm addAction:reset];
+    [confirm addAction:cancel];
+    [self presentViewController:confirm animated:YES completion:nil];
+}
+
+- (void)performNewDeviceResetForBundleId:(NSString *)bundleId {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        
+        // 1. 获取数据容器目录（整个 UUID 目录）
+        NSURL *dataContainerURL = [self getDataContainerURLForBundleId:bundleId];
+        if (dataContainerURL && [fm fileExistsAtPath:dataContainerURL.path]) {
+            // 删除整个目录（而不是内部文件）
+            NSError *error = nil;
+            [fm removeItemAtPath:dataContainerURL.path error:&error];
+            if (error) {
+                NSLog(@"[一键新机] 删除数据目录失败: %@", error);
+            } else {
+                NSLog(@"[一键新机] 成功删除数据目录: %@", dataContainerURL.path);
+            }
+        }
+        
+        // 2. 删除应用组目录（整个目录）
+        NSURL *groupURL = [self getFirstGroupContainerURLForBundleId:bundleId];
+        if (groupURL && [fm fileExistsAtPath:groupURL.path]) {
+            NSError *error = nil;
+            [fm removeItemAtPath:groupURL.path error:&error];
+            if (error) {
+                NSLog(@"[一键新机] 删除应用组目录失败: %@", error);
+            } else {
+                NSLog(@"[一键新机] 成功删除应用组目录: %@", groupURL.path);
+            }
+        }
+        
+        // 3. 清除所有缓存（路径缓存和图标缓存）
+        [groupPathCache removeObjectForKey:bundleId];
+        [iconCache removeObjectForKey:bundleId];
+        
+        // 4. 由于删除了目录，系统可能会在应用下次启动时自动创建新的 UUID 目录
+        //    但为了彻底，可以尝试通过 LSApplicationWorkspace 通知系统应用数据已更改
+        //    这里简单提示用户手动重启应用
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"一键新机完成"
+                                                                           message:@"数据目录已彻底删除。请手动重启该应用（从后台划掉再打开），系统将自动生成全新的数据目录，效果如同新设备。\n\n注意：如果应用仍显示旧目录，请重启设备。"
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+        });
+    });
+}
+
+#pragma mark - 构建 specifiers
 - (NSMutableArray*)specifiers {
     if(!_specifiers) {
         _specifiers = [NSMutableArray new];
         
-        // 0: 下载组标题
         PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         downloadGroupSpecifier.name = @"下载";
         [_specifiers addObject:downloadGroupSpecifier];
         
-        // 1: 下载按钮
         PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
         downloadSpecifier.identifier = @"download";
         [downloadSpecifier setProperty:@YES forKey:@"enabled"];
@@ -570,12 +625,10 @@ static NSCache *groupPathCache = nil;
         NSString* aboutText = [self getAboutText];
         [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
         
-        // 2: 已安装应用组标题
         PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         installedGroupSpecifier.name = @"已安装应用";
         [_specifiers addObject:installedGroupSpecifier];
         
-        // 生成并备份所有应用
         NSArray *appSpecifiers = [self generateAppSpecifiers];
         self.allAppSpecifiers = appSpecifiers;
         [_specifiers addObjectsFromArray:appSpecifiers];
@@ -733,7 +786,6 @@ static NSCache *groupPathCache = nil;
 }
 
 #pragma mark - 下载功能
-// 从本地 iTunesMetadata.plist 中提取 trackId (App ID)
 - (long long)getTrackIdFromLocalMetadataForAppInfo:(NSDictionary *)appInfo {
     if (!appInfo) return 0;
     NSString *bundlePath = appInfo[@"bundlePath"];
@@ -754,7 +806,6 @@ static NSCache *groupPathCache = nil;
     NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
     if (!metadata) return 0;
     
-    // 尝试多种可能的键名
     NSNumber *itemId = nil;
     if (metadata[@"itemId"]) {
         itemId = metadata[@"itemId"];
@@ -800,11 +851,9 @@ static NSCache *groupPathCache = nil;
         }
         NSArray* results = json[@"results"];
         if(results.count == 0) {
-            // API 无结果，尝试从本地 iTunesMetadata.plist 中提取 App ID
             long long localAppId = [self getTrackIdFromLocalMetadataForAppInfo:appInfo];
             if (localAppId != 0) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    // 自动使用提取到的 App ID 查询历史版本
                     [self getAllAppVersionIdsFromServer:localAppId];
                 });
             } else {
@@ -866,7 +915,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/一键新机/跳转目录\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
