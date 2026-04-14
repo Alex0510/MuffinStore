@@ -25,6 +25,12 @@
 static NSCache *iconCache = nil;
 static NSCache *groupPathCache = nil;
 
+@interface MFSRootViewController () <UISearchBarDelegate>
+@property (nonatomic, strong) UISearchBar *searchBar;
+@property (nonatomic, strong) NSMutableArray<PSSpecifier *> *allAppSpecifiers; // 所有应用 specifier 备份
+@property (nonatomic, assign) BOOL isSearching;
+@end
+
 @implementation MFSRootViewController
 
 + (void)initialize {
@@ -36,6 +42,7 @@ static NSCache *groupPathCache = nil;
 
 - (void)loadView {
     [super loadView];
+    
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reloadSpecifiers) name:UIApplicationWillEnterForegroundNotification object:nil];
     
     UIBarButtonItem *refreshButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshAppList)];
@@ -43,13 +50,92 @@ static NSCache *groupPathCache = nil;
     
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
+    
+    // 创建搜索栏
+    self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
+    self.searchBar.delegate = self;
+    self.searchBar.placeholder = @"搜索应用名称";
+    self.searchBar.searchBarStyle = UISearchBarStyleMinimal;
+    
+    // 设置表格头部
+    self.table.tableHeaderView = self.searchBar;
 }
 
 - (void)refreshAppList {
     _specifiers = nil;
+    self.allAppSpecifiers = nil;
+    self.isSearching = NO;
+    self.searchBar.text = @"";
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
     [self reloadSpecifiers];
+}
+
+#pragma mark - 搜索栏代理
+- (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
+    if (searchText.length == 0) {
+        self.isSearching = NO;
+        [self resetToAllAppSpecifiers];
+    } else {
+        self.isSearching = YES;
+        [self filterAppSpecifiersWithKeyword:searchText];
+    }
+    [self.table reloadData];
+}
+
+- (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
+    [searchBar resignFirstResponder];
+}
+
+- (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar {
+    searchBar.text = @"";
+    self.isSearching = NO;
+    [self resetToAllAppSpecifiers];
+    [self.table reloadData];
+    [searchBar resignFirstResponder];
+}
+
+- (void)resetToAllAppSpecifiers {
+    if (!_specifiers) return;
+    // 重建 specifiers：下载组 + 所有应用
+    NSMutableArray *newSpecifiers = [NSMutableArray array];
+    // 找出下载组和下载按钮（前两个 specifier）
+    for (PSSpecifier *spec in _specifiers) {
+        if ([spec.identifier isEqualToString:@"download"] || spec == _specifiers.firstObject) {
+            [newSpecifiers addObject:spec];
+        } else {
+            break;
+        }
+    }
+    [newSpecifiers addObjectsFromArray:self.allAppSpecifiers];
+    _specifiers = newSpecifiers;
+}
+
+- (void)filterAppSpecifiersWithKeyword:(NSString *)keyword {
+    if (!_specifiers) return;
+    
+    NSMutableArray *filtered = [NSMutableArray array];
+    // 保留前两个固定 specifier（下载组标题、下载按钮）
+    for (PSSpecifier *spec in _specifiers) {
+        if ([spec.identifier isEqualToString:@"download"] || spec == _specifiers.firstObject) {
+            [filtered addObject:spec];
+        } else {
+            break;
+        }
+    }
+    
+    // 从备份中过滤应用
+    NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(PSSpecifier *spec, NSDictionary *bindings) {
+        NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
+        if (!appInfo) return NO;
+        NSString *appName = appInfo[@"localizedName"];
+        return [appName rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound;
+    }];
+    
+    NSArray *filteredApps = [self.allAppSpecifiers filteredArrayUsingPredicate:predicate];
+    [filtered addObjectsFromArray:filteredApps];
+    
+    _specifiers = filtered;
 }
 
 #pragma mark - 左上角按钮：直接输入软件ID查询版本并下载
@@ -152,7 +238,6 @@ static NSCache *groupPathCache = nil;
     if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]]) {
         return dataContainerURL;
     }
-    // 降级：手动查找
     NSString *path = [self findDataContainerPathForBundleId:bundleId];
     return path ? [NSURL fileURLWithPath:path] : nil;
 }
@@ -175,9 +260,8 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-// 增强版应用组目录获取（参照 TrollFools 逻辑）
+// 应用组目录获取（与之前相同）
 - (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
-    // 1. 检查缓存
     NSString *cachedPath = [groupPathCache objectForKey:bundleId];
     if (cachedPath) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:cachedPath]) {
@@ -187,7 +271,6 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 2. 优先使用官方 API：groupContainerURLs
     NSArray *groupURLs = nil;
     @try {
         if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
@@ -195,9 +278,7 @@ static NSCache *groupPathCache = nil;
         } else {
             groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
         }
-    } @catch (NSException *e) {
-        groupURLs = nil;
-    }
+    } @catch (NSException *e) {}
     
     if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count > 0) {
         for (NSURL *url in groupURLs) {
@@ -208,7 +289,6 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 3. 降级方案：扫描 AppGroup 目录
     NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:appGroupRoot]) return nil;
@@ -246,7 +326,6 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 4. 最后尝试：从 entitlements 中读取
     NSArray *entitlementGroups = [self getApplicationGroupsFromEntitlementsForBundleId:bundleId];
     for (NSString *groupID in entitlementGroups) {
         NSString *possiblePath = [self findGroupContainerPathForGroupIdentifier:groupID];
@@ -307,7 +386,6 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// Filza 跳转（与 TrollFools 一致）
 - (void)openInFilza:(NSURL *)url {
     if (!url) {
         [self showAlert:@"错误" message:@"无效的 URL"];
@@ -416,7 +494,7 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-#pragma mark - 原有代码（保持不变）
+#pragma mark - 构建 specifiers
 - (NSMutableArray*)specifiers {
     if(!_specifiers) {
         _specifiers = [NSMutableArray new];
@@ -472,6 +550,9 @@ static NSCache *groupPathCache = nil;
         [appSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier* a, PSSpecifier* b) {
             return [a.name compare:b.name];
         }];
+        
+        // 保存所有应用 specifier 的副本用于搜索
+        self.allAppSpecifiers = [appSpecifiers mutableCopy];
         [_specifiers addObjectsFromArray:appSpecifiers];
     }
     self.navigationItem.title = @"MuffinStore";
@@ -541,7 +622,6 @@ static NSCache *groupPathCache = nil;
         fileExists = YES;
     }
     
-    // 默认值
     NSString *appleID = @"未知";
     NSString *artist = @"未知";
     NSString *purchaseDate = @"未知";
@@ -550,10 +630,7 @@ static NSCache *groupPathCache = nil;
     if (fileExists) {
         NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
         if (metadata) {
-            // 开发者
             artist = metadata[@"artistName"] ?: @"未知";
-            
-            // 尝试从 downloadInfo 获取
             NSDictionary *downloadInfo = metadata[@"com.apple.iTunesStore.downloadInfo"];
             if (downloadInfo && [downloadInfo isKindOfClass:[NSDictionary class]]) {
                 NSDictionary *accountInfoDict = downloadInfo[@"accountInfo"];
@@ -561,30 +638,22 @@ static NSCache *groupPathCache = nil;
                     appleID = accountInfoDict[@"AppleID"] ?: @"未知";
                 }
                 purchaseDate = downloadInfo[@"purchaseDate"] ?: @"未知";
+                if (downloadInfo[@"itemId"]) {
+                    appIdStr = [downloadInfo[@"itemId"] stringValue];
+                }
             }
-            
-            // 如果上面没获取到，尝试直接从根字典获取
             if ([appleID isEqualToString:@"未知"]) appleID = metadata[@"AppleID"] ?: @"未知";
             if ([purchaseDate isEqualToString:@"未知"]) purchaseDate = metadata[@"purchaseDate"] ?: @"未知";
-            
-            // 获取 App ID (trackId)
-            // 字段可能是 itemId, appleId, adamId 等
-            if (downloadInfo[@"itemId"]) {
-                appIdStr = [downloadInfo[@"itemId"] stringValue];
-            } else if (metadata[@"itemId"]) {
-                appIdStr = [metadata[@"itemId"] stringValue];
-            } else if (metadata[@"appleId"]) {
-                appIdStr = [metadata[@"appleId"] stringValue];
-            } else if (metadata[@"adamId"]) {
-                appIdStr = [metadata[@"adamId"] stringValue];
-            } else {
-                appIdStr = @"未知";
+            if ([appIdStr isEqualToString:@"未知"]) {
+                if (metadata[@"itemId"]) {
+                    appIdStr = [metadata[@"itemId"] stringValue];
+                } else if (metadata[@"appleId"]) {
+                    appIdStr = [metadata[@"appleId"] stringValue];
+                } else if (metadata[@"adamId"]) {
+                    appIdStr = [metadata[@"adamId"] stringValue];
+                }
             }
-        } else {
-            appIdStr = @"解析失败";
         }
-    } else {
-        appIdStr = @"未找到 metadata";
     }
     
     NSString *accountInfoStr = [NSString stringWithFormat:@"App ID: %@\nApple ID: %@\n开发者: %@\n购买日期: %@", appIdStr, appleID, artist, purchaseDate];
@@ -638,7 +707,7 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-#pragma mark - 下载功能（含降级处理）
+#pragma mark - 下载功能
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
@@ -663,7 +732,6 @@ static NSCache *groupPathCache = nil;
         }
         NSArray* results = json[@"results"];
         if(results.count == 0) {
-            // 降级：提供手动输入或从服务器获取
             dispatch_async(dispatch_get_main_queue(), ^{
                 UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"未找到应用"
                                                                                message:[NSString stringWithFormat:@"iTunes API 未返回结果。\n\n你可以手动输入版本ID，或从历史版本服务器获取列表。"]
@@ -691,7 +759,6 @@ static NSCache *groupPathCache = nil;
             });
             return;
         }
-        // 正常情况：有结果
         NSDictionary* app = results[0];
         long long trackId = [app[@"trackId"] longLongValue];
         [self getAllAppVersionIdsAndPrompt:trackId];
