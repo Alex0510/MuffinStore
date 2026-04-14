@@ -596,9 +596,6 @@ static NSCache *groupPathCache = nil;
         [groupPathCache removeAllObjects];
         [iconCache removeAllObjects];
         
-        // 4. 尝试通知系统刷新应用信息
-        [[LSApplicationWorkspace defaultWorkspace] invalidateCache];
-        
         dispatch_async(dispatch_get_main_queue(), ^{
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"一键新机完成"
                                                                            message:@"数据目录已彻底删除。请手动重启该应用（从后台划掉再打开），系统将自动生成全新的数据目录。\n\n重启应用后，再次点击「数据目录」即可看到新目录。"
