@@ -222,6 +222,7 @@ static NSCache *groupPathCache = nil;
     
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *bundlePath = appInfo[@"bundlePath"];
+    // 每次重新获取最新的 appProxy，避免使用旧的
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     
     UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:nil preferredStyle:UIAlertControllerStyleActionSheet];
@@ -237,7 +238,7 @@ static NSCache *groupPathCache = nil;
         }
     }];
     UIAlertAction *dataAction = [UIAlertAction actionWithTitle:@"数据目录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
+        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId];
         if (dataURL && [[NSFileManager defaultManager] fileExistsAtPath:dataURL.path]) {
             [self openInFilza:dataURL];
         } else {
@@ -245,7 +246,7 @@ static NSCache *groupPathCache = nil;
         }
     }];
     
-    NSURL *groupURL = [self getFirstGroupContainerURLForBundleId:bundleId appProxy:appProxy];
+    NSURL *groupURL = [self getFirstGroupContainerURLForBundleId:bundleId];
     BOOL hasAppGroup = (groupURL != nil);
     
     [actionSheet addAction:launchAction];
@@ -263,7 +264,7 @@ static NSCache *groupPathCache = nil;
         [self confirmClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
     UIAlertAction *newDeviceAction = [UIAlertAction actionWithTitle:@"一键新机" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [self confirmNewDeviceForAppProxy:appProxy bundleId:bundleId];
+        [self confirmNewDeviceForBundleId:bundleId];
     }];
     UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     
@@ -278,15 +279,20 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:actionSheet animated:YES completion:nil];
 }
 
-// 获取数据容器URL（实时，不使用缓存，优先使用系统API）
-- (NSURL *)getDataContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
-    // 优先使用 LSApplicationProxy 的 dataContainerURL，系统会返回最新路径
-    NSURL *dataContainerURL = [appProxy valueForKey:@"dataContainerURL"];
-    if (dataContainerURL && [dataContainerURL isKindOfClass:[NSURL class]] && [[NSFileManager defaultManager] fileExistsAtPath:dataContainerURL.path]) {
-        return dataContainerURL;
+// 获取数据容器URL（每次实时获取，不使用缓存）
+- (NSURL *)getDataContainerURLForBundleId:(NSString *)bundleId {
+    // 获取最新的 LSApplicationProxy
+    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    if (!appProxy) return nil;
+    
+    // 优先使用系统的 dataContainerURL
+    NSURL *dataURL = [appProxy valueForKey:@"dataContainerURL"];
+    if (dataURL && [dataURL isKindOfClass:[NSURL class]] && [[NSFileManager defaultManager] fileExistsAtPath:dataURL.path]) {
+        return dataURL;
     }
-    // 如果系统返回的路径无效，则尝试手动扫描（但会清除缓存重新扫描）
-    [groupPathCache removeObjectForKey:bundleId]; // 清除旧的缓存
+    
+    // 如果系统返回的路径无效，则手动扫描（并清除旧缓存）
+    [groupPathCache removeObjectForKey:bundleId];
     NSString *path = [self findDataContainerPathForBundleId:bundleId];
     return path ? [NSURL fileURLWithPath:path] : nil;
 }
@@ -309,8 +315,8 @@ static NSCache *groupPathCache = nil;
     return nil;
 }
 
-- (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
-    // 检查缓存是否有效
+- (NSURL *)getFirstGroupContainerURLForBundleId:(NSString *)bundleId {
+    // 先检查缓存是否有效
     NSString *cachedPath = [groupPathCache objectForKey:bundleId];
     if (cachedPath) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:cachedPath]) {
@@ -319,6 +325,9 @@ static NSCache *groupPathCache = nil;
             [groupPathCache removeObjectForKey:bundleId];
         }
     }
+    
+    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    if (!appProxy) return nil;
     
     NSArray *groupURLs = nil;
     @try {
@@ -376,6 +385,7 @@ static NSCache *groupPathCache = nil;
         }
     }
     
+    // 从 entitlement 中获取组标识再尝试
     NSArray *entitlementGroups = [self getApplicationGroupsFromEntitlementsForBundleId:bundleId];
     for (NSString *groupID in entitlementGroups) {
         NSString *possiblePath = [self findGroupContainerPathForGroupIdentifier:groupID];
@@ -504,7 +514,7 @@ static NSCache *groupPathCache = nil;
 - (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self performClearDataForAppProxy:appProxy bundleId:bundleId];
+        [self performClearDataForBundleId:bundleId];
     }];
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     [confirm addAction:clear];
@@ -512,33 +522,24 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-- (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
+- (void)performClearDataForBundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
+        // 获取最新的数据目录
+        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
             for (NSString *item in [fm contentsOfDirectoryAtPath:dataURL.path error:nil]) {
                 [fm removeItemAtPath:[dataURL.path stringByAppendingPathComponent:item] error:nil];
             }
         }
-        NSArray *groupURLs = nil;
-        @try {
-            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-            } else {
-                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-            }
-        } @catch (NSException *e) {}
-        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
-            for (NSURL *groupURL in groupURLs) {
-                if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
-                    for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
-                        [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
-                    }
-                }
+        // 清除应用组目录
+        NSURL *groupURL = [self getFirstGroupContainerURLForBundleId:bundleId];
+        if (groupURL && [fm fileExistsAtPath:groupURL.path]) {
+            for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
+                [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
             }
         }
-        // 清除该应用的缓存路径，确保下次获取新路径
+        // 清除缓存
         [groupPathCache removeObjectForKey:bundleId];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self showAlert:@"完成" message:@"数据已清理，应用可能需要重启才能生效"];
@@ -546,11 +547,11 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-#pragma mark - 一键新机功能
-- (void)confirmNewDeviceForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
+#pragma mark - 一键新机功能（增强版）
+- (void)confirmNewDeviceForBundleId:(NSString *)bundleId {
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"一键新机" message:@"将彻底清除该应用的所有数据，使其恢复到全新安装状态（类似新设备）。操作后请手动重启应用。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *reset = [UIAlertAction actionWithTitle:@"一键新机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self performNewDeviceResetForAppProxy:appProxy bundleId:bundleId];
+        [self performNewDeviceResetForBundleId:bundleId];
     }];
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     [confirm addAction:reset];
@@ -558,37 +559,36 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-- (void)performNewDeviceResetForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
+- (void)performNewDeviceResetForBundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
+        
+        // 1. 清空数据容器（使用最新路径）
+        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
             for (NSString *item in [fm contentsOfDirectoryAtPath:dataURL.path error:nil]) {
                 [fm removeItemAtPath:[dataURL.path stringByAppendingPathComponent:item] error:nil];
             }
         }
-        NSArray *groupURLs = nil;
-        @try {
-            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-            } else {
-                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-            }
-        } @catch (NSException *e) {}
-        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
-            for (NSURL *groupURL in groupURLs) {
-                if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
-                    for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
-                        [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
-                    }
-                }
+        
+        // 2. 清空应用组目录
+        NSURL *groupURL = [self getFirstGroupContainerURLForBundleId:bundleId];
+        if (groupURL && [fm fileExistsAtPath:groupURL.path]) {
+            for (NSString *item in [fm contentsOfDirectoryAtPath:groupURL.path error:nil]) {
+                [fm removeItemAtPath:[groupURL.path stringByAppendingPathComponent:item] error:nil];
             }
         }
-        // 清除缓存，确保下次获取新路径
+        
+        // 3. 清除所有缓存（包括路径缓存和图标缓存）
         [groupPathCache removeObjectForKey:bundleId];
+        [iconCache removeObjectForKey:bundleId];
+        
+        // 4. 可选：尝试清除 Keychain 中该应用的数据（需要额外权限，这里不强制）
+        //    由于沙盒限制，无法直接清除其他应用的 Keychain，但系统会在应用被删除时清除，我们只能清空数据目录。
+        
         dispatch_async(dispatch_get_main_queue(), ^{
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"一键新机完成"
-                                                                           message:@"所有数据已重置为全新状态。请手动重启该应用（从后台划掉再打开），应用将会像首次安装一样重新生成配置。"
+                                                                           message:@"所有数据已重置为全新状态。请手动重启该应用（从后台划掉再打开），应用将会像首次安装一样重新生成配置。\n\n如果仍然跳转到旧目录，请尝试重启设备。"
                                                                     preferredStyle:UIAlertControllerStyleAlert];
             [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:alert animated:YES completion:nil];
