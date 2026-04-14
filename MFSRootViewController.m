@@ -4,6 +4,10 @@
 #import <objc/runtime.h>
 #import <sys/sysctl.h>
 #import <Security/Security.h>
+#import <spawn.h>
+
+// 定义 posix_spawn 属性
+extern char **environ;
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -554,7 +558,7 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-#pragma mark - 一键新机核心功能（无 system 调用）
+#pragma mark - 一键新机核心功能（增强版，使用 posix_spawn 确保删除成功）
 - (void)confirmNewDeviceForBundleId:(NSString *)bundleId {
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"一键新机" message:@"将彻底清除该应用的所有数据、钥匙串，并强制结束进程。操作后请手动重启应用，系统将自动生成全新的数据目录。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *reset = [UIAlertAction actionWithTitle:@"一键新机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
@@ -568,19 +572,23 @@ static NSCache *groupPathCache = nil;
 
 - (void)performNewDeviceResetForBundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSFileManager *fm = [NSFileManager defaultManager];
-        
-        // 1. 强力杀死应用及其扩展进程
+        // 1. 强力杀死应用及其扩展进程（多次尝试）
         [self killAppAndExtensions:bundleId];
-        sleep(2); // 等待进程完全退出
+        sleep(2);
+        [self killAppAndExtensions:bundleId]; // 二次杀进程
+        sleep(1);
         
-        // 2. 获取数据容器路径并删除整个目录
+        // 2. 获取数据容器路径并删除整个目录（使用 posix_spawn 执行 rm -rf）
         NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId];
-        if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
-            NSError *error = nil;
-            [fm removeItemAtPath:dataURL.path error:&error];
-            if (error) {
-                NSLog(@"[一键新机] 删除数据目录失败: %@", error);
+        if (dataURL && [[NSFileManager defaultManager] fileExistsAtPath:dataURL.path]) {
+            BOOL deleted = [self deletePathWithRmRF:dataURL.path];
+            if (!deleted) {
+                // 如果 rm -rf 失败，尝试 NSFileManager
+                NSError *error = nil;
+                [[NSFileManager defaultManager] removeItemAtPath:dataURL.path error:&error];
+                if (error) {
+                    NSLog(@"[一键新机] NSFileManager 删除也失败: %@", error);
+                }
             } else {
                 NSLog(@"[一键新机] 成功删除数据目录: %@", dataURL.path);
             }
@@ -605,9 +613,21 @@ static NSCache *groupPathCache = nil;
     });
 }
 
+// 使用 posix_spawn 执行 rm -rf
+- (BOOL)deletePathWithRmRF:(NSString *)path {
+    if (!path || path.length == 0) return NO;
+    pid_t pid;
+    char *argv[] = {"/bin/rm", "-rf", (char *)[path UTF8String], NULL};
+    int status = posix_spawn(&pid, argv[0], NULL, NULL, argv, environ);
+    if (status == 0) {
+        waitpid(pid, &status, 0);
+        return (status == 0);
+    }
+    return NO;
+}
+
 // 杀死应用及其所有扩展进程（使用 sysctl 和 kill）
 - (void)killAppAndExtensions:(NSString *)bundleId {
-    // 获取所有匹配的 PID
     NSMutableArray *pids = [NSMutableArray array];
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t miblen = 4;
@@ -619,7 +639,6 @@ static NSCache *groupPathCache = nil;
             size_t count = size / sizeof(struct kinfo_proc);
             for (size_t i = 0; i < count; i++) {
                 NSString *procName = [NSString stringWithUTF8String:processes[i].kp_proc.p_comm];
-                // 检查进程名是否包含 bundleId（简单匹配）
                 if ([procName containsString:bundleId] || [bundleId containsString:procName]) {
                     pid_t pid = processes[i].kp_proc.p_pid;
                     [pids addObject:@(pid)];
@@ -628,7 +647,6 @@ static NSCache *groupPathCache = nil;
         }
         free(processes);
     }
-    // 杀死所有找到的进程
     for (NSNumber *pidNum in pids) {
         kill([pidNum intValue], SIGKILL);
     }
@@ -648,7 +666,7 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// 删除所有应用组容器（使用 NSFileManager）
+// 删除所有应用组容器（使用 posix_spawn 确保删除）
 - (void)deleteAllGroupContainers:(NSString *)bundleId {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
@@ -669,7 +687,6 @@ static NSCache *groupPathCache = nil;
         if (!identifier) identifier = dir;
         
         NSString *idLower = [identifier lowercaseString];
-        // 修复逻辑运算符警告：添加括号明确优先级
         BOOL matched = [idLower isEqualToString:bundleIdLower] ||
                        ([idLower hasPrefix:@"group."] && [[idLower substringFromIndex:6] isEqualToString:bundleIdLower]) ||
                        [idLower hasSuffix:bundleIdLower] ||
@@ -678,16 +695,12 @@ static NSCache *groupPathCache = nil;
                        [[dir lowercaseString] containsString:bundleIdLower];
         
         if (matched) {
-            NSError *error = nil;
-            [fm removeItemAtPath:groupDir error:&error];
-            if (!error) {
-                NSLog(@"[一键新机] 删除应用组: %@", groupDir);
-            }
+            [self deletePathWithRmRF:groupDir];
         }
     }
 }
 
-// 清空 Keychain（增强版）
+// 清空 Keychain
 - (void)clearKeychainForBundleId:(NSString *)bundleId {
     NSArray *secItemClasses = @[
         (__bridge id)kSecClassGenericPassword,
