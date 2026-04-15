@@ -46,11 +46,8 @@ static NSCache *groupPathCache = nil;
     
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reloadSpecifiers) name:UIApplicationWillEnterForegroundNotification object:nil];
     
-    // 刷新按钮
     UIBarButtonItem *refreshButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshAppList)];
-    // 新机按钮
-    UIBarButtonItem *newDeviceButton = [[UIBarButtonItem alloc] initWithTitle:@"新机" style:UIBarButtonItemStylePlain target:self action:@selector(oneKeyNewDevice)];
-    self.navigationItem.rightBarButtonItems = @[refreshButton, newDeviceButton];
+    self.navigationItem.rightBarButtonItem = refreshButton;
     
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
@@ -72,32 +69,6 @@ static NSCache *groupPathCache = nil;
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
     [self reloadSpecifiers];
-}
-
-#pragma mark - 一键新机（NewDevice 功能）
-- (void)oneKeyNewDevice {
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"一键新机"
-                                                                     message:@"将清理当前应用的所有数据（沙盒、钥匙串、偏好设置），应用将恢复初始状态。是否继续？"
-                                                              preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            [[NDManager shared] cleanSandbox];
-            [[NDManager shared] cleanKeychain];
-            [[NDManager shared] resetUserDefaults];
-            
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *doneAlert = [UIAlertController alertControllerWithTitle:@"完成"
-                                                                                   message:@"数据已清理，建议重启应用使所有设置生效。"
-                                                                            preferredStyle:UIAlertControllerStyleAlert];
-                [doneAlert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-                [self presentViewController:doneAlert animated:YES completion:nil];
-            });
-        });
-    }];
-    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
-    [confirm addAction:okAction];
-    [confirm addAction:cancelAction];
-    [self presentViewController:confirm animated:YES completion:nil];
 }
 
 #pragma mark - 应用列表生成
@@ -521,7 +492,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将删除该应用的所有文档和数据，且无法恢复。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将清理当前应用（MuffinStore）的所有沙盒数据、钥匙串和偏好设置，应用将恢复初始状态。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self performClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
@@ -531,131 +502,18 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-#pragma mark - 清理数据（保护元数据文件，保留目录结构，清空 Preferences plist 内容）
+#pragma mark - 清理数据（使用 NewDevice 的清理逻辑，清理 MFS 自身）
 - (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSFileManager *fm = [NSFileManager defaultManager];
-        
-        // 清理数据容器（保护 .com.apple.mobile_container_manager.metadata.plist）
-        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
-        if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
-            [self clearContentsAtPath:dataURL.path isRootContainer:YES];
-        }
-        
-        // 清理组容器（同样保护元数据文件）
-        NSArray *groupURLs = nil;
-        @try {
-            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-            } else {
-                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-            }
-        } @catch (NSException *e) {}
-        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
-            for (NSURL *groupURL in groupURLs) {
-                if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
-                    [self clearContentsAtPath:groupURL.path isRootContainer:YES];
-                }
-            }
-        }
+        // 调用 NDManager 的一键新机清理（清理 MFS 自身）
+        [[NDManager shared] cleanSandbox];
+        [[NDManager shared] cleanKeychain];
+        [[NDManager shared] resetUserDefaults];
         
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self showAlert:@"完成" message:@"数据已清理，应用可能需要重启才能生效"];
+            [self showAlert:@"完成" message:@"数据已清理，建议重启应用使所有设置生效。"];
         });
     });
-}
-
-/**
- * 递归清理指定路径下的所有文件，但保留目录结构。
- * 保护规则：
- *   - 根目录下的 .com.apple.mobile_container_manager.metadata.plist 不删除
- *   - /Library/Preferences 下的 .plist 文件只清空内容，不删除
- *   - 其他文件直接删除
- */
-- (void)clearContentsAtPath:(NSString *)path isRootContainer:(BOOL)isRoot {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    if (![fm fileExistsAtPath:path isDirectory:&isDir]) return;
-    
-    if (!isDir) {
-        // 文件：如果不是受保护的文件则删除
-        if ([self isProtectedMetadataFile:path]) {
-            // 保护元数据文件，不做任何操作
-            return;
-        }
-        [fm removeItemAtPath:path error:nil];
-        return;
-    }
-    
-    // 是目录：遍历内容
-    NSArray *contents = [fm contentsOfDirectoryAtPath:path error:nil];
-    for (NSString *item in contents) {
-        NSString *fullPath = [path stringByAppendingPathComponent:item];
-        BOOL itemIsDir = NO;
-        if ([fm fileExistsAtPath:fullPath isDirectory:&itemIsDir]) {
-            if (itemIsDir) {
-                // 递归处理子目录，但标记不是根容器
-                [self clearContentsAtPath:fullPath isRootContainer:NO];
-            } else {
-                // 文件处理
-                if ([self isProtectedMetadataFile:fullPath]) {
-                    // 保护元数据文件
-                    continue;
-                }
-                if ([self isPreferencesPlistAtPath:fullPath]) {
-                    [self clearPlistFileContent:fullPath];
-                } else {
-                    [fm removeItemAtPath:fullPath error:nil];
-                }
-            }
-        }
-    }
-}
-
-/**
- * 判断文件是否为受保护的元数据文件（.com.apple.mobile_container_manager.metadata.plist）
- */
-- (BOOL)isProtectedMetadataFile:(NSString *)path {
-    NSString *fileName = [path lastPathComponent];
-    if ([fileName isEqualToString:@".com.apple.mobile_container_manager.metadata.plist"]) {
-        return YES;
-    }
-    return NO;
-}
-
-/**
- * 判断路径是否属于应用数据目录下的 /Library/Preferences 中的 .plist 文件
- */
-- (BOOL)isPreferencesPlistAtPath:(NSString *)path {
-    if (![path.pathExtension isEqualToString:@"plist"]) return NO;
-    NSArray *pathComponents = [path pathComponents];
-    NSUInteger count = pathComponents.count;
-    for (NSUInteger i = 0; i < count - 1; i++) {
-        if ([pathComponents[i] isEqualToString:@"Library"]) {
-            if (i + 1 < count && [pathComponents[i+1] isEqualToString:@"Preferences"]) {
-                return YES;
-            }
-            break;
-        }
-    }
-    return NO;
-}
-
-/**
- * 清空 plist 文件内容（写入空字典）
- */
-- (void)clearPlistFileContent:(NSString *)path {
-    NSDictionary *emptyDict = @{};
-    NSError *error = nil;
-    NSData *plistData = [NSPropertyListSerialization dataWithPropertyList:emptyDict
-                                                                   format:NSPropertyListXMLFormat_v1_0
-                                                                  options:0
-                                                                    error:&error];
-    if (plistData) {
-        [plistData writeToFile:path atomically:YES];
-    } else {
-        [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
 }
 
 #pragma mark - 构建 specifiers
