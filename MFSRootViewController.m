@@ -3,6 +3,7 @@
 #import "CoreServices.h"
 #import <objc/runtime.h>
 #import <Security/Security.h>
+#import <sys/sysctl.h>
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -109,19 +110,14 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
-#pragma mark - 判断是否为非用户安装应用（巨魔/ESign/SideStore等）
+#pragma mark - 判断是否为非用户安装应用
 - (BOOL)isSideStoreAppAtPath:(NSString *)bundlePath {
     NSFileManager *fm = [NSFileManager defaultManager];
     
     NSArray *markerFiles = @[
-        @"_TrollStore",
-        @"_ESignStore",
-        @"_SignStore",
-        @"_SideStore",
-        @"_AltStore",
-        @"_AppSync",
-        @".TrollStore",
-        @".ESignStore"
+        @"_TrollStore", @"_ESignStore", @"_SignStore",
+        @"_SideStore", @"_AltStore", @"_AppSync",
+        @".TrollStore", @".ESignStore"
     ];
     
     for (NSString *marker in markerFiles) {
@@ -182,7 +178,6 @@ static NSCache *groupPathCache = nil;
                     
                     NSString *bundleId = infoPlist[@"CFBundleIdentifier"];
                     if (!bundleId) continue;
-                    
                     if ([bundleId hasPrefix:@"com.apple."]) continue;
                     
                     NSString *displayName = infoPlist[@"CFBundleDisplayName"];
@@ -649,20 +644,17 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 清理数据确认对话框（按照图片内容）
+#pragma mark - 清理数据确认对话框
 - (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
-    NSString *appName = @"该应用";
-    // 尝试获取应用名称
-    NSDictionary *appInfo = nil;
+    NSString *appName = bundleId;
     for (PSSpecifier *spec in self.allAppSpecifiers) {
         NSDictionary *info = [spec propertyForKey:@"appInfo"];
         if ([info[@"bundleIdentifier"] isEqualToString:bundleId]) {
-            appInfo = info;
+            if (info[@"localizedName"]) {
+                appName = info[@"localizedName"];
+            }
             break;
         }
-    }
-    if (appInfo && appInfo[@"localizedName"]) {
-        appName = appInfo[@"localizedName"];
     }
     
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清除"
@@ -677,16 +669,24 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-#pragma mark - 核心清理方法
+#pragma mark - 增强版清理数据（彻底清理）
 - (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         
+        // 1. 先杀死应用进程
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [self killAppWithBundleId:bundleId];
+        });
+        [NSThread sleepForTimeInterval:0.5];
+        
+        // 2. 清理数据容器
         NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
             [self clearContentsAtPath:dataURL.path isRootContainer:YES];
         }
         
+        // 3. 清理组容器
         NSArray *groupURLs = nil;
         @try {
             if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
@@ -703,16 +703,32 @@ static NSCache *groupPathCache = nil;
             }
         }
         
+        // 4. 清理应用自身的 Preferences
         if (dataURL) {
             [self clearPreferencesForBundleId:bundleId dataContainerURL:dataURL];
         }
         
+        // 5. 清理全局 Preferences
         [self clearGlobalPreferencesForBundleId:bundleId];
+        
+        // 6. 清理所有共享偏好文件
+        [self clearAllSharedPreferencesForBundleId:bundleId];
+        
+        // 7. 清理 Keychain（增强版）
         [self clearKeychainForBundleId:bundleId appProxy:appProxy];
         
-        dispatch_async(dispatch_get_main_queue(), ^{
+        // 8. 清理 Caches 和 tmp 目录
+        if (dataURL) {
+            [self cleanCachesAndTempDirectories:dataURL.path];
+        }
+        
+        // 9. 再次杀死应用
+        dispatch_sync(dispatch_get_main_queue(), ^{
             [self killAppWithBundleId:bundleId];
-            [self showAlert:@"完成" message:[NSString stringWithFormat:@"已清理应用「%@」的所有数据。\n请重新启动该应用，它将像第一次安装一样。", bundleId]];
+        });
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showAlert:@"完成" message:[NSString stringWithFormat:@"已彻底清理应用「%@」的所有数据。\n请重新启动该应用，它将像第一次安装一样。", bundleId]];
         });
     });
 }
@@ -767,11 +783,70 @@ static NSCache *groupPathCache = nil;
     [[NSFileManager defaultManager] removeItemAtPath:prefPath error:nil];
 }
 
-- (void)clearKeychainForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
-    NSArray *accessGroups = [self getKeychainAccessGroupsForAppProxy:appProxy];
-    if (accessGroups.count == 0) {
-        accessGroups = @[bundleId];
+- (void)clearAllSharedPreferencesForBundleId:(NSString *)bundleId {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    
+    NSString *prefDir = @"/var/mobile/Library/Preferences";
+    NSArray *files = [fm contentsOfDirectoryAtPath:prefDir error:nil];
+    for (NSString *file in files) {
+        if ([file containsString:bundleId] || [file hasPrefix:bundleId]) {
+            NSString *fullPath = [prefDir stringByAppendingPathComponent:file];
+            [fm removeItemAtPath:fullPath error:nil];
+        }
     }
+    
+    NSString *sharedPrefDir = @"/var/mobile/Library/Preferences/AppGroups";
+    if ([fm fileExistsAtPath:sharedPrefDir]) {
+        NSArray *groupFiles = [fm contentsOfDirectoryAtPath:sharedPrefDir error:nil];
+        for (NSString *file in groupFiles) {
+            if ([file containsString:bundleId]) {
+                NSString *fullPath = [sharedPrefDir stringByAppendingPathComponent:file];
+                [fm removeItemAtPath:fullPath error:nil];
+            }
+        }
+    }
+}
+
+- (void)cleanCachesAndTempDirectories:(NSString *)dataPath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    
+    NSString *cachesPath = [dataPath stringByAppendingPathComponent:@"Library/Caches"];
+    if ([fm fileExistsAtPath:cachesPath]) {
+        NSArray *cachesContents = [fm contentsOfDirectoryAtPath:cachesPath error:nil];
+        for (NSString *item in cachesContents) {
+            NSString *fullPath = [cachesPath stringByAppendingPathComponent:item];
+            [fm removeItemAtPath:fullPath error:nil];
+        }
+    }
+    
+    NSString *tmpPath = [dataPath stringByAppendingPathComponent:@"tmp"];
+    if ([fm fileExistsAtPath:tmpPath]) {
+        NSArray *tmpContents = [fm contentsOfDirectoryAtPath:tmpPath error:nil];
+        for (NSString *item in tmpContents) {
+            NSString *fullPath = [tmpPath stringByAppendingPathComponent:item];
+            [fm removeItemAtPath:fullPath error:nil];
+        }
+    }
+}
+
+#pragma mark - 增强版 Keychain 清理
+- (void)clearKeychainForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
+    NSMutableArray *allAccessGroups = [NSMutableArray array];
+    
+    NSArray *entitlementGroups = [self getKeychainAccessGroupsForAppProxy:appProxy];
+    [allAccessGroups addObjectsFromArray:entitlementGroups];
+    [allAccessGroups addObject:bundleId];
+    
+    NSString *teamId = [self getTeamIdFromAppProxy:appProxy];
+    if (teamId) {
+        [allAccessGroups addObject:[NSString stringWithFormat:@"%@.%@", teamId, bundleId]];
+        [allAccessGroups addObject:[NSString stringWithFormat:@"%@.*", teamId]];
+    }
+    
+    [allAccessGroups addObject:@"apple"];
+    [allAccessGroups addObject:@"com.apple.token"];
+    
+    NSArray *uniqueGroups = [[NSSet setWithArray:allAccessGroups] allObjects];
     
     NSArray *secClasses = @[
         (__bridge id)kSecClassGenericPassword,
@@ -781,7 +856,7 @@ static NSCache *groupPathCache = nil;
         (__bridge id)kSecClassIdentity
     ];
     
-    for (NSString *group in accessGroups) {
+    for (NSString *group in uniqueGroups) {
         for (id secClass in secClasses) {
             NSDictionary *query = @{
                 (__bridge id)kSecClass: secClass,
@@ -792,7 +867,71 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    [self deleteKeychainItemsContainingBundleId:bundleId];
+    [self deleteAllKeychainItemsContainingBundleId:bundleId];
+}
+
+- (NSString *)getTeamIdFromAppProxy:(id)appProxy {
+    @try {
+        NSDictionary *entitlements = [appProxy valueForKey:@"entitlements"];
+        if (entitlements) {
+            NSString *appIdentifier = entitlements[@"application-identifier"];
+            if (appIdentifier) {
+                NSArray *parts = [appIdentifier componentsSeparatedByString:@"."];
+                if (parts.count > 0) return parts[0];
+            }
+            NSArray *keychainGroups = entitlements[@"keychain-access-groups"];
+            if ([keychainGroups isKindOfClass:[NSArray class]] && keychainGroups.count > 0) {
+                NSArray *parts = [keychainGroups[0] componentsSeparatedByString:@"."];
+                if (parts.count > 0) return parts[0];
+            }
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+- (void)deleteAllKeychainItemsContainingBundleId:(NSString *)bundleId {
+    NSArray *secClasses = @[
+        (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecClassInternetPassword,
+        (__bridge id)kSecClassCertificate,
+        (__bridge id)kSecClassKey,
+        (__bridge id)kSecClassIdentity
+    ];
+    
+    for (id secClass in secClasses) {
+        NSDictionary *query = @{
+            (__bridge id)kSecClass: secClass,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecReturnAttributes: @YES,
+            (__bridge id)kSecReturnData: @NO
+        };
+        
+        CFArrayRef result = NULL;
+        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&result);
+        if (status == errSecSuccess && result) {
+            NSArray *items = (__bridge NSArray *)result;
+            for (NSDictionary *item in items) {
+                NSString *account = item[(__bridge id)kSecAttrAccount];
+                NSString *service = item[(__bridge id)kSecAttrService];
+                NSString *accessGroup = item[(__bridge id)kSecAttrAccessGroup];
+                
+                BOOL shouldDelete = NO;
+                if (account && [account containsString:bundleId]) shouldDelete = YES;
+                if (service && [service containsString:bundleId]) shouldDelete = YES;
+                if (accessGroup && [accessGroup containsString:bundleId]) shouldDelete = YES;
+                
+                if (shouldDelete) {
+                    NSMutableDictionary *deleteQuery = [NSMutableDictionary dictionary];
+                    deleteQuery[(__bridge id)kSecClass] = secClass;
+                    if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
+                    if (service) deleteQuery[(__bridge id)kSecAttrService] = service;
+                    if (accessGroup) deleteQuery[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+                    SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
+                }
+            }
+            CFRelease(result);
+        }
+    }
 }
 
 - (NSArray<NSString *> *)getKeychainAccessGroupsForAppProxy:(id)appProxy {
@@ -815,37 +954,14 @@ static NSCache *groupPathCache = nil;
     return groups;
 }
 
-- (void)deleteKeychainItemsContainingBundleId:(NSString *)bundleId {
-    NSDictionary *query = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-        (__bridge id)kSecReturnAttributes: @YES,
-        (__bridge id)kSecReturnData: @NO
-    };
-    CFArrayRef result = NULL;
-    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&result);
-    if (status == errSecSuccess && result) {
-        NSArray *items = (__bridge NSArray *)result;
-        for (NSDictionary *item in items) {
-            NSString *account = item[(__bridge id)kSecAttrAccount];
-            NSString *service = item[(__bridge id)kSecAttrService];
-            if ([account containsString:bundleId] || [service containsString:bundleId]) {
-                NSMutableDictionary *deleteQuery = [NSMutableDictionary dictionary];
-                deleteQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
-                if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
-                if (service) deleteQuery[(__bridge id)kSecAttrService] = service;
-                SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
-            }
-        }
-        CFRelease(result);
-    }
-}
-
 - (void)killAppWithBundleId:(NSString *)bundleId {
     LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
     if ([workspace respondsToSelector:@selector(killApplicationWithBundleIdentifier:)]) {
         [workspace performSelector:@selector(killApplicationWithBundleIdentifier:) withObject:bundleId];
     }
+    
+    NSString *killCommand = [NSString stringWithFormat:@"killall -9 %@ 2>/dev/null", bundleId];
+    system([killCommand UTF8String]);
 }
 
 - (void)showAppDetails:(UIButton *)sender {
@@ -1227,7 +1343,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.4 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
