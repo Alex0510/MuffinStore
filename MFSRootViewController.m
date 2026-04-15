@@ -109,7 +109,33 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
-#pragma mark - 应用列表生成（直接扫描文件系统，巨魔环境下有权限）
+#pragma mark - 判断是否为巨魔应用
+- (BOOL)isTrollStoreAppAtPath:(NSString *)bundlePath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    
+    // 检查 _TrollStore 文件（巨魔应用的标准标记文件）
+    NSString *trollFilePath = [bundlePath stringByAppendingPathComponent:@"_TrollStore"];
+    if ([fm fileExistsAtPath:trollFilePath]) {
+        return YES;
+    }
+    
+    // 检查 .TrollStore 隐藏文件
+    NSString *hiddenTrollPath = [bundlePath stringByAppendingPathComponent:@".TrollStore"];
+    if ([fm fileExistsAtPath:hiddenTrollPath]) {
+        return YES;
+    }
+    
+    // 检查父目录是否有 TrollStore 标记
+    NSString *parentPath = [bundlePath stringByDeletingLastPathComponent];
+    NSString *parentTrollPath = [parentPath stringByAppendingPathComponent:@"_TrollStore"];
+    if ([fm fileExistsAtPath:parentTrollPath]) {
+        return YES;
+    }
+    
+    return NO;
+}
+
+#pragma mark - 应用列表生成（直接扫描文件系统）
 - (NSArray<PSSpecifier *> *)generateAppSpecifiers {
     NSMutableArray *appSpecifiers = [NSMutableArray new];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -153,8 +179,8 @@ static NSCache *groupPathCache = nil;
                     NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
                     NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
                     
-                    NSString *trollFilePath = [bundlePath stringByAppendingPathComponent:@"_TrollStore"];
-                    BOOL isTrollApp = [fm fileExistsAtPath:trollFilePath];
+                    // 判断是否为巨魔应用
+                    BOOL isTrollApp = [self isTrollStoreAppAtPath:bundlePath];
                     
                     NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
                     appInfo[@"bundleIdentifier"] = bundleId;
@@ -945,30 +971,45 @@ static NSCache *groupPathCache = nil;
         }
         NSArray* results = json[@"results"];
         if(results.count == 0) {
+            // 从应用详情中获取 App ID 并查询历史版本
             dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"未找到应用"
-                                                                               message:[NSString stringWithFormat:@"iTunes API 未返回结果。\n\n你可以手动输入版本ID，或从历史版本服务器获取列表。"]
-                                                                        preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:@"手动输入版本ID" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    [self fetchAppIdForBundleId:bundleId completion:^(long long appId) {
-                        if (appId != 0) {
-                            [self promptForVersionId:appId];
-                        } else {
-                            [self promptForAppIdAndVersionIdManually];
+                // 获取应用详情中的 App ID
+                NSDictionary *appInfo = [specifier propertyForKey:@"appInfo"];
+                NSString *bundlePath = appInfo[@"bundlePath"];
+                NSString *containerPath = [bundlePath stringByDeletingLastPathComponent];
+                
+                NSString *metadataPath1 = [containerPath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
+                NSString *metadataPath2 = [bundlePath stringByAppendingPathComponent:@"iTunesMetadata.plist"];
+                
+                NSString *metadataPath = nil;
+                if ([[NSFileManager defaultManager] fileExistsAtPath:metadataPath1]) {
+                    metadataPath = metadataPath1;
+                } else if ([[NSFileManager defaultManager] fileExistsAtPath:metadataPath2]) {
+                    metadataPath = metadataPath2;
+                }
+                
+                long long appId = 0;
+                if (metadataPath) {
+                    NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
+                    if (metadata) {
+                        NSDictionary *downloadInfo = metadata[@"com.apple.iTunesStore.downloadInfo"];
+                        if (downloadInfo && downloadInfo[@"itemId"]) {
+                            appId = [downloadInfo[@"itemId"] longLongValue];
+                        } else if (metadata[@"itemId"]) {
+                            appId = [metadata[@"itemId"] longLongValue];
+                        } else if (metadata[@"appleId"]) {
+                            appId = [metadata[@"appleId"] longLongValue];
+                        } else if (metadata[@"adamId"]) {
+                            appId = [metadata[@"adamId"] longLongValue];
                         }
-                    }];
-                }]];
-                [alert addAction:[UIAlertAction actionWithTitle:@"从服务器获取列表" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    [self fetchAppIdForBundleId:bundleId completion:^(long long appId) {
-                        if (appId != 0) {
-                            [self getAllAppVersionIdsFromServer:appId];
-                        } else {
-                            [self showAlert:@"错误" message:@"无法获取 App ID，请尝试手动输入。"];
-                        }
-                    }];
-                }]];
-                [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-                [self presentViewController:alert animated:YES completion:nil];
+                    }
+                }
+                
+                if (appId != 0) {
+                    [self getAllAppVersionIdsFromServer:appId];
+                } else {
+                    [self promptForAppIdAndVersionIdManually];
+                }
             });
             return;
         }
