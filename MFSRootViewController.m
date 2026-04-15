@@ -113,19 +113,15 @@ static NSCache *groupPathCache = nil;
 - (BOOL)isSideStoreAppAtPath:(NSString *)bundlePath {
     NSFileManager *fm = [NSFileManager defaultManager];
     
-    // 检查各种侧载应用的标记文件
     NSArray *markerFiles = @[
-        @"_TrollStore",      // TrollStore
-        @"_ESignStore",      // ESign
-        @"_SignStore",       // SignStore
-        @"_SideStore",       // SideStore
-        @"_AltStore",        // AltStore
-        @"_AppSync",         // AppSync
-        @".TrollStore",      // 隐藏文件
-        @".ESignStore",
-        @"_Store",           // 通用匹配
-        @"TrollStore",
-        @"ESign"
+        @"_TrollStore",
+        @"_ESignStore",
+        @"_SignStore",
+        @"_SideStore",
+        @"_AltStore",
+        @"_AppSync",
+        @".TrollStore",
+        @".ESignStore"
     ];
     
     for (NSString *marker in markerFiles) {
@@ -135,7 +131,6 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 检查父目录是否有标记文件
     NSString *parentPath = [bundlePath stringByDeletingLastPathComponent];
     for (NSString *marker in markerFiles) {
         NSString *filePath = [parentPath stringByAppendingPathComponent:marker];
@@ -144,7 +139,6 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 检查 bundle 目录下是否有以 _ 开头且包含 Store 的文件
     NSArray *bundleContents = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
     for (NSString *file in bundleContents) {
         if ([file hasPrefix:@"_"] && ([file containsString:@"Store"] || [file containsString:@"store"])) {
@@ -158,12 +152,11 @@ static NSCache *groupPathCache = nil;
     return NO;
 }
 
-#pragma mark - 应用列表生成（直接扫描文件系统）
+#pragma mark - 应用列表生成
 - (NSArray<PSSpecifier *> *)generateAppSpecifiers {
     NSMutableArray *appSpecifiers = [NSMutableArray new];
     NSFileManager *fm = [NSFileManager defaultManager];
     
-    // 扫描 /var/containers/Bundle/Application 目录
     NSString *bundleDir = @"/var/containers/Bundle/Application";
     NSArray *appDirs = [fm contentsOfDirectoryAtPath:bundleDir error:nil];
     
@@ -202,7 +195,6 @@ static NSCache *groupPathCache = nil;
                     NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
                     NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
                     
-                    // 判断是否为侧载应用（巨魔/ESign等）
                     BOOL isSideApp = [self isSideStoreAppAtPath:bundlePath];
                     
                     NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
@@ -240,7 +232,7 @@ static NSCache *groupPathCache = nil;
     
     NSArray *all = [self generateAppSpecifiers];
     NSMutableArray *user = [NSMutableArray array];
-    NSMutableArray *side = [NSMutableArray array];  // 侧载应用（巨魔/ESign等）
+    NSMutableArray *side = [NSMutableArray array];
     
     for (PSSpecifier *spec in all) {
         NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
@@ -657,11 +649,26 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
+#pragma mark - 清理数据确认对话框（按照图片内容）
 - (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据"
-                                                                     message:[NSString stringWithFormat:@"将清理应用 %@ 的所有文档、钥匙串和偏好设置，且无法恢复。是否继续？", bundleId]
+    NSString *appName = @"该应用";
+    // 尝试获取应用名称
+    NSDictionary *appInfo = nil;
+    for (PSSpecifier *spec in self.allAppSpecifiers) {
+        NSDictionary *info = [spec propertyForKey:@"appInfo"];
+        if ([info[@"bundleIdentifier"] isEqualToString:bundleId]) {
+            appInfo = info;
+            break;
+        }
+    }
+    if (appInfo && appInfo[@"localizedName"]) {
+        appName = appInfo[@"localizedName"];
+    }
+    
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清除"
+                                                                     message:[NSString stringWithFormat:@"此操作将永久删除应用「%@」所有数据，包括：\n\n• 用户设置和偏好\n• 缓存和临时文件\n• 登录信息和密码\n• 所有本地数据\n\n此操作不可逆，确定要继续吗？", appName]
                                                               preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+    UIAlertAction *clear = [UIAlertAction actionWithTitle:@"确认清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self performClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
@@ -705,7 +712,7 @@ static NSCache *groupPathCache = nil;
         
         dispatch_async(dispatch_get_main_queue(), ^{
             [self killAppWithBundleId:bundleId];
-            [self showAlert:@"完成" message:[NSString stringWithFormat:@"已清理应用 %@ 的所有数据。\n请重新启动该应用，它将像第一次安装一样。", bundleId]];
+            [self showAlert:@"完成" message:[NSString stringWithFormat:@"已清理应用「%@」的所有数据。\n请重新启动该应用，它将像第一次安装一样。", bundleId]];
         });
     });
 }
@@ -994,9 +1001,7 @@ static NSCache *groupPathCache = nil;
         }
         NSArray* results = json[@"results"];
         if(results.count == 0) {
-            // 从应用详情中获取 App ID 并查询历史版本
             dispatch_async(dispatch_get_main_queue(), ^{
-                // 获取应用详情中的 App ID
                 NSDictionary *appInfo = [specifier propertyForKey:@"appInfo"];
                 NSString *bundlePath = appInfo[@"bundlePath"];
                 NSString *containerPath = [bundlePath stringByDeletingLastPathComponent];
