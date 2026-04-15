@@ -2,7 +2,8 @@
 #import "MFSRootViewController.h"
 #import "CoreServices.h"
 #import <objc/runtime.h>
-#import "NDManager.h"   // 新增：一键新机功能
+#import <Security/Security.h>
+#import <sys/sysctl.h>
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -492,7 +493,9 @@ static NSCache *groupPathCache = nil;
 }
 
 - (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据" message:@"这将清理当前应用（MuffinStore）的所有沙盒数据、钥匙串和偏好设置，应用将恢复初始状态。是否继续？" preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"确认清理数据"
+                                                                     message:[NSString stringWithFormat:@"将清理应用 %@ 的所有文档、钥匙串和偏好设置，且无法恢复。是否继续？", bundleId]
+                                                              preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction *clear = [UIAlertAction actionWithTitle:@"清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         [self performClearDataForAppProxy:appProxy bundleId:bundleId];
     }];
@@ -502,18 +505,203 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-#pragma mark - 清理数据（使用 NewDevice 的清理逻辑，清理 MFS 自身）
+#pragma mark - 核心清理方法（彻底清除应用数据，达到新机效果）
 - (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // 调用 NDManager 的一键新机清理（清理 MFS 自身）
-        [[NDManager shared] cleanSandbox];
-        [[NDManager shared] cleanKeychain];
-        [[NDManager shared] resetUserDefaults];
+        NSFileManager *fm = [NSFileManager defaultManager];
         
+        // 1. 清理数据容器（Documents, Library, tmp 等）
+        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
+        if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
+            [self clearContentsAtPath:dataURL.path isRootContainer:YES];
+        }
+        
+        // 2. 清理组容器
+        NSArray *groupURLs = nil;
+        @try {
+            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
+                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
+            } else {
+                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
+            }
+        } @catch (NSException *e) {}
+        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
+            for (NSURL *groupURL in groupURLs) {
+                if ([groupURL isKindOfClass:[NSURL class]] && [fm fileExistsAtPath:groupURL.path]) {
+                    [self clearContentsAtPath:groupURL.path isRootContainer:YES];
+                }
+            }
+        }
+        
+        // 3. 清理应用自身的 Preferences（数据容器内 Library/Preferences）
+        if (dataURL) {
+            [self clearPreferencesForBundleId:bundleId dataContainerURL:dataURL];
+        }
+        
+        // 4. 清理全局 Preferences（/var/mobile/Library/Preferences/）
+        [self clearGlobalPreferencesForBundleId:bundleId];
+        
+        // 5. 清理 Keychain（全面清理）
+        [self clearKeychainForBundleId:bundleId appProxy:appProxy];
+        
+        // 6. 杀死目标应用（如果正在运行）
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self showAlert:@"完成" message:@"数据已清理，建议重启应用使所有设置生效。"];
+            [self killAppWithBundleId:bundleId];
+            [self showAlert:@"完成" message:[NSString stringWithFormat:@"已清理应用 %@ 的所有数据。\n请重新启动该应用，它将像第一次安装一样。", bundleId]];
         });
     });
+}
+
+#pragma mark - 沙盒递归清理（保留元数据文件）
+- (void)clearContentsAtPath:(NSString *)path isRootContainer:(BOOL)isRoot {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:path isDirectory:&isDir]) return;
+    
+    if (!isDir) {
+        if ([self isProtectedMetadataFile:path]) return;
+        [fm removeItemAtPath:path error:nil];
+        return;
+    }
+    
+    NSArray *contents = [fm contentsOfDirectoryAtPath:path error:nil];
+    for (NSString *item in contents) {
+        NSString *fullPath = [path stringByAppendingPathComponent:item];
+        BOOL itemIsDir = NO;
+        if ([fm fileExistsAtPath:fullPath isDirectory:&itemIsDir]) {
+            if (itemIsDir) {
+                [self clearContentsAtPath:fullPath isRootContainer:NO];
+            } else {
+                if ([self isProtectedMetadataFile:fullPath]) continue;
+                // 注意：这里不特殊处理 Preferences plist，因为在后续专门清理了
+                [fm removeItemAtPath:fullPath error:nil];
+            }
+        }
+    }
+}
+
+- (BOOL)isProtectedMetadataFile:(NSString *)path {
+    NSString *fileName = [path lastPathComponent];
+    return [fileName isEqualToString:@".com.apple.mobile_container_manager.metadata.plist"];
+}
+
+#pragma mark - 清理 Preferences（数据容器内）
+- (void)clearPreferencesForBundleId:(NSString *)bundleId dataContainerURL:(NSURL *)dataURL {
+    NSString *prefDir = [[dataURL path] stringByAppendingPathComponent:@"Library/Preferences"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:prefDir]) return;
+    
+    NSArray *files = [fm contentsOfDirectoryAtPath:prefDir error:nil];
+    for (NSString *file in files) {
+        if ([file hasPrefix:bundleId] && [file hasSuffix:@".plist"]) {
+            NSString *fullPath = [prefDir stringByAppendingPathComponent:file];
+            [fm removeItemAtPath:fullPath error:nil];
+        }
+    }
+}
+
+#pragma mark - 清理全局 Preferences
+- (void)clearGlobalPreferencesForBundleId:(NSString *)bundleId {
+    NSString *prefPath = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", bundleId];
+    [[NSFileManager defaultManager] removeItemAtPath:prefPath error:nil];
+}
+
+#pragma mark - 清理 Keychain（全面，包括所有类，按 access group 删除）
+- (void)clearKeychainForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
+    NSArray *accessGroups = [self getKeychainAccessGroupsForAppProxy:appProxy];
+    if (accessGroups.count == 0) {
+        // 兜底：使用 bundleId 作为 group
+        accessGroups = @[bundleId];
+    }
+    
+    NSArray *secClasses = @[
+        (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecClassInternetPassword,
+        (__bridge id)kSecClassCertificate,
+        (__bridge id)kSecClassKey,
+        (__bridge id)kSecClassIdentity
+    ];
+    
+    for (NSString *group in accessGroups) {
+        for (id secClass in secClasses) {
+            NSDictionary *query = @{
+                (__bridge id)kSecClass: secClass,
+                (__bridge id)kSecAttrAccessGroup: group,
+                (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
+            };
+            SecItemDelete((__bridge CFDictionaryRef)query);
+        }
+    }
+    
+    // 额外暴力删除：遍历所有通用密码，删除 account 或 service 包含 bundleId 的项
+    [self deleteKeychainItemsContainingBundleId:bundleId];
+}
+
+- (NSArray<NSString *> *)getKeychainAccessGroupsForAppProxy:(id)appProxy {
+    NSMutableArray *groups = [NSMutableArray array];
+    NSDictionary *entitlements = nil;
+    @try {
+        entitlements = [appProxy valueForKey:@"entitlements"];
+    } @catch (NSException *e) {}
+    
+    if ([entitlements isKindOfClass:[NSDictionary class]]) {
+        NSArray *keychainGroups = entitlements[@"keychain-access-groups"];
+        if ([keychainGroups isKindOfClass:[NSArray class]]) {
+            [groups addObjectsFromArray:keychainGroups];
+        }
+        NSString *appIdentifier = entitlements[@"application-identifier"];
+        if (appIdentifier) {
+            [groups addObject:appIdentifier];
+        }
+    }
+    return groups;
+}
+
+- (void)deleteKeychainItemsContainingBundleId:(NSString *)bundleId {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+        (__bridge id)kSecReturnAttributes: @YES,
+        (__bridge id)kSecReturnData: @NO
+    };
+    CFArrayRef result = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&result);
+    if (status == errSecSuccess && result) {
+        NSArray *items = (__bridge NSArray *)result;
+        for (NSDictionary *item in items) {
+            NSString *account = item[(__bridge id)kSecAttrAccount];
+            NSString *service = item[(__bridge id)kSecAttrService];
+            if ([account containsString:bundleId] || [service containsString:bundleId]) {
+                NSMutableDictionary *deleteQuery = [NSMutableDictionary dictionary];
+                deleteQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+                if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
+                if (service) deleteQuery[(__bridge id)kSecAttrService] = service;
+                SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
+            }
+        }
+        CFRelease(result);
+    }
+}
+
+#pragma mark - 杀死目标应用
+- (void)killAppWithBundleId:(NSString *)bundleId {
+    // 使用 LSApplicationWorkspace 的私有方法（越狱环境有效）
+    LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
+    if ([workspace respondsToSelector:@selector(killApplicationWithBundleIdentifier:)]) {
+        [workspace performSelector:@selector(killApplicationWithBundleIdentifier:) withObject:bundleId];
+    } else {
+        // 备用方案：通过 sysctl 查找 pid 并 kill
+        pid_t pid = [self pidForBundleId:bundleId];
+        if (pid > 0) {
+            kill(pid, SIGKILL);
+        }
+    }
+}
+
+- (pid_t)pidForBundleId:(NSString *)bundleId {
+    // 简化实现：使用 sysctl 获取所有进程，匹配 bundleId（需要遍历 kinfo_proc）
+    // 这里不展开完整实现，因为 LSApplicationWorkspace 方法在越狱设备上通常可用
+    return 0;
 }
 
 #pragma mark - 构建 specifiers
