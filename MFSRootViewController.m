@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import <Security/Security.h>
 #import <sys/sysctl.h>
+#import <spawn.h>
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -955,13 +956,17 @@ static NSCache *groupPathCache = nil;
 }
 
 - (void)killAppWithBundleId:(NSString *)bundleId {
+    // 使用 LSApplicationWorkspace 的私有方法
     LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
     if ([workspace respondsToSelector:@selector(killApplicationWithBundleIdentifier:)]) {
         [workspace performSelector:@selector(killApplicationWithBundleIdentifier:) withObject:bundleId];
     }
     
-    NSString *killCommand = [NSString stringWithFormat:@"killall -9 %@ 2>/dev/null", bundleId];
-    system([killCommand UTF8String]);
+    // 备用方案：使用 posix_spawn
+    const char *killCmd = [[NSString stringWithFormat:@"killall -9 %@ 2>/dev/null", bundleId] UTF8String];
+    pid_t pid;
+    posix_spawn(&pid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)killCmd, NULL}, NULL);
+    waitpid(pid, NULL, 0);
 }
 
 - (void)showAppDetails:(UIButton *)sender {
