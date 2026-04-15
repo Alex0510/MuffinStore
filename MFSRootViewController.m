@@ -3,7 +3,6 @@
 #import "CoreServices.h"
 #import <objc/runtime.h>
 #import <Security/Security.h>
-#import <sys/sysctl.h>
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -30,11 +29,11 @@ static NSCache *groupPathCache = nil;
 @interface MFSRootViewController () <UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;
 @property (nonatomic, strong) UISegmentedControl *segmentControl;
-@property (nonatomic, strong) NSMutableArray *allAppSpecifiers;
-@property (nonatomic, strong) NSMutableArray *userAppSpecifiers;
-@property (nonatomic, strong) NSMutableArray *trollAppSpecifiers;
+@property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers;
+@property (nonatomic, strong) NSArray<PSSpecifier *> *userAppSpecifiers;
+@property (nonatomic, strong) NSArray<PSSpecifier *> *trollAppSpecifiers;
+@property (nonatomic, assign) BOOL isSearching;
 @property (nonatomic, copy) NSString *searchKeyword;
-@property (nonatomic, assign) NSInteger currentSegmentIndex;
 @end
 
 @implementation MFSRootViewController
@@ -57,9 +56,9 @@ static NSCache *groupPathCache = nil;
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
     
+    // 分段控件
     self.segmentControl = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"用户应用", @"巨魔应用"]];
     self.segmentControl.selectedSegmentIndex = 0;
-    self.currentSegmentIndex = 0;
     [self.segmentControl addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
     self.navigationItem.titleView = self.segmentControl;
     
@@ -72,108 +71,38 @@ static NSCache *groupPathCache = nil;
     self.table.tableHeaderView = self.searchBar;
     
     self.searchKeyword = @"";
-    
-    // 初始化空数组
-    self.allAppSpecifiers = [NSMutableArray array];
-    self.userAppSpecifiers = [NSMutableArray array];
-    self.trollAppSpecifiers = [NSMutableArray array];
-    
-    // 加载应用列表
-    [self loadApplications];
-}
-
-- (void)loadApplications {
-    NSLog(@"[MuffinStore] 开始加载应用列表...");
-    
-    [self.allAppSpecifiers removeAllObjects];
-    [self.userAppSpecifiers removeAllObjects];
-    [self.trollAppSpecifiers removeAllObjects];
-    
-    // 使用 LSApplicationWorkspace 获取应用列表
-    LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
-    [workspace enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
-        @autoreleasepool {
-            NSString *bundleId = appProxy.bundleIdentifier;
-            if (!bundleId) return;
-            
-            // 获取应用名称
-            NSString *appName = appProxy.localizedName;
-            if (!appName || appName.length == 0) {
-                appName = bundleId;
-            }
-            
-            // 获取版本号
-            NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:[appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
-            NSString *version = infoPlist[@"CFBundleShortVersionString"];
-            if (!version) version = infoPlist[@"CFBundleVersion"];
-            if (!version) version = @"N/A";
-            
-            // 判断是否为巨魔应用
-            NSString *trollFilePath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"_TrollStore"];
-            BOOL isTrollApp = [[NSFileManager defaultManager] fileExistsAtPath:trollFilePath];
-            
-            NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
-            appInfo[@"bundleIdentifier"] = bundleId;
-            appInfo[@"localizedName"] = appName;
-            appInfo[@"version"] = version;
-            appInfo[@"bundlePath"] = appProxy.bundleURL.path;
-            appInfo[@"bundleURL"] = appProxy.bundleURL;
-            appInfo[@"isTrollApp"] = @(isTrollApp);
-            
-            PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
-            [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
-            [appSpecifier setProperty:@YES forKey:@"enabled"];
-            appSpecifier.buttonAction = @selector(downloadAppShortcut:);
-            [appSpecifier setProperty:appInfo forKey:@"appInfo"];
-            
-            [self.allAppSpecifiers addObject:appSpecifier];
-            if (isTrollApp) {
-                [self.trollAppSpecifiers addObject:appSpecifier];
-            } else {
-                [self.userAppSpecifiers addObject:appSpecifier];
-            }
-        }
-    }];
-    
-    // 排序
-    NSComparator comparator = ^NSComparisonResult(PSSpecifier* a, PSSpecifier* b) {
-        return [a.name compare:b.name];
-    };
-    [self.allAppSpecifiers sortUsingComparator:comparator];
-    [self.userAppSpecifiers sortUsingComparator:comparator];
-    [self.trollAppSpecifiers sortUsingComparator:comparator];
-    
-    NSLog(@"[MuffinStore] 加载完成 - 全部: %lu, 用户: %lu, 巨魔: %lu", 
-          (unsigned long)self.allAppSpecifiers.count,
-          (unsigned long)self.userAppSpecifiers.count,
-          (unsigned long)self.trollAppSpecifiers.count);
-    
-    // 刷新界面
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self reloadSpecifiers];
-    });
 }
 
 - (void)refreshAppList {
+    _specifiers = nil;
+    self.allAppSpecifiers = nil;
+    self.userAppSpecifiers = nil;
+    self.trollAppSpecifiers = nil;
+    self.isSearching = NO;
+    self.searchBar.text = @"";
+    self.searchKeyword = @"";
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
-    [self loadApplications];
+    [self reloadSpecifiers];
 }
 
+#pragma mark - 分段控件事件
 - (void)segmentChanged:(UISegmentedControl *)sender {
-    self.currentSegmentIndex = sender.selectedSegmentIndex;
+    self.isSearching = (self.searchKeyword.length > 0);
     [self reloadSpecifiers];
 }
 
 #pragma mark - 搜索栏代理
 - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
     self.searchKeyword = searchText ?: @"";
+    self.isSearching = (self.searchKeyword.length > 0);
     [self reloadSpecifiers];
 }
 
 - (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar {
     searchBar.text = @"";
     self.searchKeyword = @"";
+    self.isSearching = NO;
     [self reloadSpecifiers];
     [searchBar resignFirstResponder];
 }
@@ -182,20 +111,93 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
+#pragma mark - 应用列表生成（保持原始方式）
+- (NSArray<PSSpecifier *> *)generateAppSpecifiers {
+    NSMutableArray *appSpecifiers = [NSMutableArray new];
+    [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
+        NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
+        appInfo[@"bundleURL"] = appProxy.bundleURL;
+        appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
+        
+        NSString *infoPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+        
+        NSString *displayName = infoPlist[@"CFBundleDisplayName"];
+        NSString *bundleName = infoPlist[@"CFBundleName"];
+        NSString *localizedName = appProxy.localizedName ?: appProxy.bundleIdentifier;
+        NSString *appName = displayName ?: (bundleName ?: localizedName);
+        appName = [appName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (appName.length == 0) {
+            appName = appProxy.bundleIdentifier;
+        }
+        appInfo[@"localizedName"] = appName;
+        
+        NSString *shortVersion = infoPlist[@"CFBundleShortVersionString"];
+        NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
+        NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
+        appInfo[@"version"] = version;
+        
+        appInfo[@"bundlePath"] = appProxy.bundleURL.path;
+        appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
+        
+        // 判断是否为巨魔应用
+        NSString *trollFilePath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"_TrollStore"];
+        BOOL isTrollApp = [[NSFileManager defaultManager] fileExistsAtPath:trollFilePath];
+        appInfo[@"isTrollApp"] = @(isTrollApp);
+        
+        PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+        [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
+        [appSpecifier setProperty:@YES forKey:@"enabled"];
+        appSpecifier.buttonAction = @selector(downloadAppShortcut:);
+        [appSpecifier setProperty:appInfo forKey:@"appInfo"];
+        [appSpecifiers addObject:appSpecifier];
+    }];
+    
+    [appSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier* a, PSSpecifier* b) {
+        return [a.name compare:b.name];
+    }];
+    
+    return [appSpecifiers copy];
+}
+
+#pragma mark - 生成分类数组
+- (void)buildCategorizedSpecifiers {
+    if (self.allAppSpecifiers) return;
+    
+    NSArray *all = [self generateAppSpecifiers];
+    NSMutableArray *user = [NSMutableArray array];
+    NSMutableArray *troll = [NSMutableArray array];
+    
+    for (PSSpecifier *spec in all) {
+        NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
+        BOOL isTrollApp = [appInfo[@"isTrollApp"] boolValue];
+        if (isTrollApp) {
+            [troll addObject:spec];
+        } else {
+            [user addObject:spec];
+        }
+    }
+    
+    self.allAppSpecifiers = all;
+    self.userAppSpecifiers = user;
+    self.trollAppSpecifiers = troll;
+}
+
 #pragma mark - 获取当前显示的应用列表
 - (NSArray *)getCurrentDisplaySpecifiers {
+    [self buildCategorizedSpecifiers];
+    
     NSArray *sourceSpecifiers = nil;
-    if (self.currentSegmentIndex == 0) {
+    NSInteger idx = self.segmentControl.selectedSegmentIndex;
+    if (idx == 0) {
         sourceSpecifiers = self.allAppSpecifiers;
-    } else if (self.currentSegmentIndex == 1) {
+    } else if (idx == 1) {
         sourceSpecifiers = self.userAppSpecifiers;
     } else {
         sourceSpecifiers = self.trollAppSpecifiers;
     }
     
-    if (!sourceSpecifiers || sourceSpecifiers.count == 0) {
-        return @[];
-    }
+    if (!sourceSpecifiers) return @[];
     
     if (self.searchKeyword.length > 0) {
         NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(PSSpecifier *spec, NSDictionary *bindings) {
@@ -203,7 +205,9 @@ static NSCache *groupPathCache = nil;
             if (!appInfo) return NO;
             NSString *appName = appInfo[@"localizedName"];
             NSString *bundleId = appInfo[@"bundleIdentifier"];
-            BOOL nameMatch = [appName rangeOfString:self.searchKeyword options:NSCaseInsensitiveSearch].location != NSNotFound;
+            if (!appName) appName = @"";
+            if (!bundleId) bundleId = @"";
+            BOOL nameMatch = [appName rangeOfString:self.searchKeyword options:NSCaseInsensitiveSearch|NSDiacriticInsensitiveSearch].location != NSNotFound;
             BOOL idMatch = [bundleId rangeOfString:self.searchKeyword options:NSCaseInsensitiveSearch].location != NSNotFound;
             return nameMatch || idMatch;
         }];
@@ -213,28 +217,76 @@ static NSCache *groupPathCache = nil;
     return sourceSpecifiers;
 }
 
-#pragma mark - 左上角按钮
-- (void)promptForAppIdDownload {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"输入软件ID" message:@"请输入App的Apple ID (trackId)" preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = @"例如: 310633997";
-        textField.keyboardType = UIKeyboardTypeNumberPad;
-    }];
-    UIAlertAction *confirmAction = [UIAlertAction actionWithTitle:@"查询版本" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *appIdStr = alert.textFields.firstObject.text;
-        if (appIdStr.length > 0) {
-            long long appId = [appIdStr longLongValue];
-            [self getAllAppVersionIdsAndPrompt:appId];
-        } else {
-            [self showAlert:@"错误" message:@"软件ID不能为空"];
-        }
-    }];
-    [alert addAction:confirmAction];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+#pragma mark - 构建 specifiers
+- (NSMutableArray*)specifiers {
+    if(!_specifiers) {
+        _specifiers = [NSMutableArray new];
+        
+        PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+        downloadGroupSpecifier.name = @"下载";
+        [_specifiers addObject:downloadGroupSpecifier];
+        
+        PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+        downloadSpecifier.identifier = @"download";
+        [downloadSpecifier setProperty:@YES forKey:@"enabled"];
+        downloadSpecifier.buttonAction = @selector(downloadApp);
+        [_specifiers addObject:downloadSpecifier];
+        
+        NSString* aboutText = [self getAboutText];
+        [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
+        
+        PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+        installedGroupSpecifier.name = @"已安装应用";
+        [_specifiers addObject:installedGroupSpecifier];
+        
+        NSArray *displaySpecifiers = [self getCurrentDisplaySpecifiers];
+        [_specifiers addObjectsFromArray:displaySpecifiers];
+    }
+    self.navigationItem.title = @"MuffinStore";
+    return _specifiers;
 }
 
-#pragma mark - 长按菜单
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
+    PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];
+    NSDictionary *appInfo = [specifier propertyForKey:@"appInfo"];
+    
+    if (appInfo && specifier.identifier != nil && ![specifier.identifier isEqualToString:@"download"]) {
+        cell.textLabel.text = appInfo[@"localizedName"];
+        NSString *version = appInfo[@"version"];
+        NSString *bundleId = appInfo[@"bundleIdentifier"];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"v%@ • %@", version, bundleId];
+        cell.detailTextLabel.textColor = [UIColor grayColor];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
+        
+        UIImage *icon = [iconCache objectForKey:bundleId];
+        if (!icon) {
+            icon = [self loadIconForAppAtPath:appInfo[@"bundlePath"]];
+            if (icon) {
+                [iconCache setObject:icon forKey:bundleId];
+            } else {
+                icon = [UIImage imageNamed:@"AppIconPlaceholder"];
+            }
+        }
+        cell.imageView.image = icon;
+        cell.imageView.layer.cornerRadius = 8;
+        cell.imageView.clipsToBounds = YES;
+        
+        UIButton *infoButton = [UIButton buttonWithType:UIButtonTypeDetailDisclosure];
+        [infoButton addTarget:self action:@selector(showAppDetails:) forControlEvents:UIControlEventTouchUpInside];
+        objc_setAssociatedObject(infoButton, "appInfo", appInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        cell.accessoryView = infoButton;
+        cell.selectionStyle = UITableViewCellSelectionStyleBlue;
+        
+        [self addLongPressGestureForCell:cell appInfo:appInfo specifier:specifier];
+    } else {
+        cell.accessoryView = nil;
+        cell.detailTextLabel.text = nil;
+        cell.imageView.image = nil;
+    }
+    return cell;
+}
+
 - (void)addLongPressGestureForCell:(UITableViewCell *)cell appInfo:(NSDictionary *)appInfo specifier:(PSSpecifier *)specifier {
     UILongPressGestureRecognizer *existingGesture = objc_getAssociatedObject(cell, "longPressGesture");
     if (existingGesture) {
@@ -709,95 +761,12 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-- (pid_t)pidForBundleId:(NSString *)bundleId {
-    return 0;
-}
-
-#pragma mark - 构建 specifiers
-- (NSMutableArray*)specifiers {
-    NSMutableArray *finalSpecifiers = [NSMutableArray new];
-    
-    // 下载组
-    PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
-    downloadGroupSpecifier.name = @"下载";
-    [finalSpecifiers addObject:downloadGroupSpecifier];
-    
-    PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
-    downloadSpecifier.identifier = @"download";
-    [downloadSpecifier setProperty:@YES forKey:@"enabled"];
-    downloadSpecifier.buttonAction = @selector(downloadApp);
-    [finalSpecifiers addObject:downloadSpecifier];
-    
-    NSString* aboutText = [self getAboutText];
-    [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
-    
-    // 已安装应用组
-    PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
-    installedGroupSpecifier.name = @"已安装应用";
-    [finalSpecifiers addObject:installedGroupSpecifier];
-    
-    // 添加应用列表
-    NSArray *displaySpecifiers = [self getCurrentDisplaySpecifiers];
-    if (displaySpecifiers.count > 0) {
-        [finalSpecifiers addObjectsFromArray:displaySpecifiers];
-    } else {
-        // 显示提示信息
-        PSSpecifier* emptySpecifier = [PSSpecifier preferenceSpecifierNamed:@"暂无应用" target:nil set:nil get:nil detail:nil cell:PSStaticTextCell edit:nil];
-        [emptySpecifier setProperty:@YES forKey:@"enabled"];
-        [finalSpecifiers addObject:emptySpecifier];
-    }
-    
-    self.navigationItem.title = @"MuffinStore";
-    return finalSpecifiers;
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
-    PSSpecifier *specifier = [self specifierAtIndexPath:indexPath];
-    NSDictionary *appInfo = [specifier propertyForKey:@"appInfo"];
-    
-    if (appInfo && specifier.identifier != nil && ![specifier.identifier isEqualToString:@"download"]) {
-        cell.textLabel.text = appInfo[@"localizedName"];
-        NSString *version = appInfo[@"version"];
-        NSString *bundleId = appInfo[@"bundleIdentifier"];
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"v%@ • %@", version, bundleId];
-        cell.detailTextLabel.textColor = [UIColor grayColor];
-        cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
-        
-        UIImage *icon = [iconCache objectForKey:bundleId];
-        if (!icon) {
-            icon = [self loadIconForAppAtPath:appInfo[@"bundlePath"]];
-            if (icon) {
-                [iconCache setObject:icon forKey:bundleId];
-            } else {
-                icon = [UIImage imageNamed:@"AppIconPlaceholder"];
-            }
-        }
-        cell.imageView.image = icon;
-        cell.imageView.layer.cornerRadius = 8;
-        cell.imageView.clipsToBounds = YES;
-        
-        UIButton *infoButton = [UIButton buttonWithType:UIButtonTypeDetailDisclosure];
-        [infoButton addTarget:self action:@selector(showAppDetails:) forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(infoButton, "appInfo", appInfo, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        cell.accessoryView = infoButton;
-        cell.selectionStyle = UITableViewCellSelectionStyleBlue;
-        
-        [self addLongPressGestureForCell:cell appInfo:appInfo specifier:specifier];
-    } else {
-        cell.accessoryView = nil;
-        cell.detailTextLabel.text = nil;
-        cell.imageView.image = nil;
-    }
-    return cell;
-}
-
 - (void)showAppDetails:(UIButton *)sender {
     NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
     if (!appInfo) return;
     
     NSString *bundlePath = appInfo[@"bundlePath"];
-    NSString *containerPath = [bundlePath stringByDeletingLastPathComponent];
+    NSString *containerPath = appInfo[@"containerPath"];
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *version = appInfo[@"version"];
     
@@ -897,6 +866,27 @@ static NSCache *groupPathCache = nil;
         }
     }
     return nil;
+}
+
+#pragma mark - 左上角按钮
+- (void)promptForAppIdDownload {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"输入软件ID" message:@"请输入App的Apple ID (trackId)" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.placeholder = @"例如: 310633997";
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    UIAlertAction *confirmAction = [UIAlertAction actionWithTitle:@"查询版本" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *appIdStr = alert.textFields.firstObject.text;
+        if (appIdStr.length > 0) {
+            long long appId = [appIdStr longLongValue];
+            [self getAllAppVersionIdsAndPrompt:appId];
+        } else {
+            [self showAlert:@"错误" message:@"软件ID不能为空"];
+        }
+    }];
+    [alert addAction:confirmAction];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 #pragma mark - 下载功能
@@ -1000,18 +990,6 @@ static NSCache *groupPathCache = nil;
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
-}
-
-- (NSString*)getAboutText {
-    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
-}
-
-- (void)showAlert:(NSString*)title message:(NSString*)message {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController* alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
-    });
 }
 
 - (void)getAllAppVersionIdsFromServer:(long long)appId {
@@ -1146,6 +1124,18 @@ static NSCache *groupPathCache = nil;
     }]];
     [linkAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:linkAlert animated:YES completion:nil];
+}
+
+- (NSString*)getAboutText {
+    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
+}
+
+- (void)showAlert:(NSString*)title message:(NSString*)message {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController* alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 @end
