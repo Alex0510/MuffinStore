@@ -29,8 +29,12 @@ static NSCache *groupPathCache = nil;
 
 @interface MFSRootViewController () <UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;
+@property (nonatomic, strong) UISegmentedControl *segmentControl;
 @property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers;
+@property (nonatomic, strong) NSArray<PSSpecifier *> *userAppSpecifiers;
+@property (nonatomic, strong) NSArray<PSSpecifier *> *trollAppSpecifiers;
 @property (nonatomic, assign) BOOL isSearching;
+@property (nonatomic, copy) NSString *searchKeyword;
 @end
 
 @implementation MFSRootViewController
@@ -53,6 +57,12 @@ static NSCache *groupPathCache = nil;
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
     
+    // 分段控件
+    self.segmentControl = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"用户应用", @"巨魔应用"]];
+    self.segmentControl.selectedSegmentIndex = 0;
+    [self.segmentControl addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
+    self.navigationItem.titleView = self.segmentControl;
+    
     self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
     self.searchBar.delegate = self;
     self.searchBar.placeholder = @"搜索应用名称或 Bundle ID";
@@ -60,21 +70,37 @@ static NSCache *groupPathCache = nil;
     self.searchBar.showsCancelButton = YES;
     self.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
     self.table.tableHeaderView = self.searchBar;
+    
+    self.searchKeyword = @"";
 }
 
 - (void)refreshAppList {
     _specifiers = nil;
     self.allAppSpecifiers = nil;
+    self.userAppSpecifiers = nil;
+    self.trollAppSpecifiers = nil;
     self.isSearching = NO;
     self.searchBar.text = @"";
+    self.searchKeyword = @"";
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
     [self reloadSpecifiers];
 }
 
-#pragma mark - 应用列表生成
-- (NSArray<PSSpecifier *> *)generateAppSpecifiers {
-    NSMutableArray *appSpecifiers = [NSMutableArray new];
+#pragma mark - 分段控件事件
+- (void)segmentChanged:(UISegmentedControl *)sender {
+    [self updateDisplayedSpecifiers];
+    [self.table reloadData];
+}
+
+#pragma mark - 生成应用列表（同时构建全部/用户/巨魔数组）
+- (void)generateAppSpecifiersIfNeeded {
+    if (self.allAppSpecifiers) return;
+    
+    NSMutableArray *all = [NSMutableArray new];
+    NSMutableArray *user = [NSMutableArray new];
+    NSMutableArray *troll = [NSMutableArray new];
+    
     [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
         NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
         appInfo[@"bundleURL"] = appProxy.bundleURL;
@@ -101,83 +127,90 @@ static NSCache *groupPathCache = nil;
         appInfo[@"bundlePath"] = appProxy.bundleURL.path;
         appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
         
+        // 判断是否为巨魔应用（bundle 目录下存在 _TrollStore 文件）
+        NSString *trollFilePath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"_TrollStore"];
+        BOOL isTrollApp = [[NSFileManager defaultManager] fileExistsAtPath:trollFilePath];
+        appInfo[@"isTrollApp"] = @(isTrollApp);
+        
         PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
         [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
         [appSpecifier setProperty:@YES forKey:@"enabled"];
         appSpecifier.buttonAction = @selector(downloadAppShortcut:);
         [appSpecifier setProperty:appInfo forKey:@"appInfo"];
-        [appSpecifiers addObject:appSpecifier];
+        
+        [all addObject:appSpecifier];
+        if (isTrollApp) {
+            [troll addObject:appSpecifier];
+        } else {
+            [user addObject:appSpecifier];
+        }
     }];
     
-    [appSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier* a, PSSpecifier* b) {
+    NSComparator comparator = ^NSComparisonResult(PSSpecifier* a, PSSpecifier* b) {
         return [a.name compare:b.name];
-    }];
+    };
+    [all sortUsingComparator:comparator];
+    [user sortUsingComparator:comparator];
+    [troll sortUsingComparator:comparator];
     
-    return [appSpecifiers copy];
+    self.allAppSpecifiers = all;
+    self.userAppSpecifiers = user;
+    self.trollAppSpecifiers = troll;
+}
+
+- (void)updateDisplayedSpecifiers {
+    [self generateAppSpecifiersIfNeeded];
+    
+    NSArray *sourceSpecifiers = nil;
+    NSInteger idx = self.segmentControl.selectedSegmentIndex;
+    if (idx == 0) {
+        sourceSpecifiers = self.allAppSpecifiers;
+    } else if (idx == 1) {
+        sourceSpecifiers = self.userAppSpecifiers;
+    } else {
+        sourceSpecifiers = self.trollAppSpecifiers;
+    }
+    
+    if (!sourceSpecifiers) {
+        _specifiers = [NSMutableArray array];
+        return;
+    }
+    
+    if (self.searchKeyword.length > 0) {
+        NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(PSSpecifier *spec, NSDictionary *bindings) {
+            NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
+            if (!appInfo) return NO;
+            NSString *appName = appInfo[@"localizedName"];
+            NSString *bundleId = appInfo[@"bundleIdentifier"];
+            if (!appName) appName = @"";
+            if (!bundleId) bundleId = @"";
+            BOOL nameMatch = [appName rangeOfString:self.searchKeyword options:NSCaseInsensitiveSearch|NSDiacriticInsensitiveSearch].location != NSNotFound;
+            BOOL idMatch = [bundleId rangeOfString:self.searchKeyword options:NSCaseInsensitiveSearch].location != NSNotFound;
+            return nameMatch || idMatch;
+        }];
+        _specifiers = [[sourceSpecifiers filteredArrayUsingPredicate:predicate] mutableCopy];
+    } else {
+        _specifiers = [sourceSpecifiers mutableCopy];
+    }
 }
 
 #pragma mark - 搜索栏代理
 - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
-    if (searchText.length == 0) {
-        self.isSearching = NO;
-        [self resetToAllAppSpecifiers];
-    } else {
-        self.isSearching = YES;
-        [self filterAppSpecifiersWithKeyword:searchText];
-    }
+    self.searchKeyword = searchText ?: @"";
+    [self updateDisplayedSpecifiers];
     [self.table reloadData];
 }
 
 - (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar {
     searchBar.text = @"";
-    self.isSearching = NO;
-    [self resetToAllAppSpecifiers];
+    self.searchKeyword = @"";
+    [self updateDisplayedSpecifiers];
     [self.table reloadData];
     [searchBar resignFirstResponder];
 }
 
 - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar {
     [searchBar resignFirstResponder];
-}
-
-- (void)resetToAllAppSpecifiers {
-    if (!_specifiers) return;
-    if (!self.allAppSpecifiers) {
-        self.allAppSpecifiers = [self generateAppSpecifiers];
-    }
-    NSMutableArray *newSpecifiers = [NSMutableArray array];
-    NSInteger fixedCount = 3;
-    for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
-        [newSpecifiers addObject:_specifiers[i]];
-    }
-    [newSpecifiers addObjectsFromArray:self.allAppSpecifiers];
-    _specifiers = newSpecifiers;
-}
-
-- (void)filterAppSpecifiersWithKeyword:(NSString *)keyword {
-    if (!_specifiers) return;
-    if (!self.allAppSpecifiers) {
-        self.allAppSpecifiers = [self generateAppSpecifiers];
-    }
-    NSMutableArray *filtered = [NSMutableArray array];
-    NSInteger fixedCount = 3;
-    for (NSInteger i = 0; i < fixedCount && i < _specifiers.count; i++) {
-        [filtered addObject:_specifiers[i]];
-    }
-    NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(PSSpecifier *spec, NSDictionary *bindings) {
-        NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
-        if (!appInfo) return NO;
-        NSString *appName = appInfo[@"localizedName"];
-        NSString *bundleId = appInfo[@"bundleIdentifier"];
-        if (!appName) appName = @"";
-        if (!bundleId) bundleId = @"";
-        BOOL nameMatch = [appName rangeOfString:keyword options:NSCaseInsensitiveSearch|NSDiacriticInsensitiveSearch].location != NSNotFound;
-        BOOL idMatch = [bundleId rangeOfString:keyword options:NSCaseInsensitiveSearch].location != NSNotFound;
-        return nameMatch || idMatch;
-    }];
-    NSArray *filteredApps = [self.allAppSpecifiers filteredArrayUsingPredicate:predicate];
-    [filtered addObjectsFromArray:filteredApps];
-    _specifiers = filtered;
 }
 
 #pragma mark - 左上角按钮：直接输入软件ID查询版本并下载
@@ -510,7 +543,7 @@ static NSCache *groupPathCache = nil;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         
-        // 1. 清理数据容器（Documents, Library, tmp 等）
+        // 1. 清理数据容器
         NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
             [self clearContentsAtPath:dataURL.path isRootContainer:YES];
@@ -541,10 +574,10 @@ static NSCache *groupPathCache = nil;
         // 4. 清理全局 Preferences（/var/mobile/Library/Preferences/）
         [self clearGlobalPreferencesForBundleId:bundleId];
         
-        // 5. 清理 Keychain（全面清理）
+        // 5. 清理 Keychain
         [self clearKeychainForBundleId:bundleId appProxy:appProxy];
         
-        // 6. 杀死目标应用（如果正在运行）
+        // 6. 杀死目标应用
         dispatch_async(dispatch_get_main_queue(), ^{
             [self killAppWithBundleId:bundleId];
             [self showAlert:@"完成" message:[NSString stringWithFormat:@"已清理应用 %@ 的所有数据。\n请重新启动该应用，它将像第一次安装一样。", bundleId]];
@@ -573,7 +606,6 @@ static NSCache *groupPathCache = nil;
                 [self clearContentsAtPath:fullPath isRootContainer:NO];
             } else {
                 if ([self isProtectedMetadataFile:fullPath]) continue;
-                // 注意：这里不特殊处理 Preferences plist，因为在后续专门清理了
                 [fm removeItemAtPath:fullPath error:nil];
             }
         }
@@ -585,7 +617,6 @@ static NSCache *groupPathCache = nil;
     return [fileName isEqualToString:@".com.apple.mobile_container_manager.metadata.plist"];
 }
 
-#pragma mark - 清理 Preferences（数据容器内）
 - (void)clearPreferencesForBundleId:(NSString *)bundleId dataContainerURL:(NSURL *)dataURL {
     NSString *prefDir = [[dataURL path] stringByAppendingPathComponent:@"Library/Preferences"];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -600,17 +631,14 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-#pragma mark - 清理全局 Preferences
 - (void)clearGlobalPreferencesForBundleId:(NSString *)bundleId {
     NSString *prefPath = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", bundleId];
     [[NSFileManager defaultManager] removeItemAtPath:prefPath error:nil];
 }
 
-#pragma mark - 清理 Keychain（全面，包括所有类，按 access group 删除）
 - (void)clearKeychainForBundleId:(NSString *)bundleId appProxy:(id)appProxy {
     NSArray *accessGroups = [self getKeychainAccessGroupsForAppProxy:appProxy];
     if (accessGroups.count == 0) {
-        // 兜底：使用 bundleId 作为 group
         accessGroups = @[bundleId];
     }
     
@@ -633,7 +661,6 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 额外暴力删除：遍历所有通用密码，删除 account 或 service 包含 bundleId 的项
     [self deleteKeychainItemsContainingBundleId:bundleId];
 }
 
@@ -683,14 +710,11 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-#pragma mark - 杀死目标应用
 - (void)killAppWithBundleId:(NSString *)bundleId {
-    // 使用 LSApplicationWorkspace 的私有方法（越狱环境有效）
     LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
     if ([workspace respondsToSelector:@selector(killApplicationWithBundleIdentifier:)]) {
         [workspace performSelector:@selector(killApplicationWithBundleIdentifier:) withObject:bundleId];
     } else {
-        // 备用方案：通过 sysctl 查找 pid 并 kill
         pid_t pid = [self pidForBundleId:bundleId];
         if (pid > 0) {
             kill(pid, SIGKILL);
@@ -699,36 +723,37 @@ static NSCache *groupPathCache = nil;
 }
 
 - (pid_t)pidForBundleId:(NSString *)bundleId {
-    // 简化实现：使用 sysctl 获取所有进程，匹配 bundleId（需要遍历 kinfo_proc）
-    // 这里不展开完整实现，因为 LSApplicationWorkspace 方法在越狱设备上通常可用
+    // 简单实现：通过 sysctl 获取所有进程，匹配 bundleId（越狱环境下 LSApplicationWorkspace 的方法通常可用）
+    // 此处返回 0 表示未找到，依赖 LSApplicationWorkspace 的方法
     return 0;
 }
 
 #pragma mark - 构建 specifiers
 - (NSMutableArray*)specifiers {
     if(!_specifiers) {
-        _specifiers = [NSMutableArray new];
+        [self updateDisplayedSpecifiers];
+        
+        NSMutableArray *finalSpecifiers = [NSMutableArray new];
         
         PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         downloadGroupSpecifier.name = @"下载";
-        [_specifiers addObject:downloadGroupSpecifier];
+        [finalSpecifiers addObject:downloadGroupSpecifier];
         
         PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
         downloadSpecifier.identifier = @"download";
         [downloadSpecifier setProperty:@YES forKey:@"enabled"];
         downloadSpecifier.buttonAction = @selector(downloadApp);
-        [_specifiers addObject:downloadSpecifier];
+        [finalSpecifiers addObject:downloadSpecifier];
         
         NSString* aboutText = [self getAboutText];
         [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
         
         PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
         installedGroupSpecifier.name = @"已安装应用";
-        [_specifiers addObject:installedGroupSpecifier];
+        [finalSpecifiers addObject:installedGroupSpecifier];
         
-        NSArray *appSpecifiers = [self generateAppSpecifiers];
-        self.allAppSpecifiers = appSpecifiers;
-        [_specifiers addObjectsFromArray:appSpecifiers];
+        [finalSpecifiers addObjectsFromArray:_specifiers];
+        _specifiers = finalSpecifiers;
     }
     self.navigationItem.title = @"MuffinStore";
     return _specifiers;
