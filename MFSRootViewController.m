@@ -33,7 +33,7 @@ static NSCache *groupPathCache = nil;
 @property (nonatomic, strong) NSArray<PSSpecifier *> *allAppSpecifiers;
 @property (nonatomic, strong) NSArray<PSSpecifier *> *userAppSpecifiers;
 @property (nonatomic, strong) NSArray<PSSpecifier *> *trollAppSpecifiers;
-@property (nonatomic, assign) BOOL isSearching;
+@property (nonatomic, strong) NSArray<PSSpecifier *> *currentAppSpecifiers;
 @property (nonatomic, copy) NSString *searchKeyword;
 @end
 
@@ -57,7 +57,6 @@ static NSCache *groupPathCache = nil;
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
     
-    // 分段控件
     self.segmentControl = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"用户应用", @"巨魔应用"]];
     self.segmentControl.selectedSegmentIndex = 0;
     [self.segmentControl addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
@@ -72,28 +71,28 @@ static NSCache *groupPathCache = nil;
     self.table.tableHeaderView = self.searchBar;
     
     self.searchKeyword = @"";
+    [self generateAppSpecifiersIfNeeded];
+    [self updateCurrentAppSpecifiers];
 }
 
 - (void)refreshAppList {
-    _specifiers = nil;
     self.allAppSpecifiers = nil;
     self.userAppSpecifiers = nil;
     self.trollAppSpecifiers = nil;
-    self.isSearching = NO;
-    self.searchBar.text = @"";
-    self.searchKeyword = @"";
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
+    [self generateAppSpecifiersIfNeeded];
+    [self updateCurrentAppSpecifiers];
     [self reloadSpecifiers];
 }
 
 #pragma mark - 分段控件事件
 - (void)segmentChanged:(UISegmentedControl *)sender {
-    [self updateDisplayedSpecifiers];
-    [self.table reloadData];
+    [self updateCurrentAppSpecifiers];
+    [self reloadSpecifiers];
 }
 
-#pragma mark - 生成应用列表（同时构建全部/用户/巨魔数组）
+#pragma mark - 生成应用列表
 - (void)generateAppSpecifiersIfNeeded {
     if (self.allAppSpecifiers) return;
     
@@ -127,7 +126,6 @@ static NSCache *groupPathCache = nil;
         appInfo[@"bundlePath"] = appProxy.bundleURL.path;
         appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
         
-        // 判断是否为巨魔应用（bundle 目录下存在 _TrollStore 文件）
         NSString *trollFilePath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"_TrollStore"];
         BOOL isTrollApp = [[NSFileManager defaultManager] fileExistsAtPath:trollFilePath];
         appInfo[@"isTrollApp"] = @(isTrollApp);
@@ -158,7 +156,7 @@ static NSCache *groupPathCache = nil;
     self.trollAppSpecifiers = troll;
 }
 
-- (void)updateDisplayedSpecifiers {
+- (void)updateCurrentAppSpecifiers {
     [self generateAppSpecifiersIfNeeded];
     
     NSArray *sourceSpecifiers = nil;
@@ -172,7 +170,7 @@ static NSCache *groupPathCache = nil;
     }
     
     if (!sourceSpecifiers) {
-        _specifiers = [NSMutableArray array];
+        self.currentAppSpecifiers = @[];
         return;
     }
     
@@ -188,24 +186,24 @@ static NSCache *groupPathCache = nil;
             BOOL idMatch = [bundleId rangeOfString:self.searchKeyword options:NSCaseInsensitiveSearch].location != NSNotFound;
             return nameMatch || idMatch;
         }];
-        _specifiers = [[sourceSpecifiers filteredArrayUsingPredicate:predicate] mutableCopy];
+        self.currentAppSpecifiers = [sourceSpecifiers filteredArrayUsingPredicate:predicate];
     } else {
-        _specifiers = [sourceSpecifiers mutableCopy];
+        self.currentAppSpecifiers = sourceSpecifiers;
     }
 }
 
 #pragma mark - 搜索栏代理
 - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText {
     self.searchKeyword = searchText ?: @"";
-    [self updateDisplayedSpecifiers];
-    [self.table reloadData];
+    [self updateCurrentAppSpecifiers];
+    [self reloadSpecifiers];
 }
 
 - (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar {
     searchBar.text = @"";
     self.searchKeyword = @"";
-    [self updateDisplayedSpecifiers];
-    [self.table reloadData];
+    [self updateCurrentAppSpecifiers];
+    [self reloadSpecifiers];
     [searchBar resignFirstResponder];
 }
 
@@ -213,7 +211,7 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
-#pragma mark - 左上角按钮：直接输入软件ID查询版本并下载
+#pragma mark - 左上角按钮
 - (void)promptForAppIdDownload {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"输入软件ID" message:@"请输入App的Apple ID (trackId)" preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
@@ -538,18 +536,16 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-#pragma mark - 核心清理方法（彻底清除应用数据，达到新机效果）
+#pragma mark - 核心清理方法
 - (void)performClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId {
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         
-        // 1. 清理数据容器
         NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
         if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
             [self clearContentsAtPath:dataURL.path isRootContainer:YES];
         }
         
-        // 2. 清理组容器
         NSArray *groupURLs = nil;
         @try {
             if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
@@ -566,18 +562,13 @@ static NSCache *groupPathCache = nil;
             }
         }
         
-        // 3. 清理应用自身的 Preferences（数据容器内 Library/Preferences）
         if (dataURL) {
             [self clearPreferencesForBundleId:bundleId dataContainerURL:dataURL];
         }
         
-        // 4. 清理全局 Preferences（/var/mobile/Library/Preferences/）
         [self clearGlobalPreferencesForBundleId:bundleId];
-        
-        // 5. 清理 Keychain
         [self clearKeychainForBundleId:bundleId appProxy:appProxy];
         
-        // 6. 杀死目标应用
         dispatch_async(dispatch_get_main_queue(), ^{
             [self killAppWithBundleId:bundleId];
             [self showAlert:@"完成" message:[NSString stringWithFormat:@"已清理应用 %@ 的所有数据。\n请重新启动该应用，它将像第一次安装一样。", bundleId]];
@@ -585,7 +576,6 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-#pragma mark - 沙盒递归清理（保留元数据文件）
 - (void)clearContentsAtPath:(NSString *)path isRootContainer:(BOOL)isRoot {
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
@@ -714,49 +704,40 @@ static NSCache *groupPathCache = nil;
     LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
     if ([workspace respondsToSelector:@selector(killApplicationWithBundleIdentifier:)]) {
         [workspace performSelector:@selector(killApplicationWithBundleIdentifier:) withObject:bundleId];
-    } else {
-        pid_t pid = [self pidForBundleId:bundleId];
-        if (pid > 0) {
-            kill(pid, SIGKILL);
-        }
     }
 }
 
 - (pid_t)pidForBundleId:(NSString *)bundleId {
-    // 简单实现：通过 sysctl 获取所有进程，匹配 bundleId（越狱环境下 LSApplicationWorkspace 的方法通常可用）
-    // 此处返回 0 表示未找到，依赖 LSApplicationWorkspace 的方法
     return 0;
 }
 
 #pragma mark - 构建 specifiers
 - (NSMutableArray*)specifiers {
-    if(!_specifiers) {
-        [self updateDisplayedSpecifiers];
-        
-        NSMutableArray *finalSpecifiers = [NSMutableArray new];
-        
-        PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
-        downloadGroupSpecifier.name = @"下载";
-        [finalSpecifiers addObject:downloadGroupSpecifier];
-        
-        PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
-        downloadSpecifier.identifier = @"download";
-        [downloadSpecifier setProperty:@YES forKey:@"enabled"];
-        downloadSpecifier.buttonAction = @selector(downloadApp);
-        [finalSpecifiers addObject:downloadSpecifier];
-        
-        NSString* aboutText = [self getAboutText];
-        [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
-        
-        PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
-        installedGroupSpecifier.name = @"已安装应用";
-        [finalSpecifiers addObject:installedGroupSpecifier];
-        
-        [finalSpecifiers addObjectsFromArray:_specifiers];
-        _specifiers = finalSpecifiers;
+    NSMutableArray *finalSpecifiers = [NSMutableArray new];
+    
+    PSSpecifier* downloadGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+    downloadGroupSpecifier.name = @"下载";
+    [finalSpecifiers addObject:downloadGroupSpecifier];
+    
+    PSSpecifier* downloadSpecifier = [PSSpecifier preferenceSpecifierNamed:@"下载" target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+    downloadSpecifier.identifier = @"download";
+    [downloadSpecifier setProperty:@YES forKey:@"enabled"];
+    downloadSpecifier.buttonAction = @selector(downloadApp);
+    [finalSpecifiers addObject:downloadSpecifier];
+    
+    NSString* aboutText = [self getAboutText];
+    [downloadGroupSpecifier setProperty:aboutText forKey:@"footerText"];
+    
+    PSSpecifier* installedGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+    installedGroupSpecifier.name = @"已安装应用";
+    [finalSpecifiers addObject:installedGroupSpecifier];
+    
+    if (self.currentAppSpecifiers) {
+        [finalSpecifiers addObjectsFromArray:self.currentAppSpecifiers];
     }
+    
     self.navigationItem.title = @"MuffinStore";
-    return _specifiers;
+    return finalSpecifiers;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
