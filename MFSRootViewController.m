@@ -35,6 +35,7 @@ static NSCache *groupPathCache = nil;
 @property (nonatomic, strong) NSArray<PSSpecifier *> *trollAppSpecifiers;
 @property (nonatomic, strong) NSArray<PSSpecifier *> *currentAppSpecifiers;
 @property (nonatomic, copy) NSString *searchKeyword;
+@property (nonatomic, assign) BOOL hasLoadedApps;
 @end
 
 @implementation MFSRootViewController
@@ -71,23 +72,44 @@ static NSCache *groupPathCache = nil;
     self.table.tableHeaderView = self.searchBar;
     
     self.searchKeyword = @"";
-    [self generateAppSpecifiersIfNeeded];
-    [self updateCurrentAppSpecifiers];
+    self.hasLoadedApps = NO;
+    self.currentAppSpecifiers = @[];
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    // 延迟加载应用列表，避免阻塞主线程
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self generateAppSpecifiersIfNeeded];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.hasLoadedApps = YES;
+            [self updateCurrentAppSpecifiers];
+            [self reloadSpecifiers];
+        });
+    });
 }
 
 - (void)refreshAppList {
     self.allAppSpecifiers = nil;
     self.userAppSpecifiers = nil;
     self.trollAppSpecifiers = nil;
+    self.hasLoadedApps = NO;
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
-    [self generateAppSpecifiersIfNeeded];
-    [self updateCurrentAppSpecifiers];
-    [self reloadSpecifiers];
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self generateAppSpecifiersIfNeeded];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.hasLoadedApps = YES;
+            [self updateCurrentAppSpecifiers];
+            [self reloadSpecifiers];
+        });
+    });
 }
 
 #pragma mark - 分段控件事件
 - (void)segmentChanged:(UISegmentedControl *)sender {
+    if (!self.hasLoadedApps) return;
     [self updateCurrentAppSpecifiers];
     [self reloadSpecifiers];
 }
@@ -157,7 +179,10 @@ static NSCache *groupPathCache = nil;
 }
 
 - (void)updateCurrentAppSpecifiers {
-    [self generateAppSpecifiersIfNeeded];
+    if (!self.hasLoadedApps) {
+        self.currentAppSpecifiers = @[];
+        return;
+    }
     
     NSArray *sourceSpecifiers = nil;
     NSInteger idx = self.segmentControl.selectedSegmentIndex;
@@ -732,8 +757,13 @@ static NSCache *groupPathCache = nil;
     installedGroupSpecifier.name = @"已安装应用";
     [finalSpecifiers addObject:installedGroupSpecifier];
     
-    if (self.currentAppSpecifiers) {
+    if (self.currentAppSpecifiers && self.currentAppSpecifiers.count > 0) {
         [finalSpecifiers addObjectsFromArray:self.currentAppSpecifiers];
+    } else if (self.hasLoadedApps) {
+        // 已加载完成但没有应用数据，显示提示
+        PSSpecifier* emptySpecifier = [PSSpecifier preferenceSpecifierNamed:@"没有找到应用" target:nil set:nil get:nil detail:nil cell:PSStaticTextCell edit:nil];
+        [emptySpecifier setProperty:@YES forKey:@"enabled"];
+        [finalSpecifiers addObject:emptySpecifier];
     }
     
     self.navigationItem.title = @"MuffinStore";
