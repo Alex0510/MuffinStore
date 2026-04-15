@@ -2,6 +2,7 @@
 #import "MFSRootViewController.h"
 #import "CoreServices.h"
 #import <objc/runtime.h>
+#import "NDManager.h"   // 新增：一键新机功能
 
 @interface SKUIItemStateCenter : NSObject
 + (id)defaultCenter;
@@ -45,8 +46,11 @@ static NSCache *groupPathCache = nil;
     
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(reloadSpecifiers) name:UIApplicationWillEnterForegroundNotification object:nil];
     
+    // 刷新按钮
     UIBarButtonItem *refreshButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshAppList)];
-    self.navigationItem.rightBarButtonItem = refreshButton;
+    // 新机按钮
+    UIBarButtonItem *newDeviceButton = [[UIBarButtonItem alloc] initWithTitle:@"新机" style:UIBarButtonItemStylePlain target:self action:@selector(oneKeyNewDevice)];
+    self.navigationItem.rightBarButtonItems = @[refreshButton, newDeviceButton];
     
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
@@ -68,6 +72,32 @@ static NSCache *groupPathCache = nil;
     [iconCache removeAllObjects];
     [groupPathCache removeAllObjects];
     [self reloadSpecifiers];
+}
+
+#pragma mark - 一键新机（NewDevice 功能）
+- (void)oneKeyNewDevice {
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"一键新机"
+                                                                     message:@"将清理当前应用的所有数据（沙盒、钥匙串、偏好设置），应用将恢复初始状态。是否继续？"
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            [[NDManager shared] cleanSandbox];
+            [[NDManager shared] cleanKeychain];
+            [[NDManager shared] resetUserDefaults];
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIAlertController *doneAlert = [UIAlertController alertControllerWithTitle:@"完成"
+                                                                                   message:@"数据已清理，建议重启应用使所有设置生效。"
+                                                                            preferredStyle:UIAlertControllerStyleAlert];
+                [doneAlert addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
+                [self presentViewController:doneAlert animated:YES completion:nil];
+            });
+        });
+    }];
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
+    [confirm addAction:okAction];
+    [confirm addAction:cancelAction];
+    [self presentViewController:confirm animated:YES completion:nil];
 }
 
 #pragma mark - 应用列表生成
