@@ -56,7 +56,6 @@ static NSCache *groupPathCache = nil;
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
     
-    // 分段控件
     self.segmentControl = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"用户应用", @"巨魔应用"]];
     self.segmentControl.selectedSegmentIndex = 0;
     [self.segmentControl addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
@@ -86,7 +85,6 @@ static NSCache *groupPathCache = nil;
     [self reloadSpecifiers];
 }
 
-#pragma mark - 分段控件事件
 - (void)segmentChanged:(UISegmentedControl *)sender {
     self.isSearching = (self.searchKeyword.length > 0);
     [self reloadSpecifiers];
@@ -111,47 +109,74 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
-#pragma mark - 应用列表生成（保持原始方式）
+#pragma mark - 应用列表生成（直接扫描文件系统，巨魔环境下有权限）
 - (NSArray<PSSpecifier *> *)generateAppSpecifiers {
     NSMutableArray *appSpecifiers = [NSMutableArray new];
-    [[LSApplicationWorkspace defaultWorkspace] enumerateApplicationsOfType:0 block:^(LSApplicationProxy* appProxy) {
-        NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
-        appInfo[@"bundleURL"] = appProxy.bundleURL;
-        appInfo[@"bundleIdentifier"] = appProxy.bundleIdentifier;
-        
-        NSString *infoPath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"Info.plist"];
-        NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
-        
-        NSString *displayName = infoPlist[@"CFBundleDisplayName"];
-        NSString *bundleName = infoPlist[@"CFBundleName"];
-        NSString *localizedName = appProxy.localizedName ?: appProxy.bundleIdentifier;
-        NSString *appName = displayName ?: (bundleName ?: localizedName);
-        appName = [appName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (appName.length == 0) {
-            appName = appProxy.bundleIdentifier;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    
+    // 扫描 /var/containers/Bundle/Application 目录
+    NSString *bundleDir = @"/var/containers/Bundle/Application";
+    NSArray *appDirs = [fm contentsOfDirectoryAtPath:bundleDir error:nil];
+    
+    if (!appDirs || appDirs.count == 0) {
+        bundleDir = @"/private/var/containers/Bundle/Application";
+        appDirs = [fm contentsOfDirectoryAtPath:bundleDir error:nil];
+    }
+    
+    for (NSString *uuidDir in appDirs) {
+        @autoreleasepool {
+            NSString *appPath = [bundleDir stringByAppendingPathComponent:uuidDir];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:appPath isDirectory:&isDir] || !isDir) continue;
+            
+            NSArray *contents = [fm contentsOfDirectoryAtPath:appPath error:nil];
+            for (NSString *item in contents) {
+                if ([item hasSuffix:@".app"]) {
+                    NSString *bundlePath = [appPath stringByAppendingPathComponent:item];
+                    
+                    NSString *infoPath = [bundlePath stringByAppendingPathComponent:@"Info.plist"];
+                    NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+                    if (!infoPlist) continue;
+                    
+                    NSString *bundleId = infoPlist[@"CFBundleIdentifier"];
+                    if (!bundleId) continue;
+                    
+                    if ([bundleId hasPrefix:@"com.apple."]) continue;
+                    
+                    NSString *displayName = infoPlist[@"CFBundleDisplayName"];
+                    NSString *bundleName = infoPlist[@"CFBundleName"];
+                    NSString *appName = displayName ?: (bundleName ?: bundleId);
+                    appName = [appName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                    if (appName.length == 0) appName = bundleId;
+                    
+                    NSString *shortVersion = infoPlist[@"CFBundleShortVersionString"];
+                    NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
+                    NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
+                    
+                    NSString *trollFilePath = [bundlePath stringByAppendingPathComponent:@"_TrollStore"];
+                    BOOL isTrollApp = [fm fileExistsAtPath:trollFilePath];
+                    
+                    NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
+                    appInfo[@"bundleIdentifier"] = bundleId;
+                    appInfo[@"localizedName"] = appName;
+                    appInfo[@"version"] = version;
+                    appInfo[@"bundlePath"] = bundlePath;
+                    appInfo[@"containerPath"] = appPath;
+                    appInfo[@"bundleURL"] = [NSURL fileURLWithPath:bundlePath];
+                    appInfo[@"isTrollApp"] = @(isTrollApp);
+                    
+                    PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
+                    [appSpecifier setProperty:[NSURL fileURLWithPath:bundlePath] forKey:@"bundleURL"];
+                    [appSpecifier setProperty:@YES forKey:@"enabled"];
+                    appSpecifier.buttonAction = @selector(downloadAppShortcut:);
+                    [appSpecifier setProperty:appInfo forKey:@"appInfo"];
+                    [appSpecifiers addObject:appSpecifier];
+                    
+                    break;
+                }
+            }
         }
-        appInfo[@"localizedName"] = appName;
-        
-        NSString *shortVersion = infoPlist[@"CFBundleShortVersionString"];
-        NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
-        NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
-        appInfo[@"version"] = version;
-        
-        appInfo[@"bundlePath"] = appProxy.bundleURL.path;
-        appInfo[@"containerPath"] = [appProxy.bundleURL.path stringByDeletingLastPathComponent];
-        
-        // 判断是否为巨魔应用
-        NSString *trollFilePath = [appProxy.bundleURL.path stringByAppendingPathComponent:@"_TrollStore"];
-        BOOL isTrollApp = [[NSFileManager defaultManager] fileExistsAtPath:trollFilePath];
-        appInfo[@"isTrollApp"] = @(isTrollApp);
-        
-        PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
-        [appSpecifier setProperty:appProxy.bundleURL forKey:@"bundleURL"];
-        [appSpecifier setProperty:@YES forKey:@"enabled"];
-        appSpecifier.buttonAction = @selector(downloadAppShortcut:);
-        [appSpecifier setProperty:appInfo forKey:@"appInfo"];
-        [appSpecifiers addObject:appSpecifier];
-    }];
+    }
     
     [appSpecifiers sortUsingComparator:^NSComparisonResult(PSSpecifier* a, PSSpecifier* b) {
         return [a.name compare:b.name];
@@ -240,7 +265,13 @@ static NSCache *groupPathCache = nil;
         [_specifiers addObject:installedGroupSpecifier];
         
         NSArray *displaySpecifiers = [self getCurrentDisplaySpecifiers];
-        [_specifiers addObjectsFromArray:displaySpecifiers];
+        if (displaySpecifiers.count > 0) {
+            [_specifiers addObjectsFromArray:displaySpecifiers];
+        } else {
+            PSSpecifier* emptySpecifier = [PSSpecifier preferenceSpecifierNamed:@"正在扫描应用..." target:nil set:nil get:nil detail:nil cell:PSStaticTextCell edit:nil];
+            [emptySpecifier setProperty:@YES forKey:@"enabled"];
+            [_specifiers addObject:emptySpecifier];
+        }
     }
     self.navigationItem.title = @"MuffinStore";
     return _specifiers;
