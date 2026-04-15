@@ -56,7 +56,7 @@ static NSCache *groupPathCache = nil;
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
     
-    self.segmentControl = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"用户应用", @"巨魔应用"]];
+    self.segmentControl = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"用户应用", @"巨魔/ESign应用"]];
     self.segmentControl.selectedSegmentIndex = 0;
     [self.segmentControl addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
     self.navigationItem.titleView = self.segmentControl;
@@ -109,27 +109,50 @@ static NSCache *groupPathCache = nil;
     [searchBar resignFirstResponder];
 }
 
-#pragma mark - 判断是否为巨魔应用
-- (BOOL)isTrollStoreAppAtPath:(NSString *)bundlePath {
+#pragma mark - 判断是否为非用户安装应用（巨魔/ESign/SideStore等）
+- (BOOL)isSideStoreAppAtPath:(NSString *)bundlePath {
     NSFileManager *fm = [NSFileManager defaultManager];
     
-    // 检查 _TrollStore 文件（巨魔应用的标准标记文件）
-    NSString *trollFilePath = [bundlePath stringByAppendingPathComponent:@"_TrollStore"];
-    if ([fm fileExistsAtPath:trollFilePath]) {
-        return YES;
+    // 检查各种侧载应用的标记文件
+    NSArray *markerFiles = @[
+        @"_TrollStore",      // TrollStore
+        @"_ESignStore",      // ESign
+        @"_SignStore",       // SignStore
+        @"_SideStore",       // SideStore
+        @"_AltStore",        // AltStore
+        @"_AppSync",         // AppSync
+        @".TrollStore",      // 隐藏文件
+        @".ESignStore",
+        @"_Store",           // 通用匹配
+        @"TrollStore",
+        @"ESign"
+    ];
+    
+    for (NSString *marker in markerFiles) {
+        NSString *filePath = [bundlePath stringByAppendingPathComponent:marker];
+        if ([fm fileExistsAtPath:filePath]) {
+            return YES;
+        }
     }
     
-    // 检查 .TrollStore 隐藏文件
-    NSString *hiddenTrollPath = [bundlePath stringByAppendingPathComponent:@".TrollStore"];
-    if ([fm fileExistsAtPath:hiddenTrollPath]) {
-        return YES;
-    }
-    
-    // 检查父目录是否有 TrollStore 标记
+    // 检查父目录是否有标记文件
     NSString *parentPath = [bundlePath stringByDeletingLastPathComponent];
-    NSString *parentTrollPath = [parentPath stringByAppendingPathComponent:@"_TrollStore"];
-    if ([fm fileExistsAtPath:parentTrollPath]) {
-        return YES;
+    for (NSString *marker in markerFiles) {
+        NSString *filePath = [parentPath stringByAppendingPathComponent:marker];
+        if ([fm fileExistsAtPath:filePath]) {
+            return YES;
+        }
+    }
+    
+    // 检查 bundle 目录下是否有以 _ 开头且包含 Store 的文件
+    NSArray *bundleContents = [fm contentsOfDirectoryAtPath:bundlePath error:nil];
+    for (NSString *file in bundleContents) {
+        if ([file hasPrefix:@"_"] && ([file containsString:@"Store"] || [file containsString:@"store"])) {
+            return YES;
+        }
+        if ([file containsString:@"Troll"] || [file containsString:@"ESign"] || [file containsString:@"SideStore"]) {
+            return YES;
+        }
     }
     
     return NO;
@@ -179,8 +202,8 @@ static NSCache *groupPathCache = nil;
                     NSString *bundleVersion = infoPlist[@"CFBundleVersion"];
                     NSString *version = shortVersion ?: (bundleVersion ?: @"N/A");
                     
-                    // 判断是否为巨魔应用
-                    BOOL isTrollApp = [self isTrollStoreAppAtPath:bundlePath];
+                    // 判断是否为侧载应用（巨魔/ESign等）
+                    BOOL isSideApp = [self isSideStoreAppAtPath:bundlePath];
                     
                     NSMutableDictionary *appInfo = [NSMutableDictionary dictionary];
                     appInfo[@"bundleIdentifier"] = bundleId;
@@ -189,7 +212,7 @@ static NSCache *groupPathCache = nil;
                     appInfo[@"bundlePath"] = bundlePath;
                     appInfo[@"containerPath"] = appPath;
                     appInfo[@"bundleURL"] = [NSURL fileURLWithPath:bundlePath];
-                    appInfo[@"isTrollApp"] = @(isTrollApp);
+                    appInfo[@"isSideApp"] = @(isSideApp);
                     
                     PSSpecifier* appSpecifier = [PSSpecifier preferenceSpecifierNamed:appName target:self set:nil get:nil detail:nil cell:PSButtonCell edit:nil];
                     [appSpecifier setProperty:[NSURL fileURLWithPath:bundlePath] forKey:@"bundleURL"];
@@ -217,13 +240,13 @@ static NSCache *groupPathCache = nil;
     
     NSArray *all = [self generateAppSpecifiers];
     NSMutableArray *user = [NSMutableArray array];
-    NSMutableArray *troll = [NSMutableArray array];
+    NSMutableArray *side = [NSMutableArray array];  // 侧载应用（巨魔/ESign等）
     
     for (PSSpecifier *spec in all) {
         NSDictionary *appInfo = [spec propertyForKey:@"appInfo"];
-        BOOL isTrollApp = [appInfo[@"isTrollApp"] boolValue];
-        if (isTrollApp) {
-            [troll addObject:spec];
+        BOOL isSideApp = [appInfo[@"isSideApp"] boolValue];
+        if (isSideApp) {
+            [side addObject:spec];
         } else {
             [user addObject:spec];
         }
@@ -231,7 +254,7 @@ static NSCache *groupPathCache = nil;
     
     self.allAppSpecifiers = all;
     self.userAppSpecifiers = user;
-    self.trollAppSpecifiers = troll;
+    self.trollAppSpecifiers = side;
 }
 
 #pragma mark - 获取当前显示的应用列表
@@ -1199,7 +1222,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.4 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
