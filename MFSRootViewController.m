@@ -743,7 +743,7 @@ static NSCache *groupPathCache = nil;
         self.progressOverlay.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.7];
         self.progressOverlay.alpha = 0.0;
         
-        UIView *containerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 200)];
+        UIView *containerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 220)];
         containerView.center = self.progressOverlay.center;
         containerView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
         containerView.layer.cornerRadius = 15;
@@ -771,7 +771,7 @@ static NSCache *groupPathCache = nil;
         self.statusLabel.textAlignment = NSTextAlignmentCenter;
         
         // 日志显示区域
-        self.logTextView = [[UITextView alloc] initWithFrame:CGRectMake(10, 100, 300, 80)];
+        self.logTextView = [[UITextView alloc] initWithFrame:CGRectMake(10, 100, 300, 100)];
         self.logTextView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.8];
         self.logTextView.textColor = [UIColor greenColor];
         self.logTextView.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
@@ -1436,7 +1436,7 @@ static NSCache *groupPathCache = nil;
 }
 
 // ============================================
-// 12. 增强版 Keychain 清理 (修复 stats 参数)
+// 12. 增强版 Keychain 清理 (修复匹配问题)
 // ============================================
 - (void)clearKeychainForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
     [stats appendLog:[NSString stringWithFormat:@"开始清理 Keychain: %@", bundleId]];
@@ -1449,40 +1449,289 @@ static NSCache *groupPathCache = nil;
         (__bridge id)kSecClassIdentity
     ];
     
-    for (id secClass in secClasses) {
-        // 删除所有
-        NSDictionary *queryAll = @{
-            (__bridge id)kSecClass: secClass,
-            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
-        };
-        OSStatus status = SecItemDelete((__bridge CFDictionaryRef)queryAll);
-        [stats appendLog:[NSString stringWithFormat:@"清理 Keychain 类型 %@: %@", secClass, status == errSecSuccess ? @"成功" : @"无数据"]];
-        
-        // 删除特定 bundleId 相关的
-        NSDictionary *queryByService = @{
-            (__bridge id)kSecClass: secClass,
-            (__bridge id)kSecAttrService: bundleId,
-            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
-        };
-        SecItemDelete((__bridge CFDictionaryRef)queryByService);
-        
-        NSDictionary *queryByAccount = @{
-            (__bridge id)kSecClass: secClass,
-            (__bridge id)kSecAttrAccount: bundleId,
-            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
-        };
-        SecItemDelete((__bridge CFDictionaryRef)queryByAccount);
-        
-        // 删除应用组相关的 Keychain
-        NSDictionary *queryByGroup = @{
-            (__bridge id)kSecClass: secClass,
-            (__bridge id)kSecAttrAccessGroup: bundleId,
-            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
-        };
-        SecItemDelete((__bridge CFDictionaryRef)queryByGroup);
+    NSUInteger totalDeleted = 0;
+    
+    // 获取应用名称用于额外匹配
+    NSString *appName = nil;
+    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    if (appProxy) {
+        appName = [appProxy valueForKey:@"localizedName"];
+    }
+    if (!appName) {
+        NSArray *parts = [bundleId componentsSeparatedByString:@"."];
+        appName = [parts lastObject];
     }
     
-    [stats appendLog:@"Keychain 清理完成"];
+    [stats appendLog:[NSString stringWithFormat:@"使用应用名称: %@ 进行匹配", appName]];
+    
+    for (id secClass in secClasses) {
+        // 方法1: 查询所有条目并筛选
+        NSMutableDictionary *queryAll = [@{
+            (__bridge id)kSecClass: secClass,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecReturnAttributes: @YES,
+            (__bridge id)kSecReturnData: @NO
+        } mutableCopy];
+        
+        CFTypeRef result = NULL;
+        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)queryAll, &result);
+        
+        NSUInteger classDeleted = 0;
+        
+        if (status == errSecSuccess && result) {
+            NSArray *items = (__bridge NSArray *)result;
+            [stats appendLog:[NSString stringWithFormat:@"Keychain 类型 %@: 共找到 %lu 个条目", [self secClassName:secClass], (unsigned long)items.count]];
+            
+            for (NSDictionary *item in items) {
+                BOOL shouldDelete = NO;
+                
+                // 检查各种可能包含 Bundle ID 或应用名称的属性
+                NSString *service = item[(__bridge id)kSecAttrService];
+                NSString *account = item[(__bridge id)kSecAttrAccount];
+                NSString *accessGroup = item[(__bridge id)kSecAttrAccessGroup];
+                NSString *label = item[(__bridge id)kSecAttrLabel];
+                NSString *server = item[(__bridge id)kSecAttrServer];
+                NSString *path = item[(__bridge id)kSecAttrPath];
+                NSString *generic = nil;
+                
+                NSData *genericData = item[(__bridge id)kSecAttrGeneric];
+                if (genericData) {
+                    generic = [[NSString alloc] initWithData:genericData encoding:NSUTF8StringEncoding];
+                }
+                
+                // 检查是否匹配
+                if ([self string:service contains:bundleId] || [self string:service contains:appName]) {
+                    shouldDelete = YES;
+                    [stats appendLog:[NSString stringWithFormat:@"  匹配 service: %@", service]];
+                } else if ([self string:account contains:bundleId] || [self string:account contains:appName]) {
+                    shouldDelete = YES;
+                    [stats appendLog:[NSString stringWithFormat:@"  匹配 account: %@", account]];
+                } else if ([self string:accessGroup contains:bundleId]) {
+                    shouldDelete = YES;
+                    [stats appendLog:[NSString stringWithFormat:@"  匹配 accessGroup: %@", accessGroup]];
+                } else if ([self string:label contains:bundleId] || [self string:label contains:appName]) {
+                    shouldDelete = YES;
+                    [stats appendLog:[NSString stringWithFormat:@"  匹配 label: %@", label]];
+                } else if ([self string:server contains:bundleId] || [self string:server contains:appName]) {
+                    shouldDelete = YES;
+                    [stats appendLog:[NSString stringWithFormat:@"  匹配 server: %@", server]];
+                } else if ([self string:path contains:bundleId] || [self string:path contains:appName]) {
+                    shouldDelete = YES;
+                    [stats appendLog:[NSString stringWithFormat:@"  匹配 path: %@", path]];
+                } else if ([self string:generic contains:bundleId] || [self string:generic contains:appName]) {
+                    shouldDelete = YES;
+                    [stats appendLog:[NSString stringWithFormat:@"  匹配 generic: %@", generic]];
+                }
+                
+                // 额外检查: 检查是否包含 Bundle ID 的部分组件
+                if (!shouldDelete) {
+                    NSArray *bundleParts = [bundleId componentsSeparatedByString:@"."];
+                    for (NSString *part in bundleParts) {
+                        if (part.length > 3) {
+                            if ([self string:service contains:part] || [self string:account contains:part] ||
+                                [self string:label contains:part]) {
+                                shouldDelete = YES;
+                                [stats appendLog:[NSString stringWithFormat:@"  匹配部分: %@", part]];
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                if (shouldDelete) {
+                    // 构建删除查询
+                    NSMutableDictionary *deleteQuery = [@{
+                        (__bridge id)kSecClass: secClass
+                    } mutableCopy];
+                    
+                    // 复制所有可用于定位的属性
+                    if (service) deleteQuery[(__bridge id)kSecAttrService] = service;
+                    if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
+                    if (accessGroup) deleteQuery[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+                    
+                    // 如果有 persistent ref，使用它来精确定位
+                    id persistentRef = item[(__bridge id)kSecValuePersistentRef];
+                    if (persistentRef) {
+                        deleteQuery[(__bridge id)kSecValuePersistentRef] = persistentRef;
+                    }
+                    
+                    OSStatus deleteStatus = SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
+                    if (deleteStatus == errSecSuccess) {
+                        classDeleted++;
+                        totalDeleted++;
+                    } else {
+                        [stats appendLog:[NSString stringWithFormat:@"  删除失败 (status: %d)", (int)deleteStatus]];
+                    }
+                }
+            }
+            
+            CFRelease(result);
+        }
+        
+        // 方法2: 使用模糊查询删除
+        if (classDeleted == 0) {
+            [self deleteKeychainItemsWithFuzzyMatch:secClass bundleId:bundleId appName:appName stats:stats];
+        }
+        
+        // 方法3: 如果仍然没有删除任何条目，尝试删除该类别下所有与 Bundle ID 相关的条目
+        if (classDeleted == 0) {
+            // 使用 bundleId 作为 service 直接删除
+            NSDictionary *queryByService = @{
+                (__bridge id)kSecClass: secClass,
+                (__bridge id)kSecAttrService: bundleId
+            };
+            OSStatus deleteStatus = SecItemDelete((__bridge CFDictionaryRef)queryByService);
+            if (deleteStatus == errSecSuccess) {
+                classDeleted++;
+                totalDeleted++;
+                [stats appendLog:[NSString stringWithFormat:@"通过 service 直接删除成功: %@", secClass]];
+            }
+            
+            // 使用 bundleId 作为 account 直接删除
+            NSDictionary *queryByAccount = @{
+                (__bridge id)kSecClass: secClass,
+                (__bridge id)kSecAttrAccount: bundleId
+            };
+            deleteStatus = SecItemDelete((__bridge CFDictionaryRef)queryByAccount);
+            if (deleteStatus == errSecSuccess) {
+                classDeleted++;
+                totalDeleted++;
+                [stats appendLog:[NSString stringWithFormat:@"通过 account 直接删除成功: %@", secClass]];
+            }
+        }
+        
+        if (classDeleted > 0) {
+            [stats appendLog:[NSString stringWithFormat:@"Keychain 类型 %@: 删除了 %lu 个条目", [self secClassName:secClass], (unsigned long)classDeleted]];
+        } else {
+            [stats appendLog:[NSString stringWithFormat:@"Keychain 类型 %@: 无数据", [self secClassName:secClass]]];
+        }
+    }
+    
+    // 额外清理：使用更宽松的匹配条件
+    [self deleteKeychainItemsWithWildcardMatch:bundleId appName:appName stats:stats];
+    
+    [stats appendLog:[NSString stringWithFormat:@"Keychain 清理完成，共删除 %lu 个条目", (unsigned long)totalDeleted]];
+}
+
+// 辅助方法：检查字符串是否包含子串
+- (BOOL)string:(NSString *)string contains:(NSString *)substring {
+    if (!string || !substring) return NO;
+    return [string rangeOfString:substring options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+// 模糊匹配删除
+- (void)deleteKeychainItemsWithFuzzyMatch:(id)secClass bundleId:(NSString *)bundleId appName:(NSString *)appName stats:(CleaningStats *)stats {
+    // 尝试多种查询组合
+    NSArray *queryKeys = @[
+        (__bridge id)kSecAttrService,
+        (__bridge id)kSecAttrAccount,
+        (__bridge id)kSecAttrGeneric,
+        (__bridge id)kSecAttrLabel
+    ];
+    
+    NSArray *searchValues = @[bundleId, appName ?: bundleId];
+    
+    for (NSString *value in searchValues) {
+        for (id key in queryKeys) {
+            NSDictionary *query = @{
+                (__bridge id)kSecClass: secClass,
+                key: value
+            };
+            
+            OSStatus status = SecItemDelete((__bridge CFDictionaryRef)query);
+            if (status == errSecSuccess) {
+                [stats appendLog:[NSString stringWithFormat:@"模糊匹配删除成功: %@ = %@", key, value]];
+                return;
+            }
+        }
+    }
+}
+
+// 通配符匹配删除
+- (void)deleteKeychainItemsWithWildcardMatch:(NSString *)bundleId appName:(NSString *)appName stats:(CleaningStats *)stats {
+    // 获取 Bundle ID 的各个部分
+    NSArray *parts = [bundleId componentsSeparatedByString:@"."];
+    NSString *lastPart = [parts lastObject];
+    NSString *secondLastPart = parts.count >= 2 ? parts[parts.count - 2] : nil;
+    
+    NSArray *searchTerms = @[bundleId, appName ?: @"", lastPart, secondLastPart ?: @""];
+    
+    NSArray *secClasses = @[
+        (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecClassInternetPassword
+    ];
+    
+    for (id secClass in secClasses) {
+        // 查询所有条目
+        NSDictionary *queryAll = @{
+            (__bridge id)kSecClass: secClass,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecReturnAttributes: @YES
+        };
+        
+        CFTypeRef result = NULL;
+        if (SecItemCopyMatching((__bridge CFDictionaryRef)queryAll, &result) == errSecSuccess && result) {
+            NSArray *items = (__bridge NSArray *)result;
+            
+            for (NSDictionary *item in items) {
+                BOOL shouldDelete = NO;
+                
+                // 检查所有属性
+                for (id key in item.allKeys) {
+                    id value = item[key];
+                    if ([value isKindOfClass:[NSString class]]) {
+                        NSString *strValue = (NSString *)value;
+                        for (NSString *term in searchTerms) {
+                            if (term.length > 0 && [strValue rangeOfString:term options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                                shouldDelete = YES;
+                                break;
+                            }
+                        }
+                    } else if ([value isKindOfClass:[NSData class]]) {
+                        NSString *strValue = [[NSString alloc] initWithData:(NSData *)value encoding:NSUTF8StringEncoding];
+                        if (strValue) {
+                            for (NSString *term in searchTerms) {
+                                if (term.length > 0 && [strValue rangeOfString:term options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                                    shouldDelete = YES;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (shouldDelete) break;
+                }
+                
+                if (shouldDelete) {
+                    NSMutableDictionary *deleteQuery = [@{
+                        (__bridge id)kSecClass: secClass
+                    } mutableCopy];
+                    
+                    NSString *service = item[(__bridge id)kSecAttrService];
+                    NSString *account = item[(__bridge id)kSecAttrAccount];
+                    
+                    if (service) deleteQuery[(__bridge id)kSecAttrService] = service;
+                    if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
+                    
+                    OSStatus deleteStatus = SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
+                    if (deleteStatus == errSecSuccess) {
+                        [stats appendLog:[NSString stringWithFormat:@"通配符删除成功: service=%@, account=%@", service, account]];
+                    }
+                }
+            }
+            
+            CFRelease(result);
+        }
+    }
+}
+
+// 获取安全类别名称
+- (NSString *)secClassName:(id)secClass {
+    if ([secClass isEqual:(__bridge id)kSecClassGenericPassword]) return @"genp(通用密码)";
+    if ([secClass isEqual:(__bridge id)kSecClassInternetPassword]) return @"inet(网络密码)";
+    if ([secClass isEqual:(__bridge id)kSecClassCertificate]) return @"cert(证书)";
+    if ([secClass isEqual:(__bridge id)kSecClassKey]) return @"keys(密钥)";
+    if ([secClass isEqual:(__bridge id)kSecClassIdentity]) return @"idnt(身份)";
+    return @"unknown";
 }
 
 // ============================================
@@ -1944,7 +2193,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.4 (增强清理版)\n作者 Mineek,Mr.Eric\n长按应用可启动/完全清理数据/跳转目录\n增强功能:\n• 强制杀死应用进程\n• 详细清理日志输出\n• 日志保存到文件\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.5 (Keychain增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/完全清理数据/跳转目录\n增强功能:\n• 强制杀死应用进程\n• 增强版Keychain清理\n• 详细清理日志输出\n• 日志保存到文件\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
