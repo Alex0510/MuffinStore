@@ -7,8 +7,6 @@
 #import <spawn.h>
 #import <sys/stat.h>
 #import <fcntl.h>
-#import <QuartzCore/QuartzCore.h>
-#import <os/log.h>
 
 // ============================================
 // 清理统计信息类
@@ -31,642 +29,6 @@
     }
     return self;
 }
-@end
-
-// ============================================
-// 增强版悬浮窗类
-// ============================================
-@interface EnhancedFloatingWindow : UIWindow
-@property (nonatomic, strong) UILabel *winterLabel;
-@property (nonatomic, strong) UIPanGestureRecognizer *panGesture;
-@property (nonatomic, strong) UIView *progressOverlay;
-@property (nonatomic, strong) UIProgressView *progressView;
-@property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, weak) MFSRootViewController *rootVC;
-
-- (void)showCleaningOptions;
-- (void)showConfirmationDialog;
-- (void)showProgressIndicator;
-- (void)updateProgress:(float)progress withStatus:(NSString *)status;
-- (void)hideProgressIndicator;
-- (void)showCleaningResults:(CleaningStats *)stats;
-- (void)clearCacheOnly;
-- (void)clearUserDataOnly;
-- (void)performFullCleanWithAnimation;
-- (void)clearAppDataWithProgress;
-- (void)exitApplication;
-- (void)handleTap:(UITapGestureRecognizer *)gesture;
-- (void)handlePan:(UIPanGestureRecognizer *)gesture;
-- (void)startPulseAnimation;
-- (UIWindow *)getKeyWindow;
-- (UIViewController *)findPresentingViewController;
-- (UIViewController *)findTopViewController:(UIViewController *)baseViewController;
-@end
-
-// ============================================
-// 增强版悬浮窗实现
-// ============================================
-@implementation EnhancedFloatingWindow
-
-- (instancetype)init {
-    CGRect screenBounds = [[UIScreen mainScreen] bounds];
-    CGRect windowFrame = CGRectMake(screenBounds.size.width - 60, 100, 40, 40);
-
-    if (@available(iOS 13.0, *)) {
-        UIWindowScene *windowScene = nil;
-        NSSet *connectedScenes = [UIApplication sharedApplication].connectedScenes;
-        for (UIWindowScene *scene in connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive) {
-                windowScene = scene;
-                break;
-            }
-        }
-        if (windowScene) {
-            self = [super initWithWindowScene:windowScene];
-        } else {
-            self = [super initWithFrame:windowFrame];
-        }
-    } else {
-        self = [super initWithFrame:windowFrame];
-    }
-    
-    if (self) {
-        self.frame = windowFrame;
-        self.windowLevel = UIWindowLevelAlert + 100;
-        self.backgroundColor = [UIColor clearColor];
-        self.hidden = NO;
-
-        self.layer.cornerRadius = 20;
-        self.layer.masksToBounds = YES;
-        self.layer.borderWidth = 1.5;
-        self.layer.borderColor = [UIColor whiteColor].CGColor;
-        self.userInteractionEnabled = YES;
-
-        self.winterLabel = [[UILabel alloc] initWithFrame:self.bounds];
-        self.winterLabel.text = @"冬";
-        self.winterLabel.textAlignment = NSTextAlignmentCenter;
-        self.winterLabel.textColor = [UIColor whiteColor];
-        self.winterLabel.font = [UIFont boldSystemFontOfSize:20];
-        self.winterLabel.backgroundColor = [UIColor colorWithRed:1.0 green:0.0 blue:0.0 alpha:0.9];
-        self.winterLabel.layer.cornerRadius = 20;
-        self.winterLabel.layer.masksToBounds = YES;
-        [self addSubview:self.winterLabel];
-
-        UITapGestureRecognizer *tapGesture = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTap:)];
-        [self addGestureRecognizer:tapGesture];
-
-        self.panGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-        [self addGestureRecognizer:self.panGesture];
-
-        [self startPulseAnimation];
-        NSLog(@"🔥AppCleaner: 增强版悬浮窗创建成功");
-    }
-    return self;
-}
-
-- (void)startPulseAnimation {
-    CABasicAnimation *pulseAnimation = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
-    pulseAnimation.duration = 0.5;
-    pulseAnimation.fromValue = @1.0;
-    pulseAnimation.toValue = @1.2;
-    pulseAnimation.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
-    pulseAnimation.autoreverses = YES;
-    pulseAnimation.repeatCount = 3;
-    [self.layer addAnimation:pulseAnimation forKey:@"pulse"];
-}
-
-- (void)handleTap:(UITapGestureRecognizer *)gesture {
-    NSLog(@"🔥AppCleaner: 增强版悬浮窗被点击，显示清理选项");
-    [self showCleaningOptions];
-}
-
-- (void)handlePan:(UIPanGestureRecognizer *)gesture {
-    CGPoint translation = [gesture translationInView:self];
-    self.center = CGPointMake(self.center.x + translation.x, self.center.y + translation.y);
-    [gesture setTranslation:CGPointZero inView:self];
-}
-
-- (UIWindow *)getKeyWindow {
-    if (@available(iOS 13.0, *)) {
-        NSSet *connectedScenes = [UIApplication sharedApplication].connectedScenes;
-        for (UIWindowScene *windowScene in connectedScenes) {
-            if (windowScene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *window in windowScene.windows) {
-                    if (window.isKeyWindow) {
-                        return window;
-                    }
-                }
-                if (windowScene.windows.count > 0) {
-                    return windowScene.windows.firstObject;
-                }
-            }
-        }
-        for (UIWindowScene *windowScene in connectedScenes) {
-            for (UIWindow *window in windowScene.windows) {
-                if (!window.hidden && window.alpha > 0) {
-                    return window;
-                }
-            }
-        }
-    }
-    
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return [UIApplication sharedApplication].keyWindow;
-    #pragma clang diagnostic pop
-}
-
-- (UIViewController *)findPresentingViewController {
-    UIWindow *keyWindow = [self getKeyWindow];
-    if (keyWindow && keyWindow.rootViewController) {
-        UIViewController *rootVC = keyWindow.rootViewController;
-        UIViewController *presentedVC = [self findTopViewController:rootVC];
-        if (presentedVC) {
-            NSLog(@"🔥AppCleaner: 找到合适的视图控制器: %@", NSStringFromClass([presentedVC class]));
-            return presentedVC;
-        }
-    }
-    
-    if (@available(iOS 13.0, *)) {
-        NSSet *connectedScenes = [UIApplication sharedApplication].connectedScenes;
-        for (UIWindowScene *windowScene in connectedScenes) {
-            if (windowScene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *window in windowScene.windows) {
-                    if (window.rootViewController && window != self) {
-                        UIViewController *topVC = [self findTopViewController:window.rootViewController];
-                        if (topVC) {
-                            NSLog(@"🔥AppCleaner: 从窗口场景找到视图控制器: %@", NSStringFromClass([topVC class]));
-                            return topVC;
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        #pragma clang diagnostic push
-        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        NSArray *windows = [UIApplication sharedApplication].windows;
-        #pragma clang diagnostic pop
-        for (UIWindow *window in windows) {
-            if (window.rootViewController && window != self) {
-                UIViewController *topVC = [self findTopViewController:window.rootViewController];
-                if (topVC) {
-                    NSLog(@"🔥AppCleaner: 从应用窗口找到视图控制器: %@", NSStringFromClass([topVC class]));
-                    return topVC;
-                }
-            }
-        }
-    }
-    
-    NSLog(@"🔥AppCleaner: 无法找到合适的视图控制器");
-    return nil;
-}
-
-- (UIViewController *)findTopViewController:(UIViewController *)baseViewController {
-    if (!baseViewController) {
-        return nil;
-    }
-    
-    if (baseViewController.presentedViewController) {
-        return [self findTopViewController:baseViewController.presentedViewController];
-    }
-    
-    if ([baseViewController isKindOfClass:[UINavigationController class]]) {
-        UINavigationController *navController = (UINavigationController *)baseViewController;
-        return [self findTopViewController:navController.visibleViewController];
-    }
-    
-    if ([baseViewController isKindOfClass:[UITabBarController class]]) {
-        UITabBarController *tabController = (UITabBarController *)baseViewController;
-        return [self findTopViewController:tabController.selectedViewController];
-    }
-    
-    return baseViewController;
-}
-
-- (void)showCleaningOptions {
-    NSLog(@"🔥AppCleaner: 开始显示清理选项菜单");
-    
-    UIViewController *presentingVC = [self findPresentingViewController];
-    if (!presentingVC) {
-        NSLog(@"🔥AppCleaner: 无法找到合适的视图控制器，直接执行完全清理");
-        [self showConfirmationDialog];
-        return;
-    }
-    
-    UIAlertController *optionsAlert = [UIAlertController alertControllerWithTitle:@"AppCleaner - 数据清理"
-                                                                          message:@"请选择清理类型"
-                                                                   preferredStyle:UIAlertControllerStyleActionSheet];
-    
-    [optionsAlert addAction:[UIAlertAction actionWithTitle:@"🗂 仅清理缓存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSLog(@"🔥AppCleaner: 用户选择仅清理缓存");
-        [self clearCacheOnly];
-    }]];
-    
-    [optionsAlert addAction:[UIAlertAction actionWithTitle:@"👤 清理用户数据" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSLog(@"🔥AppCleaner: 用户选择清理用户数据");
-        [self clearUserDataOnly];
-    }]];
-    
-    [optionsAlert addAction:[UIAlertAction actionWithTitle:@"💥 完全清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        NSLog(@"🔥AppCleaner: 用户选择完全清理");
-        [self showConfirmationDialog];
-    }]];
-    
-    [optionsAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
-        NSLog(@"🔥AppCleaner: 用户取消操作");
-    }]];
-    
-    if ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad) {
-        optionsAlert.popoverPresentationController.sourceView = presentingVC.view;
-        optionsAlert.popoverPresentationController.sourceRect = CGRectMake(presentingVC.view.bounds.size.width/2, presentingVC.view.bounds.size.height/2, 1, 1);
-        optionsAlert.popoverPresentationController.permittedArrowDirections = 0;
-    }
-    
-    NSLog(@"🔥AppCleaner: 准备显示清理选项弹窗");
-    [presentingVC presentViewController:optionsAlert animated:YES completion:^{
-        NSLog(@"🔥AppCleaner: 清理选项弹窗显示完成");
-    }];
-}
-
-- (void)showConfirmationDialog {
-    NSLog(@"🔥AppCleaner: 开始显示确认对话框");
-    
-    UIViewController *presentingVC = [self findPresentingViewController];
-    if (!presentingVC) {
-        NSLog(@"🔥AppCleaner: 无法找到合适的视图控制器，直接执行完全清理");
-        [self performFullCleanWithAnimation];
-        return;
-    }
-    
-    UIAlertController *confirmAlert = [UIAlertController alertControllerWithTitle:@"⚠️ 确认清除"
-                                                                          message:@"此操作将永久删除应用所有数据，包括：\n• 用户设置和偏好\n• 缓存和临时文件\n• 登录信息和密码\n• 所有本地数据\n\n此操作不可逆，确定要继续吗？"
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-    
-    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"确认清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        NSLog(@"🔥AppCleaner: 用户确认执行完全清理");
-        [self performFullCleanWithAnimation];
-    }]];
-    
-    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
-        NSLog(@"🔥AppCleaner: 用户取消完全清理");
-    }]];
-    
-    NSLog(@"🔥AppCleaner: 准备显示确认对话框");
-    [presentingVC presentViewController:confirmAlert animated:YES completion:^{
-        NSLog(@"🔥AppCleaner: 确认对话框显示完成");
-    }];
-}
-
-- (void)showProgressIndicator {
-    if (self.progressOverlay) {
-        [self hideProgressIndicator];
-    }
-    
-    self.progressOverlay = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.progressOverlay.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.7];
-    self.progressOverlay.alpha = 0.0;
-    
-    UIView *containerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 280, 120)];
-    containerView.center = self.progressOverlay.center;
-    containerView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.9];
-    containerView.layer.cornerRadius = 15;
-    containerView.layer.masksToBounds = YES;
-    
-    UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 15, 240, 25)];
-    titleLabel.text = @"AppCleaner 正在清理...";
-    titleLabel.textColor = [UIColor whiteColor];
-    titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    titleLabel.textAlignment = NSTextAlignmentCenter;
-    
-    self.progressView = [[UIProgressView alloc] initWithFrame:CGRectMake(20, 50, 240, 4)];
-    if (@available(iOS 13.0, *)) {
-        self.progressView.progressTintColor = [UIColor systemBlueColor];
-    } else {
-        self.progressView.progressTintColor = [UIColor blueColor];
-    }
-    self.progressView.trackTintColor = [UIColor colorWithWhite:0.3 alpha:1.0];
-    self.progressView.progress = 0.0;
-    
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 70, 240, 35)];
-    self.statusLabel.text = @"正在初始化...";
-    self.statusLabel.textColor = [UIColor lightGrayColor];
-    self.statusLabel.font = [UIFont systemFontOfSize:14];
-    self.statusLabel.textAlignment = NSTextAlignmentCenter;
-    self.statusLabel.numberOfLines = 2;
-    
-    [containerView addSubview:titleLabel];
-    [containerView addSubview:self.progressView];
-    [containerView addSubview:self.statusLabel];
-    [self.progressOverlay addSubview:containerView];
-    
-    UIWindow *currentWindow = [self getKeyWindow];
-    if (currentWindow) {
-        [currentWindow addSubview:self.progressOverlay];
-        [currentWindow bringSubviewToFront:self.progressOverlay];
-        
-        [UIView animateWithDuration:0.3 animations:^{
-            self.progressOverlay.alpha = 1.0;
-        }];
-    }
-}
-
-- (void)updateProgress:(float)progress withStatus:(NSString *)status {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.progressView) {
-            [UIView animateWithDuration:0.2 animations:^{
-                self.progressView.progress = progress;
-            }];
-        }
-        if (self.statusLabel && status) {
-            self.statusLabel.text = status;
-        }
-    });
-}
-
-- (void)hideProgressIndicator {
-    if (self.progressOverlay) {
-        [UIView animateWithDuration:0.3 animations:^{
-            self.progressOverlay.alpha = 0.0;
-        } completion:^(BOOL finished) {
-            [self.progressOverlay removeFromSuperview];
-            self.progressOverlay = nil;
-            self.progressView = nil;
-            self.statusLabel = nil;
-        }];
-    }
-}
-
-- (void)showCleaningResults:(CleaningStats *)stats {
-    UIWindow *keyWindow = [self getKeyWindow];
-    if (!keyWindow || !keyWindow.rootViewController) {
-        NSLog(@"🔥AppCleaner: 清理完成 - 删除文件：%lu 个，释放空间：%.2f MB，耗时：%.1f 秒",
-                (unsigned long)stats.filesDeleted,
-                stats.bytesFreed / (1024.0 * 1024.0),
-                stats.cleaningDuration);
-        return;
-    }
-    
-    NSString *message = [NSString stringWithFormat:@"清理完成！\n\n📁 删除文件：%lu 个\n💾 释放空间：%.2f MB\n⏱ 耗时：%.1f 秒\n\n应用将在3秒后退出",
-                        (unsigned long)stats.filesDeleted,
-                        stats.bytesFreed / (1024.0 * 1024.0),
-                        stats.cleaningDuration];
-    
-    UIAlertController *resultAlert = [UIAlertController alertControllerWithTitle:@"✅ 清理完成"
-                                                                         message:message
-                                                                  preferredStyle:UIAlertControllerStyleAlert];
-    
-    [resultAlert addAction:[UIAlertAction actionWithTitle:@"立即退出" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        exit(0);
-    }]];
-    
-    [keyWindow.rootViewController presentViewController:resultAlert animated:YES completion:^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            exit(0);
-        });
-    }];
-}
-
-- (void)clearCacheOnly {
-    [self showProgressIndicator];
-    
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        CleaningStats *stats = [[CleaningStats alloc] init];
-        NSDate *startTime = [NSDate date];
-        NSFileManager *fileManager = [NSFileManager defaultManager];
-        
-        [self updateProgress:0.1 withStatus:@"正在清理缓存目录..."];
-        
-        NSString *cachesDirectory = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
-        NSArray *cacheFiles = [fileManager contentsOfDirectoryAtPath:cachesDirectory error:nil];
-        
-        [self updateProgress:0.3 withStatus:@"正在删除缓存文件..."];
-        
-        for (NSString *file in cacheFiles) {
-            NSString *filePath = [cachesDirectory stringByAppendingPathComponent:file];
-            NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
-            if (attributes) {
-                stats.bytesFreed += [attributes fileSize];
-                stats.filesDeleted++;
-            }
-            [fileManager removeItemAtPath:filePath error:nil];
-        }
-        
-        [self updateProgress:0.6 withStatus:@"正在清理临时文件..."];
-        
-        NSString *tempDirectory = NSTemporaryDirectory();
-        NSArray *tempFiles = [fileManager contentsOfDirectoryAtPath:tempDirectory error:nil];
-        
-        for (NSString *file in tempFiles) {
-            NSString *filePath = [tempDirectory stringByAppendingPathComponent:file];
-            NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
-            if (attributes) {
-                stats.bytesFreed += [attributes fileSize];
-                stats.filesDeleted++;
-            }
-            [fileManager removeItemAtPath:filePath error:nil];
-        }
-        
-        [self updateProgress:0.9 withStatus:@"正在清理网络缓存..."];
-        [[NSURLCache sharedURLCache] removeAllCachedResponses];
-        
-        [self updateProgress:1.0 withStatus:@"缓存清理完成！"];
-        stats.cleaningDuration = [[NSDate date] timeIntervalSinceDate:startTime];
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self hideProgressIndicator];
-            [self showCleaningResults:stats];
-            
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [self exitApplication];
-            });
-        });
-    });
-}
-
-- (void)clearUserDataOnly {
-    [self showProgressIndicator];
-    
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        CleaningStats *stats = [[CleaningStats alloc] init];
-        NSDate *startTime = [NSDate date];
-        NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
-        NSFileManager *fileManager = [NSFileManager defaultManager];
-        
-        [self updateProgress:0.1 withStatus:@"正在清理用户设置..."];
-        
-        [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bundleIdentifier];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        
-        [self updateProgress:0.4 withStatus:@"正在清理用户文档..."];
-        
-        NSString *documentsDirectory = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        NSArray *docFiles = [fileManager contentsOfDirectoryAtPath:documentsDirectory error:nil];
-        
-        for (NSString *file in docFiles) {
-            NSString *filePath = [documentsDirectory stringByAppendingPathComponent:file];
-            NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
-            if (attributes) {
-                stats.bytesFreed += [attributes fileSize];
-                stats.filesDeleted++;
-            }
-            [fileManager removeItemAtPath:filePath error:nil];
-        }
-        
-        [self updateProgress:0.7 withStatus:@"正在清理应用偏好设置..."];
-        
-        NSString *preferencesPath = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"Preferences"];
-        NSArray *prefFiles = [fileManager contentsOfDirectoryAtPath:preferencesPath error:nil];
-        
-        for (NSString *file in prefFiles) {
-            if ([file hasPrefix:bundleIdentifier] && [file hasSuffix:@".plist"]) {
-                NSString *filePath = [preferencesPath stringByAppendingPathComponent:file];
-                NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
-                if (attributes) {
-                    stats.bytesFreed += [attributes fileSize];
-                    stats.filesDeleted++;
-                }
-                [fileManager removeItemAtPath:filePath error:nil];
-            }
-        }
-        
-        [self updateProgress:1.0 withStatus:@"用户数据清理完成！"];
-        stats.cleaningDuration = [[NSDate date] timeIntervalSinceDate:startTime];
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self hideProgressIndicator];
-            [self showCleaningResults:stats];
-            
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [self exitApplication];
-            });
-        });
-    });
-}
-
-- (void)performFullCleanWithAnimation {
-    [self showProgressIndicator];
-    
-    [UIView animateWithDuration:0.2 animations:^{
-        self.transform = CGAffineTransformMakeScale(1.5, 1.5);
-    } completion:^(BOOL finished) {
-        [UIView animateWithDuration:0.3 animations:^{
-            self.transform = CGAffineTransformConcat(
-                CGAffineTransformMakeScale(0.1, 0.1),
-                CGAffineTransformMakeRotation(M_PI)
-            );
-            self.alpha = 0.0;
-        } completion:^(BOOL finished) {
-            [self clearAppDataWithProgress];
-        }];
-    }];
-}
-
-- (void)clearAppDataWithProgress {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        CleaningStats *stats = [[CleaningStats alloc] init];
-        NSDate *startTime = [NSDate date];
-        NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
-        NSFileManager *fileManager = [NSFileManager defaultManager];
-        
-        [self updateProgress:0.05 withStatus:@"正在初始化清理..."];
-        
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        sync();
-        
-        [self updateProgress:0.1 withStatus:@"正在清理用户设置..."];
-        
-        [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bundleIdentifier];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        
-        [self updateProgress:0.2 withStatus:@"正在清理文档目录..."];
-        
-        NSArray *directoriesToClean = @[
-            NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject,
-            NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject,
-            NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject,
-            NSTemporaryDirectory()
-        ];
-        
-        float progressStep = 0.6 / directoriesToClean.count;
-        float currentProgress = 0.2;
-        
-        for (NSString *directory in directoriesToClean) {
-            NSString *dirName = [directory lastPathComponent];
-            [self updateProgress:currentProgress withStatus:[NSString stringWithFormat:@"正在清理 %@ 目录...", dirName]];
-            
-            NSArray *files = [fileManager contentsOfDirectoryAtPath:directory error:nil];
-            for (NSString *file in files) {
-                NSString *filePath = [directory stringByAppendingPathComponent:file];
-                NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
-                if (attributes) {
-                    stats.bytesFreed += [attributes fileSize];
-                    stats.filesDeleted++;
-                }
-                [fileManager removeItemAtPath:filePath error:nil];
-            }
-            
-            currentProgress += progressStep;
-        }
-        
-        [self updateProgress:0.8 withStatus:@"正在清理Keychain数据..."];
-        
-        NSArray *keychainClasses = @[
-            (__bridge id)kSecClassGenericPassword,
-            (__bridge id)kSecClassInternetPassword,
-            (__bridge id)kSecClassCertificate,
-            (__bridge id)kSecClassKey,
-            (__bridge id)kSecClassIdentity
-        ];
-        
-        for (id keychainClass in keychainClasses) {
-            NSMutableDictionary *query = [[NSMutableDictionary alloc] init];
-            [query setObject:keychainClass forKey:(__bridge id)kSecClass];
-            SecItemDelete((__bridge CFDictionaryRef)query);
-        }
-        
-        [self updateProgress:0.9 withStatus:@"正在执行延迟清除..."];
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            for (NSString *directory in directoriesToClean) {
-                NSArray *files = [fileManager contentsOfDirectoryAtPath:directory error:nil];
-                for (NSString *file in files) {
-                    NSString *filePath = [directory stringByAppendingPathComponent:file];
-                    [fileManager removeItemAtPath:filePath error:nil];
-                }
-            }
-            
-            [self updateProgress:1.0 withStatus:@"清理完成！"];
-            stats.cleaningDuration = [[NSDate date] timeIntervalSinceDate:startTime];
-            
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self hideProgressIndicator];
-                [self showCleaningResults:stats];
-                
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [self exitApplication];
-                });
-            });
-        });
-    });
-}
-
-- (void)exitApplication {
-    NSLog(@"🔥AppCleaner: 准备退出应用");
-    
-    [UIView animateWithDuration:0.3 animations:^{
-        self.alpha = 0.0;
-        self.transform = CGAffineTransformMakeScale(0.1, 0.1);
-    } completion:^(BOOL finished) {
-        self.hidden = YES;
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NSLog(@"🔥AppCleaner: 应用即将退出");
-            exit(0);
-        });
-    }];
-}
-
 @end
 
 // ============================================
@@ -693,7 +55,6 @@
 
 static NSCache *iconCache = nil;
 static NSCache *groupPathCache = nil;
-static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
 
 @interface MFSRootViewController () <UISearchBarDelegate>
 @property (nonatomic, strong) UISearchBar *searchBar;
@@ -729,10 +90,6 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
     UIBarButtonItem *idDownloadButton = [[UIBarButtonItem alloc] initWithTitle:@"ID下载" style:UIBarButtonItemStylePlain target:self action:@selector(promptForAppIdDownload)];
     self.navigationItem.leftBarButtonItem = idDownloadButton;
     
-    // 添加悬浮窗开关按钮
-    UIBarButtonItem *floatButton = [[UIBarButtonItem alloc] initWithTitle:@"悬浮窗" style:UIBarButtonItemStylePlain target:self action:@selector(toggleFloatingWindow)];
-    self.navigationItem.leftBarButtonItems = @[idDownloadButton, floatButton];
-    
     self.segmentControl = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"用户应用", @"巨魔/ESign应用"]];
     self.segmentControl.selectedSegmentIndex = 0;
     [self.segmentControl addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
@@ -747,83 +104,6 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
     self.table.tableHeaderView = self.searchBar;
     
     self.searchKeyword = @"";
-    
-    // 自动创建悬浮窗
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self createEnhancedFloatingWindow];
-    });
-}
-
-#pragma mark - 悬浮窗管理
-- (void)toggleFloatingWindow {
-    if (enhancedFloatingWindow && !enhancedFloatingWindow.hidden) {
-        [self hideFloatingWindow];
-        [self showAlert:@"悬浮窗" message:@"悬浮窗已隐藏"];
-    } else {
-        [self showFloatingWindow];
-        [self showAlert:@"悬浮窗" message:@"悬浮窗已显示"];
-    }
-}
-
-- (void)showFloatingWindow {
-    if (enhancedFloatingWindow) {
-        enhancedFloatingWindow.hidden = NO;
-        enhancedFloatingWindow.alpha = 1.0;
-        [enhancedFloatingWindow makeKeyAndVisible];
-        NSLog(@"🔥AppCleaner: 重新显示悬浮窗");
-    } else {
-        [self createEnhancedFloatingWindow];
-    }
-}
-
-- (void)hideFloatingWindow {
-    if (enhancedFloatingWindow) {
-        enhancedFloatingWindow.hidden = YES;
-        NSLog(@"🔥AppCleaner: 隐藏悬浮窗");
-    }
-}
-
-- (void)createEnhancedFloatingWindow {
-    NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
-    NSLog(@"🔥AppCleaner: 尝试创建增强版悬浮窗，应用: %@", bundleIdentifier);
-    
-    if ([bundleIdentifier hasPrefix:@"com.apple."]) {
-        NSLog(@"🔥AppCleaner: 跳过系统应用: %@", bundleIdentifier);
-        return;
-    }
-    
-    if (enhancedFloatingWindow && !enhancedFloatingWindow.hidden) {
-        NSLog(@"🔥AppCleaner: 增强版悬浮窗已存在");
-        return;
-    }
-    
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self createEnhancedFloatingWindow];
-        });
-        return;
-    }
-    
-    @try {
-        if (enhancedFloatingWindow) {
-            enhancedFloatingWindow = nil;
-        }
-        enhancedFloatingWindow = [[EnhancedFloatingWindow alloc] init];
-        if (enhancedFloatingWindow) {
-            enhancedFloatingWindow.windowLevel = UIWindowLevelAlert + 100;
-            enhancedFloatingWindow.hidden = NO;
-            enhancedFloatingWindow.rootVC = self;
-            [enhancedFloatingWindow makeKeyAndVisible];
-            [enhancedFloatingWindow setNeedsDisplay];
-            [enhancedFloatingWindow layoutIfNeeded];
-            
-            NSLog(@"🔥AppCleaner: 增强版悬浮窗创建并显示成功，窗口级别: %.0f", enhancedFloatingWindow.windowLevel);
-        } else {
-            NSLog(@"🔥AppCleaner: 悬浮窗创建失败");
-        }
-    } @catch (NSException *exception) {
-        NSLog(@"🔥AppCleaner: 创建悬浮窗时发生异常: %@", exception.reason);
-    }
 }
 
 - (void)refreshAppList {
@@ -1372,7 +652,7 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 清理功能方法
+#pragma mark - 清理功能方法 (只清理选中的应用，不清理自身)
 - (void)showFullCleanConfirmationForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
     UIAlertController *confirmAlert = [UIAlertController alertControllerWithTitle:@"⚠️ 确认清除"
                                                                           message:[NSString stringWithFormat:@"此操作将永久删除应用「%@」所有数据，包括：\n\n• 用户设置和偏好\n• 缓存和临时文件\n• 登录信息和密码\n• 所有本地数据\n• Keychain数据\n\n此操作不可逆，确定要继续吗？", appName ?: bundleId]
@@ -1427,7 +707,7 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
     containerView.layer.masksToBounds = YES;
     
     UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 15, 240, 25)];
-    titleLabel.text = @"AllClean 正在清理...";
+    titleLabel.text = @"正在清理应用数据...";
     titleLabel.textColor = [UIColor whiteColor];
     titleLabel.font = [UIFont boldSystemFontOfSize:16];
     titleLabel.textAlignment = NSTextAlignmentCenter;
@@ -1498,7 +778,11 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
         NSDate *startTime = [NSDate date];
         NSFileManager *fm = [NSFileManager defaultManager];
         
-        // 强制杀死目标应用
+        NSLog(@"[清理] ========== 开始清理应用 ==========");
+        NSLog(@"[清理] 目标应用 Bundle ID: %@", bundleId);
+        NSLog(@"[清理] 目标应用名称: %@", appName);
+        
+        // 1. 强制杀死目标应用
         dispatch_sync(dispatch_get_main_queue(), ^{
             [self killAppWithBundleId:bundleId];
         });
@@ -1507,22 +791,19 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
         
         [self updateProgress:0.05 withStatus:@"正在定位应用数据..."];
         
-        // 查找数据容器路径
+        // 2. 查找数据容器路径
         NSString *dataContainerPath = [self findDataContainerPathForBundleId:bundleId];
         
-        if (!dataContainerPath) {
-            if (appProxy) {
-                NSURL *dataURL = [appProxy valueForKey:@"dataContainerURL"];
-                if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
-                    dataContainerPath = dataURL.path;
-                }
+        if (!dataContainerPath && appProxy) {
+            NSURL *dataURL = [appProxy valueForKey:@"dataContainerURL"];
+            if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
+                dataContainerPath = dataURL.path;
             }
         }
         
-        NSLog(@"[清理] Bundle ID: %@", bundleId);
         NSLog(@"[清理] 数据容器路径: %@", dataContainerPath ?: @"未找到");
         
-        // 清理数据容器内的目录
+        // 3. 清理数据容器内的目录
         if (dataContainerPath && [fm fileExistsAtPath:dataContainerPath]) {
             [self updateProgress:0.1 withStatus:@"找到数据目录，开始清理..."];
             
@@ -1554,23 +835,23 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
             [self cleanByBundleIdDirectly:bundleId stats:stats];
         }
         
-        // 清理应用组目录
+        // 4. 清理应用组目录
         [self updateProgress:0.7 withStatus:@"清理应用组目录..."];
         [self cleanAppGroupDirectoriesForBundleId:bundleId stats:stats];
         
-        // 清理全局偏好设置
+        // 5. 清理全局偏好设置
         [self updateProgress:0.75 withStatus:@"清理偏好设置..."];
         [self cleanGlobalPreferencesForBundleId:bundleId stats:stats];
         
-        // 清理 Keychain
+        // 6. 清理 Keychain
         [self updateProgress:0.8 withStatus:@"清理 Keychain..."];
         [self clearKeychainForBundleId:bundleId];
         
-        // 清理网络缓存
+        // 7. 清理网络缓存
         [self updateProgress:0.85 withStatus:@"清理网络缓存..."];
         [[NSURLCache sharedURLCache] removeAllCachedResponses];
         
-        // 延迟二次清理
+        // 8. 延迟二次清理
         [self updateProgress:0.9 withStatus:@"二次确认清理..."];
         
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -1586,6 +867,7 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
             [self updateProgress:1.0 withStatus:@"清理完成！"];
             stats.cleaningDuration = [[NSDate date] timeIntervalSinceDate:startTime];
             
+            // 最终杀死应用
             dispatch_sync(dispatch_get_main_queue(), ^{
                 [self killAppWithBundleId:bundleId];
                 [self forceKillAppWithBundleId:bundleId];
@@ -2203,7 +1485,7 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.2 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\n悬浮窗功能已集成\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.4 (增强版)\n作者 Mineek,Mr.Eric\n长按应用可启动/清理数据/跳转目录\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
@@ -2215,10 +1497,6 @@ static EnhancedFloatingWindow *enhancedFloatingWindow = nil;
 }
 
 - (void)dealloc {
-    if (enhancedFloatingWindow) {
-        enhancedFloatingWindow.hidden = YES;
-        enhancedFloatingWindow = nil;
-    }
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
