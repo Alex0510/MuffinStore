@@ -8,6 +8,7 @@
 #import <sys/stat.h>
 #import <fcntl.h>
 #import <os/log.h>
+#import <sqlite3.h>
 
 // ============================================
 // 日志函数
@@ -516,7 +517,6 @@ static NSCache *groupPathCache = nil;
 - (NSString *)findDataContainerPathForBundleId:(NSString *)bundleId {
     NSFileManager *fm = [NSFileManager defaultManager];
     
-    // 方法1: 通过 metadata.plist 查找
     NSArray *dataRoots = @[
         @"/var/mobile/Containers/Data/Application",
         @"/private/var/mobile/Containers/Data/Application"
@@ -540,7 +540,6 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 方法2: 通过 LSApplicationProxy
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     if (appProxy) {
         NSURL *dataURL = [appProxy valueForKey:@"dataContainerURL"];
@@ -553,7 +552,6 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString *)findFirstAppGroupPathForBundleId:(NSString *)bundleId {
-    // 检查缓存
     NSString *cachedPath = [groupPathCache objectForKey:bundleId];
     if (cachedPath && [[NSFileManager defaultManager] fileExistsAtPath:cachedPath]) {
         return cachedPath;
@@ -583,7 +581,6 @@ static NSCache *groupPathCache = nil;
                 }
             }
             
-            // 检查目录名是否包含 bundleId
             if ([dir containsString:bundleId]) {
                 [groupPathCache setObject:groupDir forKey:bundleId];
                 return groupDir;
@@ -591,7 +588,6 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 通过 entitlements 获取
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     if (appProxy) {
         @try {
@@ -685,15 +681,12 @@ static NSCache *groupPathCache = nil;
 }
 
 #pragma mark - ============================================
-#pragma mark - 完整清理功能 (优先清理 Keychain)
+#pragma mark - 完整清理功能 (直接操作 Keychain 数据库)
 #pragma mark - ============================================
 
-// ============================================
-// 1. 显示完全清理确认对话框
-// ============================================
 - (void)showFullCleanConfirmationForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
     UIAlertController *confirmAlert = [UIAlertController alertControllerWithTitle:@"⚠️ 确认清除"
-                                                                          message:[NSString stringWithFormat:@"此操作将永久删除应用「%@」所有数据，包括：\n\n• Keychain 钥匙串数据（优先清理）\n• 用户设置和偏好\n• 缓存和临时文件\n• 登录信息和密码\n• 所有本地数据\n• 应用组共享数据\n\n此操作不可逆，确定要继续吗？", appName ?: bundleId]
+                                                                          message:[NSString stringWithFormat:@"此操作将永久删除应用「%@」所有数据，包括：\n\n• Keychain 钥匙串数据（直接操作数据库）\n• 用户设置和偏好\n• 缓存和临时文件\n• 所有本地数据\n• 应用组共享数据\n\n此操作不可逆，确定要继续吗？", appName ?: bundleId]
                                                                    preferredStyle:UIAlertControllerStyleAlert];
     
     [confirmAlert addAction:[UIAlertAction actionWithTitle:@"确认清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
@@ -705,12 +698,9 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:confirmAlert animated:YES completion:nil];
 }
 
-// ============================================
-// 2. 执行完全清理
-// ============================================
 - (void)performFullCleanForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
     CleanLog(@"========================================");
-    CleanLog(@"开始执行完全清理 (优先清理 Keychain)");
+    CleanLog(@"开始执行完全清理 (直接操作 Keychain 数据库)");
     CleanLog(@"应用名称: %@", appName);
     CleanLog(@"Bundle ID: %@", bundleId);
     CleanLog(@"========================================");
@@ -718,9 +708,6 @@ static NSCache *groupPathCache = nil;
     [self clearAppDataWithProgressForAppProxy:appProxy bundleId:bundleId appName:appName];
 }
 
-// ============================================
-// 3. 进度指示器
-// ============================================
 - (void)showProgressIndicator {
     if (self.progressOverlay) {
         [self hideProgressIndicator];
@@ -731,7 +718,7 @@ static NSCache *groupPathCache = nil;
         self.progressOverlay.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.7];
         self.progressOverlay.alpha = 0.0;
         
-        UIView *containerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 220)];
+        UIView *containerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 240)];
         containerView.center = self.progressOverlay.center;
         containerView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.95];
         containerView.layer.cornerRadius = 15;
@@ -758,8 +745,7 @@ static NSCache *groupPathCache = nil;
         self.statusLabel.font = [UIFont systemFontOfSize:14];
         self.statusLabel.textAlignment = NSTextAlignmentCenter;
         
-        // 日志显示区域
-        self.logTextView = [[UITextView alloc] initWithFrame:CGRectMake(10, 100, 300, 100)];
+        self.logTextView = [[UITextView alloc] initWithFrame:CGRectMake(10, 100, 300, 120)];
         self.logTextView.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.8];
         self.logTextView.textColor = [UIColor greenColor];
         self.logTextView.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
@@ -773,7 +759,6 @@ static NSCache *groupPathCache = nil;
         [containerView addSubview:self.logTextView];
         [self.progressOverlay addSubview:containerView];
         
-        // 使用兼容 iOS 13+ 的方式获取 keyWindow
         UIWindow *keyWindow = nil;
         if (@available(iOS 13.0, *)) {
             NSSet *connectedScenes = [UIApplication sharedApplication].connectedScenes;
@@ -818,7 +803,6 @@ static NSCache *groupPathCache = nil;
             NSString *newLog = [NSString stringWithFormat:@"[%@] %@\n", timestamp, status];
             self.logTextView.text = [self.logTextView.text stringByAppendingString:newLog];
             
-            // 自动滚动到底部
             if (self.logTextView.text.length > 0) {
                 NSRange bottom = NSMakeRange(self.logTextView.text.length - 1, 1);
                 [self.logTextView scrollRangeToVisible:bottom];
@@ -848,10 +832,6 @@ static NSCache *groupPathCache = nil;
         }
     });
 }
-
-// ============================================
-// 4. 强制杀死应用的所有方法
-// ============================================
 
 - (void)killAppWithBundleId:(NSString *)bundleId {
     LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
@@ -994,7 +974,7 @@ static NSCache *groupPathCache = nil;
 }
 
 // ============================================
-// 5. 带进度的完全清理 (核心方法 - 优先清理 Keychain)
+// 核心方法：带进度的完全清理
 // ============================================
 - (void)clearAppDataWithProgressForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
     [self showProgressIndicator];
@@ -1004,7 +984,6 @@ static NSCache *groupPathCache = nil;
         NSDate *startTime = [NSDate date];
         NSFileManager *fm = [NSFileManager defaultManager];
         
-        // 获取应用名称
         NSString *displayName = appName;
         if (!displayName) {
             displayName = [appProxy valueForKey:@"localizedName"];
@@ -1015,7 +994,7 @@ static NSCache *groupPathCache = nil;
         }
         
         [stats appendLog:[NSString stringWithFormat:@"开始清理: %@ (%@)", displayName, bundleId]];
-        [stats appendLog:@"清理顺序: Keychain -> 应用数据 -> 应用组数据"];
+        [stats appendLog:@"清理顺序: Keychain (直接操作数据库) -> 应用数据 -> 应用组数据"];
         
         // ============================================
         // 步骤 1: 强制杀死目标应用
@@ -1032,13 +1011,18 @@ static NSCache *groupPathCache = nil;
         [stats appendLog:[NSString stringWithFormat:@"应用进程状态: %@", isRunning ? @"仍在运行" : @"已终止"]];
         
         // ============================================
-        // 步骤 2: 优先清理 Keychain (最重要的修改)
+        // 步骤 2: 优先清理 Keychain (直接操作数据库)
         // ============================================
-        [self updateProgress:0.10 withStatus:@"清理 Keychain 钥匙串..."];
-        [stats appendLog:@"========== Keychain 清理开始 =========="];
-        [stats appendLog:[NSString stringWithFormat:@"应用 Bundle ID: %@", bundleId]];
-        [self clearKeychainForBundleId:bundleId stats:stats displayName:displayName];
-        [stats appendLog:@"========== Keychain 清理完成 =========="];
+        [self updateProgress:0.10 withStatus:@"清理 Keychain 钥匙串 (直接操作数据库)..."];
+        [stats appendLog:@"========== Keychain 清理开始 (直接操作数据库) =========="];
+        [stats appendLog:[NSString stringWithFormat:@"目标 Bundle ID: %@", bundleId]];
+        [stats appendLog:[NSString stringWithFormat:@"Keychain 数据库路径: /var/Keychains/keychain-2.db"]];
+        
+        NSUInteger deletedCount = [self cleanKeychainDirectlyForBundleId:bundleId stats:stats];
+        stats.keychainItemsDeleted = deletedCount;
+        
+        [stats appendLog:[NSString stringWithFormat:@"========== Keychain 清理完成 =========="]];
+        [stats appendLog:[NSString stringWithFormat:@"总计删除 Keychain 条目：%lu 个", (unsigned long)deletedCount]];
         
         // ============================================
         // 步骤 3: 查找数据容器路径
@@ -1064,7 +1048,6 @@ static NSCache *groupPathCache = nil;
             [self updateProgress:0.35 withStatus:@"清理应用数据目录..."];
             [stats appendLog:@"开始清理数据容器..."];
             
-            // 清理 Documents
             NSString *documentsPath = [dataContainerPath stringByAppendingPathComponent:@"Documents"];
             if ([fm fileExistsAtPath:documentsPath]) {
                 [self updateProgress:0.40 withStatus:@"清理 Documents..."];
@@ -1072,7 +1055,6 @@ static NSCache *groupPathCache = nil;
                 [self cleanDirectoryRecursively:documentsPath stats:stats];
             }
             
-            // 清理 Library
             NSString *libraryPath = [dataContainerPath stringByAppendingPathComponent:@"Library"];
             if ([fm fileExistsAtPath:libraryPath]) {
                 [self updateProgress:0.50 withStatus:@"清理 Library..."];
@@ -1080,7 +1062,6 @@ static NSCache *groupPathCache = nil;
                 [self cleanDirectoryRecursively:libraryPath stats:stats];
             }
             
-            // 清理 Caches
             NSString *cachesPath = [dataContainerPath stringByAppendingPathComponent:@"Library/Caches"];
             if ([fm fileExistsAtPath:cachesPath]) {
                 [self updateProgress:0.55 withStatus:@"清理 Caches..."];
@@ -1088,7 +1069,6 @@ static NSCache *groupPathCache = nil;
                 [self cleanDirectoryRecursively:cachesPath stats:stats];
             }
             
-            // 清理 tmp
             NSString *tmpPath = [dataContainerPath stringByAppendingPathComponent:@"tmp"];
             if ([fm fileExistsAtPath:tmpPath]) {
                 [self updateProgress:0.60 withStatus:@"清理 tmp..."];
@@ -1096,14 +1076,12 @@ static NSCache *groupPathCache = nil;
                 [self cleanDirectoryRecursively:tmpPath stats:stats];
             }
             
-            // 清理 SplashBoard
             NSString *splashPath = [dataContainerPath stringByAppendingPathComponent:@"Library/SplashBoard"];
             if ([fm fileExistsAtPath:splashPath]) {
                 [stats appendLog:@"清理 SplashBoard 快照"];
                 [self cleanDirectoryRecursively:splashPath stats:stats];
             }
             
-            // 清理其他重要目录
             NSArray *specialDirs = @[@"StoreKit", @"WebKit", @"Cookies", @"HTTPStorages", @"Saved Application State"];
             for (NSString *dir in specialDirs) {
                 NSString *specialPath = [libraryPath stringByAppendingPathComponent:dir];
@@ -1147,7 +1125,6 @@ static NSCache *groupPathCache = nil;
         
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             
-            // 再次清理数据容器
             if (dataContainerPath && [fm fileExistsAtPath:dataContainerPath]) {
                 [stats appendLog:@"执行二次清理 (数据容器)"];
                 [self cleanDirectoryRecursively:[dataContainerPath stringByAppendingPathComponent:@"Documents"] stats:stats];
@@ -1155,11 +1132,9 @@ static NSCache *groupPathCache = nil;
                 [self cleanDirectoryRecursively:[dataContainerPath stringByAppendingPathComponent:@"tmp"] stats:stats];
             }
             
-            // 再次清理偏好设置
             [stats appendLog:@"执行二次清理 (偏好设置)"];
             [self cleanGlobalPreferencesForBundleId:bundleId stats:stats];
             
-            // 再次确保应用已杀死
             [stats appendLog:@"最终确认应用进程状态"];
             dispatch_sync(dispatch_get_main_queue(), ^{
                 [self forceKillAppCompletely:bundleId];
@@ -1179,8 +1154,260 @@ static NSCache *groupPathCache = nil;
 }
 
 // ============================================
-// 6. 递归清理目录
+// 直接操作 Keychain 数据库进行清理
 // ============================================
+- (NSUInteger)cleanKeychainDirectlyForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
+    NSString *keychainDBPath = @"/var/Keychains/keychain-2.db";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    
+    if (![fm fileExistsAtPath:keychainDBPath]) {
+        [stats appendLog:@"错误: Keychain 数据库文件不存在"];
+        return 0;
+    }
+    
+    // 获取数据库文件大小
+    NSDictionary *attrs = [fm attributesOfItemAtPath:keychainDBPath error:nil];
+    unsigned long long dbSize = [attrs fileSize];
+    [stats appendLog:[NSString stringWithFormat:@"Keychain 数据库大小: %.2f MB", dbSize / (1024.0 * 1024.0)]];
+    
+    // 先停止 securityd 服务以确保数据库不被锁定
+    [stats appendLog:@"暂停 securityd 服务..."];
+    const char *stopCmd = "launchctl unload /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null";
+    pid_t stopPid;
+    posix_spawn(&stopPid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)stopCmd, NULL}, NULL);
+    waitpid(stopPid, NULL, 0);
+    [NSThread sleepForTimeInterval:0.5];
+    
+    sqlite3 *db = NULL;
+    NSUInteger totalDeleted = 0;
+    
+    int rc = sqlite3_open([keychainDBPath UTF8String], &db);
+    if (rc != SQLITE_OK) {
+        [stats appendLog:[NSString stringWithFormat:@"打开 Keychain 数据库失败: %s", sqlite3_errmsg(db)]];
+        if (db) sqlite3_close(db);
+        
+        // 重新启动 securityd
+        const char *startCmd = "launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null";
+        pid_t startPid;
+        posix_spawn(&startPid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)startCmd, NULL}, NULL);
+        waitpid(startPid, NULL, 0);
+        
+        return 0;
+    }
+    
+    [stats appendLog:@"成功打开 Keychain 数据库"];
+    
+    // ============================================
+    // 查询 genp 表 (通用密码)
+    // ============================================
+    NSString *genpSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, svce, acct FROM genp WHERE agrp LIKE '%%%@%%' OR svce LIKE '%%%@%%' OR acct LIKE '%%%@%%'", bundleId, bundleId, bundleId];
+    NSUInteger genpDeleted = [self deleteFromTable:@"genp" withSQL:genpSQL db:db stats:stats];
+    totalDeleted += genpDeleted;
+    
+    // ============================================
+    // 查询 inet 表 (网络密码)
+    // ============================================
+    NSString *inetSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, srvr, acct FROM inet WHERE agrp LIKE '%%%@%%' OR srvr LIKE '%%%@%%' OR acct LIKE '%%%@%%'", bundleId, bundleId, bundleId];
+    NSUInteger inetDeleted = [self deleteFromTable:@"inet" withSQL:inetSQL db:db stats:stats];
+    totalDeleted += inetDeleted;
+    
+    // ============================================
+    // 查询 cert 表 (证书)
+    // ============================================
+    NSString *certSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, labl FROM cert WHERE agrp LIKE '%%%@%%' OR labl LIKE '%%%@%%'", bundleId, bundleId];
+    NSUInteger certDeleted = [self deleteFromTable:@"cert" withSQL:certSQL db:db stats:stats];
+    totalDeleted += certDeleted;
+    
+    // ============================================
+    // 查询 keys 表 (密钥)
+    // ============================================
+    NSString *keysSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, labl FROM keys WHERE agrp LIKE '%%%@%%' OR labl LIKE '%%%@%%'", bundleId, bundleId];
+    NSUInteger keysDeleted = [self deleteFromTable:@"keys" withSQL:keysSQL db:db stats:stats];
+    totalDeleted += keysDeleted;
+    
+    // ============================================
+    // 查询 oidt 表 (身份)
+    // ============================================
+    NSString *oidtSQL = [NSString stringWithFormat:@"SELECT rowid FROM oidt"];
+    // 身份表结构不同，需要关联查询，这里简化为全表扫描
+    NSUInteger oidtDeleted = 0;
+    sqlite3_stmt *oidtStmt = NULL;
+    rc = sqlite3_prepare_v2(db, [oidtSQL UTF8String], -1, &oidtStmt, NULL);
+    if (rc == SQLITE_OK) {
+        while (sqlite3_step(oidtStmt) == SQLITE_ROW) {
+            int rowid = sqlite3_column_int(oidtStmt, 0);
+            // 检查是否与 bundleId 相关（通过关联其他表）
+            NSString *checkSQL = [NSString stringWithFormat:@"SELECT 1 FROM genp WHERE rowid=%d AND (agrp LIKE '%%%@%%' OR svce LIKE '%%%@%%') UNION SELECT 1 FROM inet WHERE rowid=%d AND (agrp LIKE '%%%@%%' OR srvr LIKE '%%%@%%') UNION SELECT 1 FROM cert WHERE rowid=%d AND (agrp LIKE '%%%@%%') UNION SELECT 1 FROM keys WHERE rowid=%d AND (agrp LIKE '%%%@%%')", rowid, bundleId, bundleId, rowid, bundleId, bundleId, rowid, bundleId, rowid, bundleId];
+            
+            sqlite3_stmt *checkStmt = NULL;
+            if (sqlite3_prepare_v2(db, [checkSQL UTF8String], -1, &checkStmt, NULL) == SQLITE_OK) {
+                if (sqlite3_step(checkStmt) == SQLITE_ROW) {
+                    NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM oidt WHERE rowid=%d", rowid];
+                    char *errMsg = NULL;
+                    if (sqlite3_exec(db, [deleteSQL UTF8String], NULL, NULL, &errMsg) == SQLITE_OK) {
+                        oidtDeleted++;
+                    }
+                    if (errMsg) sqlite3_free(errMsg);
+                }
+                sqlite3_finalize(checkStmt);
+            }
+        }
+        sqlite3_finalize(oidtStmt);
+    }
+    totalDeleted += oidtDeleted;
+    
+    if (oidtDeleted > 0) {
+        [stats appendLog:[NSString stringWithFormat:@"身份 (idnt): 删除了 %lu 个条目", (unsigned long)oidtDeleted]];
+    } else {
+        [stats appendLog:@"身份 (idnt): 无匹配条目"];
+    }
+    
+    // ============================================
+    // 额外清理：使用应用名称搜索
+    // ============================================
+    if (totalDeleted == 0) {
+        [stats appendLog:@"使用应用名称进行模糊搜索..."];
+        
+        NSArray *parts = [bundleId componentsSeparatedByString:@"."];
+        for (NSString *part in parts) {
+            if (part.length > 3) {
+                NSString *fuzzySQL = [NSString stringWithFormat:@"SELECT rowid FROM genp WHERE svce LIKE '%%%@%%' OR acct LIKE '%%%@%%'", part, part];
+                sqlite3_stmt *fuzzyStmt = NULL;
+                if (sqlite3_prepare_v2(db, [fuzzySQL UTF8String], -1, &fuzzyStmt, NULL) == SQLITE_OK) {
+                    NSMutableArray *idsToDelete = [NSMutableArray array];
+                    while (sqlite3_step(fuzzyStmt) == SQLITE_ROW) {
+                        [idsToDelete addObject:@(sqlite3_column_int(fuzzyStmt, 0))];
+                    }
+                    sqlite3_finalize(fuzzyStmt);
+                    
+                    for (NSNumber *rowId in idsToDelete) {
+                        NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM genp WHERE rowid=%d", [rowId intValue]];
+                        char *errMsg = NULL;
+                        if (sqlite3_exec(db, [deleteSQL UTF8String], NULL, NULL, &errMsg) == SQLITE_OK) {
+                            totalDeleted++;
+                        }
+                        if (errMsg) sqlite3_free(errMsg);
+                    }
+                    
+                    if (idsToDelete.count > 0) {
+                        [stats appendLog:[NSString stringWithFormat:@"模糊匹配删除 genp 表 %lu 个条目 (关键词: %@)", (unsigned long)idsToDelete.count, part]];
+                    }
+                }
+            }
+        }
+    }
+    
+    sqlite3_close(db);
+    
+    // ============================================
+    // 清理 WAL 和 SHM 文件
+    // ============================================
+    NSString *walPath = @"/var/Keychains/keychain-2.db-wal";
+    NSString *shmPath = @"/var/Keychains/keychain-2.db-shm";
+    if ([fm fileExistsAtPath:walPath]) {
+        [fm removeItemAtPath:walPath error:nil];
+        [stats appendLog:@"已删除 WAL 文件"];
+    }
+    if ([fm fileExistsAtPath:shmPath]) {
+        [fm removeItemAtPath:shmPath error:nil];
+        [stats appendLog:@"已删除 SHM 文件"];
+    }
+    
+    // ============================================
+    // 重新启动 securityd
+    // ============================================
+    [stats appendLog:@"重新启动 securityd 服务..."];
+    const char *startCmd = "launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null";
+    pid_t startPid;
+    posix_spawn(&startPid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)startCmd, NULL}, NULL);
+    waitpid(startPid, NULL, 0);
+    [NSThread sleepForTimeInterval:1.0];
+    
+    return totalDeleted;
+}
+
+- (NSUInteger)deleteFromTable:(NSString *)tableName withSQL:(NSString *)sql db:(sqlite3 *)db stats:(CleaningStats *)stats {
+    sqlite3_stmt *stmt = NULL;
+    NSUInteger deletedCount = 0;
+    NSMutableArray *details = [NSMutableArray array];
+    
+    int rc = sqlite3_prepare_v2(db, [sql UTF8String], -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        [stats appendLog:[NSString stringWithFormat:@"查询 %@ 表失败: %s", tableName, sqlite3_errmsg(db)]];
+        return 0;
+    }
+    
+    NSMutableArray *rowIds = [NSMutableArray array];
+    
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int rowid = sqlite3_column_int(stmt, 0);
+        [rowIds addObject:@(rowid)];
+        
+        // 收集详细信息
+        const unsigned char *agrp = sqlite3_column_text(stmt, 1);
+        const unsigned char *second = sqlite3_column_text(stmt, 2);
+        const unsigned char *third = sqlite3_column_text(stmt, 3);
+        
+        NSString *detail = @"";
+        if (agrp) {
+            detail = [detail stringByAppendingFormat:@"agrp: %s", agrp];
+        }
+        if (second) {
+            NSString *fieldName = [tableName isEqualToString:@"genp"] ? @"svce" : ([tableName isEqualToString:@"inet"] ? @"srvr" : @"labl");
+            detail = [detail stringByAppendingFormat:@" %@: %s", fieldName, second];
+        }
+        if (third) {
+            detail = [detail stringByAppendingFormat:@" acct: %s", third];
+        }
+        if (detail.length > 0) {
+            [details addObject:detail];
+        }
+    }
+    
+    sqlite3_finalize(stmt);
+    
+    // 执行删除
+    for (NSNumber *rowId in rowIds) {
+        NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM %@ WHERE rowid=%d", tableName, [rowId intValue]];
+        char *errMsg = NULL;
+        if (sqlite3_exec(db, [deleteSQL UTF8String], NULL, NULL, &errMsg) == SQLITE_OK) {
+            deletedCount++;
+        } else {
+            [stats appendLog:[NSString stringWithFormat:@"删除 %@ 表 rowid=%d 失败: %s", tableName, [rowId intValue], errMsg]];
+        }
+        if (errMsg) sqlite3_free(errMsg);
+    }
+    
+    // 输出结果
+    NSString *tableDisplayName = @"";
+    NSString *shortName = @"";
+    if ([tableName isEqualToString:@"genp"]) {
+        tableDisplayName = @"通用密码";
+        shortName = @"genp";
+    } else if ([tableName isEqualToString:@"inet"]) {
+        tableDisplayName = @"互联网密码";
+        shortName = @"inet";
+    } else if ([tableName isEqualToString:@"cert"]) {
+        tableDisplayName = @"证书";
+        shortName = @"cert";
+    } else if ([tableName isEqualToString:@"keys"]) {
+        tableDisplayName = @"密钥";
+        shortName = @"keys";
+    }
+    
+    if (rowIds.count > 0) {
+        [stats appendLog:[NSString stringWithFormat:@"\n%@（%@）类别发现 %lu 个条目：", tableDisplayName, shortName, (unsigned long)rowIds.count]];
+        for (NSString *detail in details) {
+            [stats appendLog:[NSString stringWithFormat:@"  - %@", detail]];
+        }
+        [stats appendLog:[NSString stringWithFormat:@"成功删除 %lu 个 %@（%@）条目", (unsigned long)deletedCount, tableDisplayName, shortName]];
+    } else {
+        [stats appendLog:[NSString stringWithFormat:@"%@（%@）：无条目", tableDisplayName, shortName]];
+    }
+    
+    return deletedCount;
+}
+
 - (void)cleanDirectoryRecursively:(NSString *)directoryPath stats:(CleaningStats *)stats {
     NSFileManager *fm = [NSFileManager defaultManager];
     
@@ -1199,12 +1426,10 @@ static NSCache *groupPathCache = nil;
         @autoreleasepool {
             NSString *itemPath = [directoryPath stringByAppendingPathComponent:item];
             
-            // 跳过保护文件
             if ([self isProtectedMetadataFile:itemPath]) {
                 continue;
             }
             
-            // 获取文件大小
             NSDictionary *attributes = [fm attributesOfItemAtPath:itemPath error:nil];
             if (attributes) {
                 long long fileSize = [attributes fileSize];
@@ -1214,12 +1439,10 @@ static NSCache *groupPathCache = nil;
                 dirBytes += fileSize;
             }
             
-            // 尝试删除
             NSError *error = nil;
             BOOL success = [fm removeItemAtPath:itemPath error:&error];
             
             if (!success || error) {
-                // 使用 shell 命令强制删除
                 [self removeWithShellCommand:itemPath];
                 [stats appendLog:[NSString stringWithFormat:@"强制删除: %@", [itemPath lastPathComponent]]];
             }
@@ -1229,15 +1452,11 @@ static NSCache *groupPathCache = nil;
     [stats appendLog:[NSString stringWithFormat:@"目录清理完成: %@, 删除 %lu 个文件, 释放 %.2f KB", 
                      [directoryPath lastPathComponent], (unsigned long)dirFileCount, dirBytes / 1024.0]];
     
-    // 重新创建空目录
     if (![fm fileExistsAtPath:directoryPath]) {
         [fm createDirectoryAtPath:directoryPath withIntermediateDirectories:YES attributes:nil error:nil];
     }
 }
 
-// ============================================
-// 7. 使用 shell 命令强制删除
-// ============================================
 - (void)removeWithShellCommand:(NSString *)path {
     const char *rmCmd = [[NSString stringWithFormat:@"rm -rf \"%@\" 2>/dev/null", path] UTF8String];
     pid_t pid;
@@ -1245,9 +1464,6 @@ static NSCache *groupPathCache = nil;
     waitpid(pid, NULL, 0);
 }
 
-// ============================================
-// 8. 备用清理方案
-// ============================================
 - (void)cleanByBundleIdDirectly:(NSString *)bundleId stats:(CleaningStats *)stats {
     NSFileManager *fm = [NSFileManager defaultManager];
     
@@ -1279,9 +1495,6 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// ============================================
-// 9. 清理应用组目录
-// ============================================
 - (void)cleanAppGroupDirectoriesForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
     NSFileManager *fm = [NSFileManager defaultManager];
     
@@ -1316,13 +1529,9 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// ============================================
-// 10. 清理全局偏好设置
-// ============================================
 - (void)cleanGlobalPreferencesForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
     NSFileManager *fm = [NSFileManager defaultManager];
     
-    // 主偏好文件
     NSString *mainPrefPath = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", bundleId];
     if ([fm fileExistsAtPath:mainPrefPath]) {
         NSDictionary *attributes = [fm attributesOfItemAtPath:mainPrefPath error:nil];
@@ -1334,7 +1543,6 @@ static NSCache *groupPathCache = nil;
         [stats appendLog:[NSString stringWithFormat:@"删除主偏好文件: %@", mainPrefPath]];
     }
     
-    // 所有包含 bundleId 的偏好文件
     NSString *prefDir = @"/var/mobile/Library/Preferences";
     if ([fm fileExistsAtPath:prefDir]) {
         NSArray *prefFiles = [fm contentsOfDirectoryAtPath:prefDir error:nil];
@@ -1352,7 +1560,6 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 清理 NSUserDefaults 缓存
     const char *flushCmd = "killall -9 cfprefsd 2>/dev/null";
     pid_t pid;
     posix_spawn(&pid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)flushCmd, NULL}, NULL);
@@ -1360,9 +1567,6 @@ static NSCache *groupPathCache = nil;
     [stats appendLog:@"已刷新偏好设置守护进程"];
 }
 
-// ============================================
-// 11. 清理系统缓存
-// ============================================
 - (void)cleanSystemCachesForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
     [stats appendLog:@"刷新 SpringBoard 图标缓存"];
     const char *respringCmd = "killall -9 SpringBoard 2>/dev/null";
@@ -1371,262 +1575,6 @@ static NSCache *groupPathCache = nil;
     waitpid(pid, NULL, 0);
 }
 
-// ============================================
-// 12. 增强版 Keychain 清理
-// ============================================
-- (void)clearKeychainForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats displayName:(NSString *)displayName {
-    [stats appendLog:[NSString stringWithFormat:@"========== Keychain 清理开始 =========="]];
-    [stats appendLog:[NSString stringWithFormat:@"应用 Bundle ID: %@", bundleId]];
-    
-    NSArray *secClasses = @[
-        (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecClassInternetPassword,
-        (__bridge id)kSecClassCertificate,
-        (__bridge id)kSecClassKey,
-        (__bridge id)kSecClassIdentity
-    ];
-    
-    NSArray *secClassNames = @[@"通用密码", @"互联网密码", @"证书", @"密钥", @"身份"];
-    
-    NSUInteger totalDeleted = 0;
-    
-    for (NSUInteger idx = 0; idx < secClasses.count; idx++) {
-        id secClass = secClasses[idx];
-        NSString *className = secClassNames[idx];
-        
-        // 查询所有条目
-        NSMutableDictionary *queryAll = [@{
-            (__bridge id)kSecClass: secClass,
-            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-            (__bridge id)kSecReturnAttributes: @YES,
-            (__bridge id)kSecReturnData: @NO
-        } mutableCopy];
-        
-        CFTypeRef result = NULL;
-        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)queryAll, &result);
-        
-        NSUInteger classDeleted = 0;
-        NSUInteger classFound = 0;
-        NSMutableArray *deletedItems = [NSMutableArray array];
-        
-        if (status == errSecSuccess && result) {
-            NSArray *items = (__bridge NSArray *)result;
-            classFound = items.count;
-            [stats appendLog:[NSString stringWithFormat:@"\n%@（%@）类别发现 %lu 个条目：", className, [self secClassShortName:secClass], (unsigned long)items.count]];
-            
-            for (NSDictionary *item in items) {
-                BOOL shouldDelete = NO;
-                NSString *matchReason = nil;
-                
-                // 检查各种属性
-                NSString *service = item[(__bridge id)kSecAttrService];
-                NSString *account = item[(__bridge id)kSecAttrAccount];
-                NSString *accessGroup = item[(__bridge id)kSecAttrAccessGroup];
-                NSString *label = item[(__bridge id)kSecAttrLabel];
-                NSString *server = item[(__bridge id)kSecAttrServer];
-                
-                // 获取 generic 数据
-                NSString *generic = nil;
-                NSData *genericData = item[(__bridge id)kSecAttrGeneric];
-                if (genericData) {
-                    generic = [[NSString alloc] initWithData:genericData encoding:NSUTF8StringEncoding];
-                }
-                
-                // 检查匹配
-                if ([self string:service contains:bundleId] || [self string:service contains:displayName]) {
-                    shouldDelete = YES;
-                    matchReason = [NSString stringWithFormat:@"service: %@", service];
-                } else if ([self string:account contains:bundleId] || [self string:account contains:displayName]) {
-                    shouldDelete = YES;
-                    matchReason = [NSString stringWithFormat:@"account: %@", account];
-                } else if ([self string:accessGroup contains:bundleId]) {
-                    shouldDelete = YES;
-                    matchReason = [NSString stringWithFormat:@"accessGroup: %@", accessGroup];
-                } else if ([self string:label contains:bundleId] || [self string:label contains:displayName]) {
-                    shouldDelete = YES;
-                    matchReason = [NSString stringWithFormat:@"label: %@", label];
-                } else if ([self string:server contains:bundleId] || [self string:server contains:displayName]) {
-                    shouldDelete = YES;
-                    matchReason = [NSString stringWithFormat:@"server: %@", server];
-                } else if ([self string:generic contains:bundleId] || [self string:generic contains:displayName]) {
-                    shouldDelete = YES;
-                    matchReason = [NSString stringWithFormat:@"generic: %@", generic];
-                }
-                
-                // 部分匹配
-                if (!shouldDelete) {
-                    NSArray *bundleParts = [bundleId componentsSeparatedByString:@"."];
-                    for (NSString *part in bundleParts) {
-                        if (part.length > 3) {
-                            if ([self string:service contains:part] || [self string:account contains:part]) {
-                                shouldDelete = YES;
-                                matchReason = [NSString stringWithFormat:@"部分匹配: %@", part];
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                if (shouldDelete) {
-                    // 记录条目信息
-                    NSString *itemDesc = @"";
-                    if (account && account.length > 0) {
-                        itemDesc = [NSString stringWithFormat:@"账户：%@", account];
-                    }
-                    if (service && service.length > 0) {
-                        if (itemDesc.length > 0) {
-                            itemDesc = [NSString stringWithFormat:@"%@，服务：%@", itemDesc, service];
-                        } else {
-                            itemDesc = [NSString stringWithFormat:@"服务：%@", service];
-                        }
-                    }
-                    if (itemDesc.length == 0) {
-                        itemDesc = [NSString stringWithFormat:@"匹配原因: %@", matchReason];
-                    }
-                    
-                    // 构建删除查询
-                    NSMutableDictionary *deleteQuery = [@{
-                        (__bridge id)kSecClass: secClass
-                    } mutableCopy];
-                    
-                    if (service) deleteQuery[(__bridge id)kSecAttrService] = service;
-                    if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
-                    if (accessGroup) deleteQuery[(__bridge id)kSecAttrAccessGroup] = accessGroup;
-                    
-                    OSStatus deleteStatus = SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
-                    if (deleteStatus == errSecSuccess) {
-                        classDeleted++;
-                        totalDeleted++;
-                        [deletedItems addObject:itemDesc];
-                    }
-                }
-            }
-            
-            CFRelease(result);
-        }
-        
-        // 直接删除尝试
-        if (classDeleted == 0) {
-            NSDictionary *queryByService = @{
-                (__bridge id)kSecClass: secClass,
-                (__bridge id)kSecAttrService: bundleId
-            };
-            if (SecItemDelete((__bridge CFDictionaryRef)queryByService) == errSecSuccess) {
-                classDeleted++;
-                totalDeleted++;
-                [deletedItems addObject:[NSString stringWithFormat:@"直接删除 (service=%@)", bundleId]];
-            }
-            
-            NSDictionary *queryByAccount = @{
-                (__bridge id)kSecClass: secClass,
-                (__bridge id)kSecAttrAccount: bundleId
-            };
-            if (SecItemDelete((__bridge CFDictionaryRef)queryByAccount) == errSecSuccess) {
-                classDeleted++;
-                totalDeleted++;
-                [deletedItems addObject:[NSString stringWithFormat:@"直接删除 (account=%@)", bundleId]];
-            }
-        }
-        
-        // 输出删除的条目
-        if (deletedItems.count > 0) {
-            for (NSString *itemDesc in deletedItems) {
-                [stats appendLog:[NSString stringWithFormat:@"  - %@", itemDesc]];
-            }
-            [stats appendLog:[NSString stringWithFormat:@"成功删除 %lu 个 %@（%@）条目", (unsigned long)classDeleted, className, [self secClassShortName:secClass]]];
-        } else {
-            if (classFound > 0) {
-                [stats appendLog:[NSString stringWithFormat:@"%@（%@）：无匹配条目", className, [self secClassShortName:secClass]]];
-            } else {
-                [stats appendLog:[NSString stringWithFormat:@"%@（%@）：无条目", className, [self secClassShortName:secClass]]];
-            }
-        }
-    }
-    
-    // 通配符清理
-    [self deleteKeychainItemsWithWildcardMatch:bundleId appName:displayName stats:stats];
-    
-    stats.keychainItemsDeleted = totalDeleted;
-    [stats appendLog:[NSString stringWithFormat:@"\n========== Keychain 清理完成 =========="]];
-    [stats appendLog:[NSString stringWithFormat:@"总计删除 Keychain 条目：%lu 个", (unsigned long)totalDeleted]];
-}
-
-- (BOOL)string:(NSString *)string contains:(NSString *)substring {
-    if (!string || !substring) return NO;
-    return [string rangeOfString:substring options:NSCaseInsensitiveSearch].location != NSNotFound;
-}
-
-- (NSString *)secClassShortName:(id)secClass {
-    if ([secClass isEqual:(__bridge id)kSecClassGenericPassword]) return @"genp";
-    if ([secClass isEqual:(__bridge id)kSecClassInternetPassword]) return @"inet";
-    if ([secClass isEqual:(__bridge id)kSecClassCertificate]) return @"cert";
-    if ([secClass isEqual:(__bridge id)kSecClassKey]) return @"keys";
-    if ([secClass isEqual:(__bridge id)kSecClassIdentity]) return @"idnt";
-    return @"unknown";
-}
-
-- (void)deleteKeychainItemsWithWildcardMatch:(NSString *)bundleId appName:(NSString *)appName stats:(CleaningStats *)stats {
-    NSArray *parts = [bundleId componentsSeparatedByString:@"."];
-    NSString *lastPart = [parts lastObject];
-    
-    NSArray *searchTerms = @[bundleId, appName ?: @"", lastPart];
-    
-    NSArray *secClasses = @[
-        (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecClassInternetPassword
-    ];
-    
-    for (id secClass in secClasses) {
-        NSDictionary *queryAll = @{
-            (__bridge id)kSecClass: secClass,
-            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-            (__bridge id)kSecReturnAttributes: @YES
-        };
-        
-        CFTypeRef result = NULL;
-        if (SecItemCopyMatching((__bridge CFDictionaryRef)queryAll, &result) == errSecSuccess && result) {
-            NSArray *items = (__bridge NSArray *)result;
-            
-            for (NSDictionary *item in items) {
-                BOOL shouldDelete = NO;
-                
-                for (id key in item.allKeys) {
-                    id value = item[key];
-                    if ([value isKindOfClass:[NSString class]]) {
-                        NSString *strValue = (NSString *)value;
-                        for (NSString *term in searchTerms) {
-                            if (term.length > 0 && [strValue rangeOfString:term options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                                shouldDelete = YES;
-                                break;
-                            }
-                        }
-                    }
-                    if (shouldDelete) break;
-                }
-                
-                if (shouldDelete) {
-                    NSMutableDictionary *deleteQuery = [@{
-                        (__bridge id)kSecClass: secClass
-                    } mutableCopy];
-                    
-                    NSString *service = item[(__bridge id)kSecAttrService];
-                    NSString *account = item[(__bridge id)kSecAttrAccount];
-                    
-                    if (service) deleteQuery[(__bridge id)kSecAttrService] = service;
-                    if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
-                    
-                    SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
-                }
-            }
-            
-            CFRelease(result);
-        }
-    }
-}
-
-// ============================================
-// 13. 检查是否为受保护的元数据文件
-// ============================================
 - (BOOL)isProtectedMetadataFile:(NSString *)path {
     NSString *fileName = [path lastPathComponent];
     NSArray *protectedFiles = @[
@@ -1641,9 +1589,6 @@ static NSCache *groupPathCache = nil;
     return NO;
 }
 
-// ============================================
-// 14. 显示清理结果
-// ============================================
 - (void)showCleaningResults:(CleaningStats *)stats appName:(NSString *)appName bundleId:(NSString *)bundleId {
     NSString *sizeStr;
     if (stats.bytesFreed >= 1024 * 1024 * 1024) {
@@ -1656,7 +1601,6 @@ static NSCache *groupPathCache = nil;
         sizeStr = [NSString stringWithFormat:@"%lld B", stats.bytesFreed];
     }
     
-    // 最终日志
     [stats appendLog:@"========================================"];
     [stats appendLog:@"清理完成统计"];
     [stats appendLog:[NSString stringWithFormat:@"应用名称: %@", appName]];
@@ -1667,7 +1611,6 @@ static NSCache *groupPathCache = nil;
     [stats appendLog:[NSString stringWithFormat:@"耗时: %.1f 秒", stats.cleaningDuration]];
     [stats appendLog:@"========================================"];
     
-    // 保存日志到文件
     [self saveLogToFile:stats.logOutput bundleId:bundleId];
     
     NSString *message = [NSString stringWithFormat:@"清理完成！\n\n📁 删除文件：%lu 个\n🔐 Keychain 条目：%lu 个\n💾 释放空间：%@\n⏱ 耗时：%.1f 秒\n\n详细日志已保存到:\n/var/mobile/Documents/MuffinStore_Logs/",
@@ -1689,9 +1632,6 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:resultAlert animated:YES completion:nil];
 }
 
-// ============================================
-// 15. 保存日志到文件
-// ============================================
 - (void)saveLogToFile:(NSString *)logContent bundleId:(NSString *)bundleId {
     NSString *logDir = @"/var/mobile/Documents/MuffinStore_Logs";
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -1711,9 +1651,6 @@ static NSCache *groupPathCache = nil;
     [logContent writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-// ============================================
-// 16. 显示完整日志
-// ============================================
 - (void)showFullLog:(NSString *)logContent {
     UIAlertController *logAlert = [UIAlertController alertControllerWithTitle:@"清理日志"
                                                                       message:logContent
@@ -2086,7 +2023,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.6 (优先清理 Keychain)\n作者 Mineek,Mr.Eric\n长按应用可启动/完全清理数据/跳转目录\n清理顺序: Keychain → 应用数据 → 应用组数据\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v1.7 (直接操作 Keychain 数据库)\n作者 Mineek,Mr.Eric\n长按应用可启动/完全清理数据/跳转目录\nKeychain 清理: 直接操作 /var/Keychains/keychain-2.db\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
