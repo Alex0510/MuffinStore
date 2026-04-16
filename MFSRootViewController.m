@@ -10,6 +10,7 @@
 #import <sys/stat.h>
 #import <fcntl.h>
 #import <WebKit/WebKit.h>
+#import <sys/wait.h>
 
 // ============================================
 // 清理统计信息类
@@ -655,6 +656,62 @@ static NSCache *groupPathCache = nil;
 #pragma mark - 核心清理功能（增强版 - 彻底清理）
 #pragma mark - ============================================
 
+// ============================================
+// 获取主窗口的兼容方法
+// ============================================
+- (UIWindow *)getKeyWindow {
+    if (@available(iOS 13.0, *)) {
+        NSSet *connectedScenes = [UIApplication sharedApplication].connectedScenes;
+        for (UIWindowScene *windowScene in connectedScenes) {
+            if (windowScene.activationState == UISceneActivationStateForegroundActive) {
+                for (UIWindow *window in windowScene.windows) {
+                    if (window.isKeyWindow) {
+                        return window;
+                    }
+                }
+            }
+        }
+    }
+    return [UIApplication sharedApplication].keyWindow;
+}
+
+// ============================================
+// 执行 Shell 命令（使用 posix_spawn，iOS 兼容）
+// ============================================
+- (void)runShellCommand:(NSString *)command {
+    if (!command || command.length == 0) return;
+    
+    NSLog(@"[执行] %@", command);
+    
+    pid_t pid;
+    char *argv[] = {"/bin/sh", "-c", (char *)[command UTF8String], NULL};
+    
+    int status = posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, NULL);
+    if (status == 0) {
+        waitpid(pid, NULL, 0);
+    } else {
+        NSLog(@"[执行] posix_spawn 失败: %s", strerror(status));
+    }
+}
+
+// ============================================
+// 执行 Shell 命令并获取输出
+// ============================================
+- (NSString *)runShellCommandWithOutput:(NSString *)command {
+    if (!command || command.length == 0) return @"";
+    
+    char buffer[4096];
+    NSString *result = @"";
+    FILE *pipe = popen([command UTF8String], "r");
+    if (pipe) {
+        while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
+            result = [result stringByAppendingString:[NSString stringWithUTF8String:buffer]];
+        }
+        pclose(pipe);
+    }
+    return result;
+}
+
 - (void)showFullCleanConfirmationForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
     UIAlertController *confirmAlert = [UIAlertController alertControllerWithTitle:@"⚠️ 确认清除"
                                                                           message:[NSString stringWithFormat:@"此操作将永久删除应用「%@」所有数据，包括：\n\n• 用户设置和偏好\n• 缓存和临时文件\n• 登录信息和密码\n• 所有本地数据\n• Keychain数据\n• 网络缓存和Cookies\n• 启动图缓存\n• WebKit数据\n• 应用组数据\n\n此操作不可逆，确定要继续吗？", appName ?: bundleId]
@@ -744,7 +801,6 @@ static NSCache *groupPathCache = nil;
     }
     
     // 2. 清理 NSUserDefaults
-    [self updateProgress:0.65 withStatus:@"清理用户设置..."];
     [self runShellCommand:[NSString stringWithFormat:@"rm -f '/var/mobile/Library/Preferences/%@.plist'", bundleId]];
     [self runShellCommand:[NSString stringWithFormat:@"rm -f '/var/mobile/Library/Preferences/%@.plist'", 
                            [bundleId stringByReplacingOccurrencesOfString:@"." withString:@"_"]]];
@@ -755,28 +811,23 @@ static NSCache *groupPathCache = nil;
     [self runShellCommand:[NSString stringWithFormat:@"rm -f '/var/mobile/Library/Preferences/%@'*.plist 2>/dev/null", bundleId]];
     
     // 4. 清理 Keychain（更彻底的方式）
-    [self updateProgress:0.70 withStatus:@"清理钥匙串..."];
     [self cleanKeychainCompletely:bundleId];
     
     // 5. 清理应用组目录
-    [self updateProgress:0.75 withStatus:@"清理应用组..."];
     [self runShellCommand:[NSString stringWithFormat:@"find /var/mobile/Containers/Shared/AppGroup -name '*.plist' -exec grep -l '%@' {} \\; -exec rm -f {} \\; 2>/dev/null", bundleId]];
     
     // 6. 清理启动图缓存
-    [self updateProgress:0.80 withStatus:@"清理启动图缓存..."];
     [self runShellCommand:[NSString stringWithFormat:@"find /var/mobile/Library/SplashBoard -name '*%@*' -exec rm -rf {} \\; 2>/dev/null", bundleId]];
     [self.currentStats.cleanedFiles addObject:@"[启动图] 清理启动图缓存"];
     self.currentStats.filesDeleted++;
     
     // 7. 清理 WebKit 数据
-    [self updateProgress:0.83 withStatus:@"清理WebKit数据..."];
     [self runShellCommand:[NSString stringWithFormat:@"find /var/mobile/Library/WebKit -name '*%@*' -exec rm -rf {} \\; 2>/dev/null", bundleId]];
     [self runShellCommand:[NSString stringWithFormat:@"rm -rf '/var/mobile/Containers/Data/Application/*/Library/WebKit' 2>/dev/null"]];
     [self.currentStats.cleanedFiles addObject:@"[WebKit] 清理 WebKit 缓存"];
     self.currentStats.filesDeleted++;
     
     // 8. 清理网络缓存
-    [self updateProgress:0.85 withStatus:@"清理网络缓存..."];
     [self runShellCommand:[NSString stringWithFormat:@"rm -rf '/var/mobile/Containers/Data/Application/*/Library/Caches'/* 2>/dev/null"]];
     
     // 9. 清理 Cookies
@@ -814,30 +865,6 @@ static NSCache *groupPathCache = nil;
     NSString *output = [self runShellCommandWithOutput:[NSString stringWithFormat:@"pgrep -f '%@' | wc -l", bundleId]];
     int count = [output intValue];
     return count > 0;
-}
-
-// ============================================
-// 执行带输出的 Shell 命令
-// ============================================
-- (NSString *)runShellCommandWithOutput:(NSString *)command {
-    char buffer[4096];
-    NSString *result = @"";
-    FILE *pipe = popen([command UTF8String], "r");
-    if (pipe) {
-        while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
-            result = [result stringByAppendingString:[NSString stringWithUTF8String:buffer]];
-        }
-        pclose(pipe);
-    }
-    return result;
-}
-
-// ============================================
-// 执行 Shell 命令
-// ============================================
-- (void)runShellCommand:(NSString *)command {
-    NSLog(@"[执行] %@", command);
-    system([command UTF8String]);
 }
 
 // ============================================
@@ -1075,7 +1102,8 @@ static NSCache *groupPathCache = nil;
     [containerView addSubview:self.statusLabel];
     [self.progressOverlay addSubview:containerView];
     
-    UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+    // 使用兼容方法获取窗口
+    UIWindow *keyWindow = [self getKeyWindow];
     if (keyWindow) {
         [keyWindow addSubview:self.progressOverlay];
         [keyWindow bringSubviewToFront:self.progressOverlay];
