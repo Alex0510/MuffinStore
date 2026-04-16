@@ -6,4 +6,9 @@
 
 @interface MFSRootViewController : PSListController
 
+// 悬浮窗相关方法
+- (void)showFloatingWindow;
+- (void)hideFloatingWindow;
+- (void)createEnhancedFloatingWindow;
+
 @end
