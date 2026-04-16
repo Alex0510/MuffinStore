@@ -28,7 +28,9 @@
 static NSCache *iconCache = nil;
 static NSCache *groupPathCache = nil;
 
-// 清理统计信息类 (与 allclean.x 完全一致)
+// ============================================
+// 从 allclean.x 完整移植的 CleaningStats 类
+// ============================================
 @interface CleaningStats : NSObject
 @property (nonatomic, assign) NSUInteger filesDeleted;
 @property (nonatomic, assign) long long bytesFreed;
@@ -57,7 +59,9 @@ static NSCache *groupPathCache = nil;
 @property (nonatomic, strong) NSArray<PSSpecifier *> *trollAppSpecifiers;
 @property (nonatomic, assign) BOOL isSearching;
 @property (nonatomic, copy) NSString *searchKeyword;
-// 进度指示器属性 (与 allclean.x 完全一致)
+// ============================================
+// 从 allclean.x 完整移植的进度指示器属性
+// ============================================
 @property (nonatomic, strong) UIView *progressOverlay;
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) UILabel *statusLabel;
@@ -438,8 +442,11 @@ static NSCache *groupPathCache = nil;
         [actionSheet addAction:appGroupAction];
     }
     
+    // ============================================
+    // 使用 allclean.x 的完全清理功能
+    // ============================================
     UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"清理数据" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self confirmClearDataForAppProxy:appProxy bundleId:bundleId appName:appInfo[@"localizedName"]];
+        [self showCleaningOptionsForAppProxy:appProxy bundleId:bundleId appName:appInfo[@"localizedName"]];
     }];
     UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     
@@ -670,8 +677,63 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 进度指示器方法 (与 allclean.x 完全一致)
-- (void)showProgressIndicator {
+#pragma mark - ============================================
+#pragma mark - 从 allclean.x 完整移植的清理功能
+#pragma mark - ============================================
+
+// ============================================
+// 1. 显示清理选项菜单 (完全移植自 allclean.x)
+// ============================================
+- (void)showCleaningOptionsForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
+    UIAlertController *optionsAlert = [UIAlertController alertControllerWithTitle:@"AllClean - 数据清理"
+                                                                          message:@"请选择清理类型"
+                                                                   preferredStyle:UIAlertControllerStyleActionSheet];
+    
+    [optionsAlert addAction:[UIAlertAction actionWithTitle:@"🗂 仅清理缓存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self clearCacheOnlyForBundleId:bundleId appProxy:appProxy appName:appName];
+    }]];
+    
+    [optionsAlert addAction:[UIAlertAction actionWithTitle:@"👤 清理用户数据" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self clearUserDataOnlyForBundleId:bundleId appProxy:appProxy appName:appName];
+    }]];
+    
+    [optionsAlert addAction:[UIAlertAction actionWithTitle:@"💥 完全清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self showFullCleanConfirmationForAppProxy:appProxy bundleId:bundleId appName:appName];
+    }]];
+    
+    [optionsAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    
+    // iPad 适配
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        optionsAlert.popoverPresentationController.sourceView = self.view;
+        optionsAlert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width/2, self.view.bounds.size.height/2, 1, 1);
+        optionsAlert.popoverPresentationController.permittedArrowDirections = 0;
+    }
+    
+    [self presentViewController:optionsAlert animated:YES completion:nil];
+}
+
+// ============================================
+// 2. 显示完全清理确认对话框 (完全移植自 allclean.x)
+// ============================================
+- (void)showFullCleanConfirmationForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
+    UIAlertController *confirmAlert = [UIAlertController alertControllerWithTitle:@"⚠️ 确认清除"
+                                                                          message:[NSString stringWithFormat:@"此操作将永久删除应用「%@」所有数据，包括：\n\n• 用户设置和偏好\n• 缓存和临时文件\n• 登录信息和密码\n• 所有本地数据\n• Keychain数据\n\n此操作不可逆，确定要继续吗？", appName ?: bundleId]
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+    
+    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"确认清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self performFullCleanWithAnimationForAppProxy:appProxy bundleId:bundleId appName:appName];
+    }]];
+    
+    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    
+    [self presentViewController:confirmAlert animated:YES completion:nil];
+}
+
+// ============================================
+// 3. 进度指示器 (完全移植自 allclean.x)
+// ============================================
+- (void)showProgressIndicatorWithTitle:(NSString *)title {
     if (self.progressOverlay) {
         [self hideProgressIndicator];
     }
@@ -687,7 +749,7 @@ static NSCache *groupPathCache = nil;
     containerView.layer.masksToBounds = YES;
     
     UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 15, 240, 25)];
-    titleLabel.text = @"正在清理应用数据...";
+    titleLabel.text = title ?: @"AllClean 正在清理...";
     titleLabel.textColor = [UIColor whiteColor];
     titleLabel.font = [UIFont boldSystemFontOfSize:16];
     titleLabel.textAlignment = NSTextAlignmentCenter;
@@ -750,23 +812,167 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-#pragma mark - 清理数据确认对话框 (与 allclean.x 完全一致)
-- (void)confirmClearDataForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"⚠️ 确认清除"
-                                                                     message:[NSString stringWithFormat:@"此操作将永久删除应用「%@」所有数据，包括：\n\n• 用户设置和偏好\n• 缓存和临时文件\n• 登录信息和密码\n• 所有本地数据\n• Keychain数据\n\n此操作不可逆，确定要继续吗？", appName ?: bundleId]
-                                                              preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *clear = [UIAlertAction actionWithTitle:@"确认清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self performFullCleanForAppProxy:appProxy bundleId:bundleId appName:appName];
-    }];
-    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
-    [confirm addAction:clear];
-    [confirm addAction:cancel];
-    [self presentViewController:confirm animated:YES completion:nil];
+// ============================================
+// 4. 仅清理缓存 (完全移植自 allclean.x)
+// ============================================
+- (void)clearCacheOnlyForBundleId:(NSString *)bundleId appProxy:(id)appProxy appName:(NSString *)appName {
+    [self showProgressIndicatorWithTitle:@"AllClean - 清理缓存"];
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        CleaningStats *stats = [[CleaningStats alloc] init];
+        NSDate *startTime = [NSDate date];
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        
+        [self updateProgress:0.1 withStatus:@"正在清理缓存目录..."];
+        
+        // 清理 Caches 目录
+        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
+        if (dataURL) {
+            NSString *cachesDirectory = [dataURL.path stringByAppendingPathComponent:@"Library/Caches"];
+            if ([fileManager fileExistsAtPath:cachesDirectory]) {
+                NSArray *cacheFiles = [fileManager contentsOfDirectoryAtPath:cachesDirectory error:nil];
+                for (NSString *file in cacheFiles) {
+                    NSString *filePath = [cachesDirectory stringByAppendingPathComponent:file];
+                    NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
+                    if (attributes) {
+                        stats.bytesFreed += [attributes fileSize];
+                        stats.filesDeleted++;
+                    }
+                    [fileManager removeItemAtPath:filePath error:nil];
+                }
+            }
+        }
+        
+        [self updateProgress:0.6 withStatus:@"正在清理临时文件..."];
+        
+        // 清理临时目录
+        NSString *tempDirectory = NSTemporaryDirectory();
+        if ([fileManager fileExistsAtPath:tempDirectory]) {
+            NSArray *tempFiles = [fileManager contentsOfDirectoryAtPath:tempDirectory error:nil];
+            for (NSString *file in tempFiles) {
+                NSString *filePath = [tempDirectory stringByAppendingPathComponent:file];
+                NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
+                if (attributes) {
+                    stats.bytesFreed += [attributes fileSize];
+                    stats.filesDeleted++;
+                }
+                [fileManager removeItemAtPath:filePath error:nil];
+            }
+        }
+        
+        [self updateProgress:0.9 withStatus:@"正在清理网络缓存..."];
+        [[NSURLCache sharedURLCache] removeAllCachedResponses];
+        
+        [self updateProgress:1.0 withStatus:@"缓存清理完成！"];
+        stats.cleaningDuration = [[NSDate date] timeIntervalSinceDate:startTime];
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self hideProgressIndicator];
+            [self showCleaningResults:stats appName:appName bundleId:bundleId];
+        });
+    });
 }
 
-#pragma mark - 完全清理功能 (与 allclean.x 的 clearAppDataWithProgress 完全一致)
-- (void)performFullCleanForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
-    [self showProgressIndicator];
+// ============================================
+// 5. 仅清理用户数据 (完全移植自 allclean.x)
+// ============================================
+- (void)clearUserDataOnlyForBundleId:(NSString *)bundleId appProxy:(id)appProxy appName:(NSString *)appName {
+    [self showProgressIndicatorWithTitle:@"AllClean - 清理用户数据"];
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        CleaningStats *stats = [[CleaningStats alloc] init];
+        NSDate *startTime = [NSDate date];
+        NSString *bundleIdentifier = bundleId;
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        
+        [self updateProgress:0.1 withStatus:@"正在清理用户设置..."];
+        
+        // 清理 UserDefaults
+        [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bundleIdentifier];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        
+        [self updateProgress:0.4 withStatus:@"正在清理用户文档..."];
+        
+        // 清理 Documents 目录
+        NSURL *dataURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
+        if (dataURL) {
+            NSString *documentsDirectory = [dataURL.path stringByAppendingPathComponent:@"Documents"];
+            if ([fileManager fileExistsAtPath:documentsDirectory]) {
+                NSArray *docFiles = [fileManager contentsOfDirectoryAtPath:documentsDirectory error:nil];
+                for (NSString *file in docFiles) {
+                    NSString *filePath = [documentsDirectory stringByAppendingPathComponent:file];
+                    NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
+                    if (attributes) {
+                        stats.bytesFreed += [attributes fileSize];
+                        stats.filesDeleted++;
+                    }
+                    [fileManager removeItemAtPath:filePath error:nil];
+                }
+            }
+        }
+        
+        [self updateProgress:0.7 withStatus:@"正在清理应用偏好设置..."];
+        
+        // 清理偏好设置文件
+        NSString *preferencesPath = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"Preferences"];
+        if ([fileManager fileExistsAtPath:preferencesPath]) {
+            NSArray *prefFiles = [fileManager contentsOfDirectoryAtPath:preferencesPath error:nil];
+            for (NSString *file in prefFiles) {
+                if ([file hasPrefix:bundleIdentifier] && [file hasSuffix:@".plist"]) {
+                    NSString *filePath = [preferencesPath stringByAppendingPathComponent:file];
+                    NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
+                    if (attributes) {
+                        stats.bytesFreed += [attributes fileSize];
+                        stats.filesDeleted++;
+                    }
+                    [fileManager removeItemAtPath:filePath error:nil];
+                }
+            }
+        }
+        
+        [self updateProgress:1.0 withStatus:@"用户数据清理完成！"];
+        stats.cleaningDuration = [[NSDate date] timeIntervalSinceDate:startTime];
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self hideProgressIndicator];
+            [self showCleaningResults:stats appName:appName bundleId:bundleId];
+        });
+    });
+}
+
+// ============================================
+// 6. 执行完全清理带动画 (完全移植自 allclean.x)
+// ============================================
+- (void)performFullCleanWithAnimationForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
+    // 动画效果 (与 allclean.x 完全一致)
+    UIView *animationView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 100, 100)];
+    animationView.center = self.view.center;
+    animationView.backgroundColor = [UIColor redColor];
+    animationView.layer.cornerRadius = 50;
+    animationView.alpha = 0.8;
+    [self.view addSubview:animationView];
+    
+    [UIView animateWithDuration:0.2 animations:^{
+        animationView.transform = CGAffineTransformMakeScale(1.5, 1.5);
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.3 animations:^{
+            animationView.transform = CGAffineTransformConcat(
+                CGAffineTransformMakeScale(0.1, 0.1),
+                CGAffineTransformMakeRotation(M_PI)
+            );
+            animationView.alpha = 0.0;
+        } completion:^(BOOL finished) {
+            [animationView removeFromSuperview];
+            [self clearAppDataWithProgressForAppProxy:appProxy bundleId:bundleId appName:appName];
+        }];
+    }];
+}
+
+// ============================================
+// 7. 带进度的完全清理 (完全移植自 allclean.x 的 clearAppDataWithProgress)
+// ============================================
+- (void)clearAppDataWithProgressForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
+    [self showProgressIndicatorWithTitle:@"AllClean - 完全清理"];
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         CleaningStats *stats = [[CleaningStats alloc] init];
@@ -782,22 +988,21 @@ static NSCache *groupPathCache = nil;
         
         [self updateProgress:0.05 withStatus:@"正在初始化清理..."];
         
-        // 2. 同步用户默认设置 (与 allclean.x 一致)
+        // 2. 同步用户默认设置
         [[NSUserDefaults standardUserDefaults] synchronize];
         sync();
         
         [self updateProgress:0.1 withStatus:@"正在清理用户设置..."];
         
-        // 3. 清理用户设置 (与 allclean.x 一致)
+        // 3. 清理 UserDefaults
         [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bundleIdentifier];
         [[NSUserDefaults standardUserDefaults] synchronize];
         
         [self updateProgress:0.2 withStatus:@"正在清理文档目录..."];
         
-        // 4. 获取数据容器路径
+        // 4. 获取需要清理的目录列表
         NSURL *dataContainerURL = [self getDataContainerURLForBundleId:bundleId appProxy:appProxy];
         
-        // 5. 构建需要清理的目录列表 (与 allclean.x 完全一致)
         NSMutableArray *directoriesToClean = [NSMutableArray array];
         
         if (dataContainerURL && [fileManager fileExistsAtPath:dataContainerURL.path]) {
@@ -813,7 +1018,7 @@ static NSCache *groupPathCache = nil;
             [directoriesToClean addObject:NSTemporaryDirectory()];
         }
         
-        // 6. 清理各个目录 (与 allclean.x 的进度步进逻辑一致)
+        // 5. 清理各个目录
         float progressStep = 0.6 / directoriesToClean.count;
         float currentProgress = 0.2;
         
@@ -826,11 +1031,8 @@ static NSCache *groupPathCache = nil;
             NSArray *files = [fileManager contentsOfDirectoryAtPath:directory error:nil];
             for (NSString *file in files) {
                 NSString *filePath = [directory stringByAppendingPathComponent:file];
-                // 跳过保护性元数据文件
-                if ([self isProtectedMetadataFile:filePath]) continue;
-                
                 NSDictionary *attributes = [fileManager attributesOfItemAtPath:filePath error:nil];
-                if (attributes) {
+                if (attributes && ![self isProtectedMetadataFile:filePath]) {
                     stats.bytesFreed += [attributes fileSize];
                     stats.filesDeleted++;
                 }
@@ -840,38 +1042,15 @@ static NSCache *groupPathCache = nil;
             currentProgress += progressStep;
         }
         
-        // 7. 清理组容器 (与 allclean.x 一致)
+        // 6. 清理 Keychain
         [self updateProgress:0.8 withStatus:@"正在清理Keychain数据..."];
+        [self clearKeychainDataForBundleId:bundleId];
         
-        NSArray *groupURLs = nil;
-        @try {
-            if ([appProxy respondsToSelector:@selector(groupContainerURLs)]) {
-                groupURLs = [appProxy performSelector:@selector(groupContainerURLs)];
-            } else {
-                groupURLs = [appProxy valueForKey:@"groupContainerURLs"];
-            }
-        } @catch (NSException *e) {}
-        
-        if ([groupURLs isKindOfClass:[NSArray class]] && groupURLs.count) {
-            for (NSURL *groupURL in groupURLs) {
-                if ([groupURL isKindOfClass:[NSURL class]] && [fileManager fileExistsAtPath:groupURL.path]) {
-                    [self cleanDirectoryContents:groupURL.path stats:stats];
-                }
-            }
-        }
-        
-        // 8. 清理 Keychain (与 allclean.x 一致)
-        [self clearKeychainForBundleId:bundleId];
-        
-        // 9. 清理全局偏好设置
-        [self updateProgress:0.85 withStatus:@"正在清理偏好设置..."];
-        [self cleanGlobalPreferencesForBundleId:bundleId stats:stats];
-        
-        // 10. 延迟清除 (与 allclean.x 的 dispatch_after 逻辑一致)
+        // 7. 延迟二次清理 (与 allclean.x 完全一致)
         [self updateProgress:0.9 withStatus:@"正在执行延迟清除..."];
         
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            // 再次清理所有目录，确保彻底 (与 allclean.x 一致)
+            // 再次清理所有目录
             for (NSString *directory in directoriesToClean) {
                 if ([fileManager fileExistsAtPath:directory]) {
                     NSArray *files = [fileManager contentsOfDirectoryAtPath:directory error:nil];
@@ -900,90 +1079,10 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-// 清理目录内容的辅助方法
-- (void)cleanDirectoryContents:(NSString *)directoryPath stats:(CleaningStats *)stats {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *contents = [fm contentsOfDirectoryAtPath:directoryPath error:nil];
-    for (NSString *item in contents) {
-        NSString *itemPath = [directoryPath stringByAppendingPathComponent:item];
-        NSDictionary *attributes = [fm attributesOfItemAtPath:itemPath error:nil];
-        if (attributes && ![self isProtectedMetadataFile:itemPath]) {
-            stats.bytesFreed += [attributes fileSize];
-            stats.filesDeleted++;
-        }
-        [fm removeItemAtPath:itemPath error:nil];
-    }
-}
-
-// 清理全局偏好设置
-- (void)cleanGlobalPreferencesForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    
-    // 清理主偏好文件
-    NSString *prefPath = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", bundleId];
-    if ([fm fileExistsAtPath:prefPath]) {
-        NSDictionary *attributes = [fm attributesOfItemAtPath:prefPath error:nil];
-        if (attributes) {
-            stats.bytesFreed += [attributes fileSize];
-            stats.filesDeleted++;
-        }
-        [fm removeItemAtPath:prefPath error:nil];
-    }
-    
-    // 清理包含 bundleId 的所有偏好文件
-    NSString *prefDir = @"/var/mobile/Library/Preferences";
-    NSArray *prefFiles = [fm contentsOfDirectoryAtPath:prefDir error:nil];
-    for (NSString *file in prefFiles) {
-        if ([file containsString:bundleId]) {
-            NSString *fullPath = [prefDir stringByAppendingPathComponent:file];
-            NSDictionary *attributes = [fm attributesOfItemAtPath:fullPath error:nil];
-            if (attributes) {
-                stats.bytesFreed += [attributes fileSize];
-                stats.filesDeleted++;
-            }
-            [fm removeItemAtPath:fullPath error:nil];
-        }
-    }
-    
-    // 清理 AppGroups 中的偏好
-    NSString *sharedPrefDir = @"/var/mobile/Library/Preferences/AppGroups";
-    if ([fm fileExistsAtPath:sharedPrefDir]) {
-        NSArray *groupFiles = [fm contentsOfDirectoryAtPath:sharedPrefDir error:nil];
-        for (NSString *file in groupFiles) {
-            if ([file containsString:bundleId]) {
-                NSString *fullPath = [sharedPrefDir stringByAppendingPathComponent:file];
-                NSDictionary *attributes = [fm attributesOfItemAtPath:fullPath error:nil];
-                if (attributes) {
-                    stats.bytesFreed += [attributes fileSize];
-                    stats.filesDeleted++;
-                }
-                [fm removeItemAtPath:fullPath error:nil];
-            }
-        }
-    }
-}
-
-// 检查是否为受保护的元数据文件
-- (BOOL)isProtectedMetadataFile:(NSString *)path {
-    NSString *fileName = [path lastPathComponent];
-    NSArray *protectedFiles = @[
-        @".com.apple.mobile_container_manager.metadata.plist",
-        @".DS_Store",
-        @"com.apple.LaunchServices-*.csstore"
-    ];
-    for (NSString *protectedFile in protectedFiles) {
-        if ([fileName isEqualToString:protectedFile]) {
-            return YES;
-        }
-        if ([protectedFile containsString:@"*"] && [fileName hasPrefix:[protectedFile stringByReplacingOccurrencesOfString:@"*" withString:@""]]) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-#pragma mark - Keychain 清理 (与 allclean.x 的 ClearKeychainData 完全一致)
-- (void)clearKeychainForBundleId:(NSString *)bundleId {
+// ============================================
+// 8. Keychain 清理函数 (完全移植自 allclean.x)
+// ============================================
+- (void)clearKeychainDataForBundleId:(NSString *)bundleId {
     NSArray *keychainClasses = @[
         (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecClassInternetPassword,
@@ -1003,7 +1102,9 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-#pragma mark - 杀死应用进程 (与 allclean.x 一致)
+// ============================================
+// 9. 杀死应用进程 (完全移植自 allclean.x)
+// ============================================
 - (void)killAppWithBundleId:(NSString *)bundleId {
     // 方法1：使用 LSApplicationWorkspace
     LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
@@ -1018,7 +1119,9 @@ static NSCache *groupPathCache = nil;
     waitpid(pid, NULL, 0);
 }
 
-#pragma mark - 显示清理结果 (与 allclean.x 完全一致)
+// ============================================
+// 10. 显示清理结果 (完全移植自 allclean.x)
+// ============================================
 - (void)showCleaningResults:(CleaningStats *)stats appName:(NSString *)appName bundleId:(NSString *)bundleId {
     NSString *sizeStr;
     if (stats.bytesFreed >= 1024 * 1024 * 1024) {
@@ -1040,6 +1143,23 @@ static NSCache *groupPathCache = nil;
     
     [resultAlert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:resultAlert animated:YES completion:nil];
+}
+
+// ============================================
+// 11. 检查是否为受保护的元数据文件
+// ============================================
+- (BOOL)isProtectedMetadataFile:(NSString *)path {
+    NSString *fileName = [path lastPathComponent];
+    NSArray *protectedFiles = @[
+        @".com.apple.mobile_container_manager.metadata.plist",
+        @".DS_Store"
+    ];
+    for (NSString *protectedFile in protectedFiles) {
+        if ([fileName isEqualToString:protectedFile]) {
+            return YES;
+        }
+    }
+    return NO;
 }
 
 - (void)showAppDetails:(UIButton *)sender {
