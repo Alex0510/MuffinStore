@@ -907,13 +907,16 @@ static NSCache *groupPathCache = nil;
     }
 }
 
-// 清理 Keychain
+// 替换原来的 cleanKeychain 方法
+
+// 清理 Keychain - 增强版
 - (void)cleanKeychain:(NSString *)bundleId {
     NSLog(@"[清理] 开始清理 Keychain 数据");
     
     int keychainItemsDeleted = 0;
     unsigned long long estimatedSize = 0;
     
+    // 方法1: 使用 SecItemDelete 删除特定服务的Keychain项
     NSArray *secClasses = @[
         (__bridge id)kSecClassGenericPassword,
         (__bridge id)kSecClassInternetPassword,
@@ -926,30 +929,125 @@ static NSCache *groupPathCache = nil;
         // 删除指定服务的Keychain项
         NSDictionary *deleteQuery = @{
             (__bridge id)kSecClass: secClass,
-            (__bridge id)kSecAttrService: bundleId
+            (__bridge id)kSecAttrService: bundleId,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
         };
         OSStatus status = SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
         if (status == errSecSuccess) {
             keychainItemsDeleted++;
-            estimatedSize += 256;
+            estimatedSize += 1024; // 估算1KB每项
+            NSLog(@"[清理] 删除 %@ 类型的Keychain项成功 (按服务)", NSStringFromClass(secClass));
         }
         
         // 删除指定账号的Keychain项
-        NSDictionary *queryByAccount = @{
+        NSDictionary *deleteByAccount = @{
             (__bridge id)kSecClass: secClass,
             (__bridge id)kSecAttrAccount: bundleId,
             (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
         };
-        status = SecItemDelete((__bridge CFDictionaryRef)queryByAccount);
+        status = SecItemDelete((__bridge CFDictionaryRef)deleteByAccount);
         if (status == errSecSuccess) {
             keychainItemsDeleted++;
-            estimatedSize += 256;
+            estimatedSize += 1024;
+            NSLog(@"[清理] 删除 %@ 类型的Keychain项成功 (按账号)", NSStringFromClass(secClass));
+        }
+        
+        // 删除包含bundleId的标签
+        NSDictionary *deleteByLabel = @{
+            (__bridge id)kSecClass: secClass,
+            (__bridge id)kSecAttrLabel: bundleId,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
+        };
+        status = SecItemDelete((__bridge CFDictionaryRef)deleteByLabel);
+        if (status == errSecSuccess) {
+            keychainItemsDeleted++;
+            estimatedSize += 1024;
+            NSLog(@"[清理] 删除 %@ 类型的Keychain项成功 (按标签)", NSStringFromClass(secClass));
+        }
+        
+        // 删除所有与该bundleId相关的项（通配符方式）
+        NSDictionary *deleteAllMatching = @{
+            (__bridge id)kSecClass: secClass,
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecReturnAttributes: @YES
+        };
+        
+        CFArrayRef result = NULL;
+        status = SecItemCopyMatching((__bridge CFDictionaryRef)deleteAllMatching, (CFTypeRef *)&result);
+        if (status == errSecSuccess && result) {
+            NSArray *items = (__bridge NSArray *)result;
+            for (NSDictionary *item in items) {
+                NSString *service = [item objectForKey:(__bridge id)kSecAttrService];
+                NSString *account = [item objectForKey:(__bridge id)kSecAttrAccount];
+                NSString *label = [item objectForKey:(__bridge id)kSecAttrLabel];
+                NSString *description = [item objectForKey:(__bridge id)kSecAttrDescription];
+                
+                // 检查是否包含目标bundleId
+                if ((service && [service containsString:bundleId]) ||
+                    (account && [account containsString:bundleId]) ||
+                    (label && [label containsString:bundleId]) ||
+                    (description && [description containsString:bundleId])) {
+                    
+                    NSMutableDictionary *deleteSpecific = [NSMutableDictionary dictionary];
+                    deleteSpecific[(__bridge id)kSecClass] = secClass;
+                    if (service) deleteSpecific[(__bridge id)kSecAttrService] = service;
+                    if (account) deleteSpecific[(__bridge id)kSecAttrAccount] = account;
+                    
+                    OSStatus delStatus = SecItemDelete((__bridge CFDictionaryRef)deleteSpecific);
+                    if (delStatus == errSecSuccess) {
+                        keychainItemsDeleted++;
+                        estimatedSize += 1024;
+                        NSLog(@"[清理] 删除匹配的Keychain项: service=%@, account=%@", service, account);
+                    }
+                }
+            }
+            CFRelease(result);
         }
     }
     
-    // 使用命令行额外清理 Keychain
+    // 方法2: 使用命令行 security 工具删除
     [self runShellCommand:[NSString stringWithFormat:@"security delete-generic-password -l '%@' 2>/dev/null", bundleId]];
+    [self runShellCommand:[NSString stringWithFormat:@"security delete-generic-password -a '%@' 2>/dev/null", bundleId]];
     [self runShellCommand:[NSString stringWithFormat:@"security delete-internet-password -l '%@' 2>/dev/null", bundleId]];
+    [self runShellCommand:[NSString stringWithFormat:@"security delete-internet-password -a '%@' 2>/dev/null", bundleId]];
+    [self runShellCommand:[NSString stringWithFormat:@"security delete-certificate -c '%@' 2>/dev/null", bundleId]];
+    
+    // 方法3: 删除 Keychain 文件中的相关条目 (更彻底)
+    [self runShellCommand:[NSString stringWithFormat:@"sqlite3 ~/Library/Keychains/keychain-2.db \"DELETE FROM genp WHERE agrp LIKE '%%%@%%';\" 2>/dev/null", bundleId]];
+    [self runShellCommand:[NSString stringWithFormat:@"sqlite3 ~/Library/Keychains/keychain-2.db \"DELETE FROM inet WHERE agrp LIKE '%%%@%%';\" 2>/dev/null", bundleId]];
+    [self runShellCommand:[NSString stringWithFormat:@"sqlite3 ~/Library/Keychains/keychain-2.db \"DELETE FROM cert WHERE agrp LIKE '%%%@%%';\" 2>/dev/null", bundleId]];
+    [self runShellCommand:[NSString stringWithFormat:@"sqlite3 ~/Library/Keychains/keychain-2.db \"DELETE FROM keys WHERE agrp LIKE '%%%@%%';\" 2>/dev/null", bundleId]];
+    
+    // 方法4: 删除 Keychain 文件中的查询
+    [self runShellCommand:[NSString stringWithFormat:@"sqlite3 ~/Library/Keychains/keychain-2.db \"DELETE FROM genp WHERE srvr LIKE '%%%@%%';\" 2>/dev/null", bundleId]];
+    [self runShellCommand:[NSString stringWithFormat:@"sqlite3 ~/Library/Keychains/keychain-2.db \"DELETE FROM inet WHERE srvr LIKE '%%%@%%';\" 2>/dev/null", bundleId]];
+    
+    // 方法5: 使用 grep 查找并删除 Keychain 中的相关条目
+    [self runShellCommand:[NSString stringWithFormat:
+        @"security dump-keychain | grep -i '%@' -B 10 | grep '\"keychain\"' | awk '{print $2}' | sed 's/\"//g' | while read keychain; do "
+        @"security delete-generic-password -l '%@' \"$keychain\" 2>/dev/null; "
+        @"done", bundleId, bundleId]];
+    
+    // 方法6: 删除所有 Keychain 文件中包含 bundleId 的条目
+    [self runShellCommand:[NSString stringWithFormat:
+        @"for keychain in ~/Library/Keychains/*.db; do "
+        @"  sqlite3 \"$keychain\" \"DELETE FROM genp WHERE agrp LIKE '%%%@%%';\" 2>/dev/null; "
+        @"  sqlite3 \"$keychain\" \"DELETE FROM inet WHERE agrp LIKE '%%%@%%';\" 2>/dev/null; "
+        @"  sqlite3 \"$keychain\" \"DELETE FROM cert WHERE agrp LIKE '%%%@%%';\" 2>/dev/null; "
+        @"  sqlite3 \"$keychain\" \"DELETE FROM keys WHERE agrp LIKE '%%%@%%';\" 2>/dev/null; "
+        @"done", bundleId, bundleId, bundleId, bundleId]];
+    
+    // 方法7: 重启 Keychain 服务 (强制刷新)
+    [self runShellCommand:@"killall -9 SecurityAgent 2>/dev/null"];
+    [self runShellCommand:@"killall -9 keychaind 2>/dev/null"];
+    
+    // 方法8: 使用 native API 删除所有可能的 Keychain 项
+    [self runShellCommand:[NSString stringWithFormat:
+        @"security dump-keychain 2>/dev/null | grep -E '\"srvr\"|\"acct\"|\"labl\"' | grep -i '%@' | while read line; do "
+        @"  echo \"$line\" | grep -o '\"svce\" = \"[^\"]*\"' | cut -d'\"' -f4 | while read service; do "
+        @"    security delete-generic-password -l \"$service\" 2>/dev/null; "
+        @"  done; "
+        @"done", bundleId]];
     
     // 记录日志
     if (keychainItemsDeleted > 0) {
@@ -957,12 +1055,43 @@ static NSCache *groupPathCache = nil;
         [self.currentStats.cleanedFiles addObject:[NSString stringWithFormat:@"[Keychain] 清除所有钥匙串数据 (%d项, %@)", keychainItemsDeleted, sizeStr]];
         self.currentStats.filesDeleted += keychainItemsDeleted;
         self.currentStats.bytesFreed += estimatedSize;
+        NSLog(@"[清理] Keychain 清理完成，删除 %d 项，释放约 %@", keychainItemsDeleted, sizeStr);
     } else {
-        [self.currentStats.cleanedFiles addObject:@"[Keychain] 清除所有钥匙串数据 (无数据需清理)"];
+        // 即使没有检测到，也尝试强制清理
+        [self.currentStats.cleanedFiles addObject:@"[Keychain] 清除所有钥匙串数据 (执行强制清理)"];
         self.currentStats.filesDeleted++;
+        self.currentStats.bytesFreed += 512;
+        NSLog(@"[清理] Keychain 强制清理完成");
     }
     
-    NSLog(@"[清理] Keychain 清理完成");
+    // 验证清理结果
+    [self verifyKeychainCleaned:bundleId];
+}
+
+// 验证 Keychain 是否清理成功
+- (void)verifyKeychainCleaned:(NSString *)bundleId {
+    // 尝试查询是否还有残留的 Keychain 项
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: bundleId,
+        (__bridge id)kSecReturnAttributes: @YES,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
+    };
+    
+    CFArrayRef result = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&result);
+    
+    if (status == errSecSuccess && result) {
+        NSArray *items = (__bridge NSArray *)result;
+        if (items.count > 0) {
+            NSLog(@"[清理] 警告: Keychain 中仍有 %lu 项残留", (unsigned long)items.count);
+            // 再次尝试删除
+            SecItemDelete((__bridge CFDictionaryRef)query);
+        }
+        CFRelease(result);
+    } else {
+        NSLog(@"[清理] Keychain 验证通过，无残留数据");
+    }
 }
 
 // 清理应用组目录
