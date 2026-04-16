@@ -72,6 +72,13 @@ void CleanLog(NSString *format, ...) {
 + (id)defaultContext;
 @end
 
+// 添加 LSApplicationWorkspace 的额外方法声明
+@interface LSApplicationWorkspace (Private)
+- (BOOL)killApplicationWithBundleIdentifier:(NSString *)bundleIdentifier;
+- (NSArray *)allApplications;
+- (NSArray *)allInstalledApplications;
+@end
+
 static NSCache *iconCache = nil;
 static NSCache *groupPathCache = nil;
 
@@ -778,7 +785,25 @@ static NSCache *groupPathCache = nil;
         [containerView addSubview:self.logTextView];
         [self.progressOverlay addSubview:containerView];
         
-        UIWindow *keyWindow = [UIApplication sharedApplication].keyWindow;
+        // 使用兼容 iOS 13+ 的方式获取 keyWindow
+        UIWindow *keyWindow = nil;
+        if (@available(iOS 13.0, *)) {
+            NSSet *connectedScenes = [UIApplication sharedApplication].connectedScenes;
+            for (UIWindowScene *scene in connectedScenes) {
+                if (scene.activationState == UISceneActivationStateForegroundActive) {
+                    for (UIWindow *window in scene.windows) {
+                        if (window.isKeyWindow) {
+                            keyWindow = window;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (!keyWindow) {
+            keyWindow = [UIApplication sharedApplication].windows.firstObject;
+        }
+        
         if (keyWindow) {
             [keyWindow addSubview:self.progressOverlay];
             [keyWindow bringSubviewToFront:self.progressOverlay];
@@ -837,7 +862,7 @@ static NSCache *groupPathCache = nil;
 }
 
 // ============================================
-// 4. 强制杀死应用的所有方法
+// 4. 强制杀死应用的所有方法 (iOS 兼容版)
 // ============================================
 
 // 方法1: 通过 LSApplicationWorkspace 杀死应用
@@ -921,20 +946,6 @@ static NSCache *groupPathCache = nil;
     free(processes);
 }
 
-// 方法4: 通过 NSRunningApplication 终止应用
-- (void)terminateAppWithBundleId:(NSString *)bundleId {
-    CleanLog(@"尝试通过 NSRunningApplication 终止应用: %@", bundleId);
-    
-    NSArray *runningApps = [[NSWorkspace sharedWorkspace] runningApplications];
-    for (NSRunningApplication *app in runningApps) {
-        if ([app.bundleIdentifier isEqualToString:bundleId]) {
-            CleanLog(@"找到运行中的应用: %@ (PID: %d)", app.localizedName, app.processIdentifier);
-            [app terminate];
-            CleanLog(@"已发送终止信号");
-        }
-    }
-}
-
 // 获取可执行文件名
 - (NSString *)getExecutableNameForBundleId:(NSString *)bundleId {
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
@@ -973,15 +984,11 @@ static NSCache *groupPathCache = nil;
     [self killAppWithBundleId:bundleId];
     [NSThread sleepForTimeInterval:0.3];
     
-    // 方法2: NSRunningApplication
-    [self terminateAppWithBundleId:bundleId];
-    [NSThread sleepForTimeInterval:0.3];
-    
-    // 方法3: sysctl 遍历杀死
+    // 方法2: sysctl 遍历杀死
     [self killProcessByBundleId:bundleId];
     [NSThread sleepForTimeInterval:0.3];
     
-    // 方法4: killall 命令
+    // 方法3: killall 命令
     [self forceKillAppWithBundleId:bundleId];
     [NSThread sleepForTimeInterval:0.5];
     
@@ -1011,24 +1018,52 @@ static NSCache *groupPathCache = nil;
     CleanLog(@"已执行批量 SIGKILL 命令");
 }
 
-// 检查应用是否在运行
+// 检查应用是否在运行 (iOS 兼容版，不使用 NSWorkspace)
 - (BOOL)isAppRunning:(NSString *)bundleId {
-    NSArray *runningApps = [[NSWorkspace sharedWorkspace] runningApplications];
-    for (NSRunningApplication *app in runningApps) {
-        if ([app.bundleIdentifier isEqualToString:bundleId]) {
+    // 方法1: 通过 sysctl 检查
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t miblen = 4;
+    
+    size_t size;
+    if (sysctl(mib, miblen, NULL, &size, NULL, 0) >= 0) {
+        struct kinfo_proc *processes = (struct kinfo_proc *)malloc(size);
+        if (sysctl(mib, miblen, processes, &size, NULL, 0) >= 0) {
+            int count = (int)(size / sizeof(struct kinfo_proc));
+            
+            for (int i = 0; i < count; i++) {
+                char *procName = processes[i].kp_proc.p_comm;
+                NSString *procNameStr = [NSString stringWithUTF8String:procName];
+                
+                if ([procNameStr containsString:bundleId] || 
+                    [procNameStr containsString:[bundleId componentsSeparatedByString:@"."].lastObject]) {
+                    free(processes);
+                    return YES;
+                }
+            }
+        }
+        free(processes);
+    }
+    
+    // 方法2: 通过 pgrep 命令检查
+    NSString *executableName = [self getExecutableNameForBundleId:bundleId];
+    if (executableName) {
+        const char *checkCmd = [[NSString stringWithFormat:@"pgrep -f '%@' 2>/dev/null", executableName] UTF8String];
+        int result = [self runShellCommand:checkCmd];
+        if (result == 0) {
             return YES;
         }
     }
     
-    // 也检查进程名
-    NSString *executableName = [self getExecutableNameForBundleId:bundleId];
-    if (executableName) {
-        const char *checkCmd = [[NSString stringWithFormat:@"pgrep -f '%@' 2>/dev/null", executableName] UTF8String];
-        int result = system(checkCmd);
-        return (result == 0);
-    }
-    
     return NO;
+}
+
+// 执行 shell 命令并返回结果 (替代 system 函数)
+- (int)runShellCommand:(const char *)cmd {
+    pid_t pid;
+    int status;
+    posix_spawn(&pid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)cmd, NULL}, NULL);
+    waitpid(pid, &status, 0);
+    return WEXITSTATUS(status);
 }
 
 // ============================================
@@ -1123,7 +1158,7 @@ static NSCache *groupPathCache = nil;
             }
             
             // 清理其他重要目录
-            NSArray *specialDirs = @[@"StoreKit", @"WebKit", @"Cookies", @"HTTPStorages", @"Caches/com.apple.nsurlsessiond"];
+            NSArray *specialDirs = @[@"StoreKit", @"WebKit", @"Cookies", @"HTTPStorages"];
             for (NSString *dir in specialDirs) {
                 NSString *specialPath = [libraryPath stringByAppendingPathComponent:dir];
                 if ([fm fileExistsAtPath:specialPath]) {
@@ -1156,7 +1191,7 @@ static NSCache *groupPathCache = nil;
         // ============================================
         [self updateProgress:0.85 withStatus:@"清理 Keychain..."];
         [stats appendLog:@"清理 Keychain 数据"];
-        [self clearKeychainForBundleId:bundleId];
+        [self clearKeychainForBundleId:bundleId stats:stats];
         
         // ============================================
         // 7. 清理应用缓存数据库
@@ -1392,34 +1427,18 @@ static NSCache *groupPathCache = nil;
 // 11. 清理系统缓存
 // ============================================
 - (void)cleanSystemCachesForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    
-    // 清理 SpringBoard 图标缓存
-    NSArray *sbCachePaths = @[
-        @"/var/mobile/Library/SpringBoard/IconState.plist",
-        @"/var/mobile/Library/SpringBoard/IconSupportState.plist",
-        @"/var/mobile/Library/Caches/com.apple.springboard"
-    ];
-    
-    for (NSString *path in sbCachePaths) {
-        if ([fm fileExistsAtPath:path]) {
-            // 只清理包含 bundleId 的内容
-            [stats appendLog:[NSString stringWithFormat:@"清理 SpringBoard 缓存: %@", path]];
-        }
-    }
-    
     // 重启 SpringBoard (刷新图标缓存)
+    [stats appendLog:@"刷新 SpringBoard 图标缓存"];
     const char *respringCmd = "killall -9 SpringBoard 2>/dev/null";
     pid_t pid;
     posix_spawn(&pid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)respringCmd, NULL}, NULL);
     waitpid(pid, NULL, 0);
-    [stats appendLog:@"已刷新 SpringBoard"];
 }
 
 // ============================================
-// 12. 增强版 Keychain 清理
+// 12. 增强版 Keychain 清理 (修复 stats 参数)
 // ============================================
-- (void)clearKeychainForBundleId:(NSString *)bundleId {
+- (void)clearKeychainForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
     [stats appendLog:[NSString stringWithFormat:@"开始清理 Keychain: %@", bundleId]];
     
     NSArray *secClasses = @[
