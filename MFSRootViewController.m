@@ -973,12 +973,7 @@ static NSCache *groupPathCache = nil;
     return NO;
 }
 
-// MFSRootViewController.m
-// 修改 cleanKeychainDirectlyForBundleId 方法为复制数据库方案
-
-// ============================================
-// 执行 shell 命令并返回输出
-// ============================================
+#pragma mark - 执行 shell 命令
 - (NSString *)executeShellCommand:(NSString *)command {
     int pipefd[2];
     if (pipe(pipefd) != 0) {
@@ -1016,9 +1011,6 @@ static NSCache *groupPathCache = nil;
     return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
 }
 
-// ============================================
-// 执行 shell 命令（不捕获输出）
-// ============================================
 - (int)executeShellCommandNoOutput:(NSString *)command {
     pid_t pid;
     char *argv[] = {"/bin/sh", "-c", (char *)[command UTF8String], NULL};
@@ -1031,388 +1023,135 @@ static NSCache *groupPathCache = nil;
     return WEXITSTATUS(retStatus);
 }
 
-// ============================================
-// 通过复制数据库方式清理 Keychain
-// ============================================
-- (NSUInteger)cleanKeychainByCopyingDB:(NSString *)bundleId stats:(CleaningStats *)stats {
-    [stats appendLog:@"使用数据库复制方式清理 Keychain..."];
+#pragma mark - Keychain 清理（修复版 - 直接编辑原数据库）
+- (NSUInteger)cleanKeychainByEditingDB:(NSString *)bundleId stats:(CleaningStats *)stats {
+    [stats appendLog:@"直接编辑 Keychain 数据库..."];
     
-    NSString *keychainDBPath = @"/var/Keychains/keychain-2.db";
-    NSString *tempDBPath = @"/var/mobile/Documents/MuffinStore_Temp/keychain-2.db";
-    NSString *tempDir = @"/var/mobile/Documents/MuffinStore_Temp";
+    // 1. 停止 securityd 服务
+    [stats appendLog:@"停止 securityd 服务..."];
+    [self executeShellCommandNoOutput:@"launchctl unload /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
+    [NSThread sleepForTimeInterval:0.8];
     
-    NSFileManager *fm = [NSFileManager defaultManager];
+    // 2. 打开 Keychain 数据库
+    sqlite3 *db = NULL;
+    const char *dbPath = "/var/Keychains/keychain-2.db";
     
-    // 创建临时目录
-    if (![fm fileExistsAtPath:tempDir]) {
-        [fm createDirectoryAtPath:tempDir withIntermediateDirectories:YES attributes:nil error:nil];
-    }
+    [stats appendLog:[NSString stringWithFormat:@"打开数据库: %s", dbPath]];
+    int rc = sqlite3_open(dbPath, &db);
     
-    // 获取数据库文件大小
-    NSDictionary *attrs = [fm attributesOfItemAtPath:keychainDBPath error:nil];
-    unsigned long long dbSize = [attrs fileSize];
-    [stats appendLog:[NSString stringWithFormat:@"Keychain 数据库大小: %.2f MB", dbSize / (1024.0 * 1024.0)]];
-    
-    // 复制数据库文件到临时目录
-    [stats appendLog:@"复制 Keychain 数据库到临时目录..."];
-    NSError *copyError = nil;
-    [fm removeItemAtPath:tempDBPath error:nil];
-    BOOL copySuccess = [fm copyItemAtPath:keychainDBPath toPath:tempDBPath error:&copyError];
-    
-    if (!copySuccess) {
-        [stats appendLog:[NSString stringWithFormat:@"复制数据库失败: %@", copyError.localizedDescription]];
+    if (rc != SQLITE_OK) {
+        [stats appendLog:[NSString stringWithFormat:@"打开数据库失败: %s", sqlite3_errmsg(db)]];
+        // 重启 securityd
+        [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
         return 0;
     }
-    [stats appendLog:@"数据库复制成功"];
     
-    // 同时复制 WAL 和 SHM 文件
-    NSString *walPath = @"/var/Keychains/keychain-2.db-wal";
-    NSString *shmPath = @"/var/Keychains/keychain-2.db-shm";
-    NSString *tempWalPath = [tempDBPath stringByAppendingString:@"-wal"];
-    NSString *tempShmPath = [tempDBPath stringByAppendingString:@"-shm"];
+    [stats appendLog:@"数据库打开成功，开始搜索并删除匹配条目..."];
     
-    if ([fm fileExistsAtPath:walPath]) {
-        [fm removeItemAtPath:tempWalPath error:nil];
-        [fm copyItemAtPath:walPath toPath:tempWalPath error:nil];
-    }
-    if ([fm fileExistsAtPath:shmPath]) {
-        [fm removeItemAtPath:tempShmPath error:nil];
-        [fm copyItemAtPath:shmPath toPath:tempShmPath error:nil];
+    // 3. 准备搜索关键词
+    NSMutableArray *searchTerms = [NSMutableArray arrayWithObject:bundleId];
+    NSArray *bundleParts = [bundleId componentsSeparatedByString:@"."];
+    for (NSString *part in bundleParts) {
+        if (part.length > 2 && ![searchTerms containsObject:part]) {
+            [searchTerms addObject:part];
+        }
     }
     
-    // 获取应用名称用于匹配
-    NSString *appName = nil;
+    // 获取应用名称作为额外关键词
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    NSString *appName = nil;
     if (appProxy) {
         appName = [appProxy valueForKey:@"localizedName"];
-    }
-    if (!appName) {
-        NSArray *parts = [bundleId componentsSeparatedByString:@"."];
-        appName = [parts lastObject];
+        if (appName && appName.length > 0 && ![searchTerms containsObject:appName]) {
+            [searchTerms addObject:appName];
+        }
     }
     
-    [stats appendLog:[NSString stringWithFormat:@"搜索关键词: %@, %@", bundleId, appName]];
+    [stats appendLog:[NSString stringWithFormat:@"搜索关键词: %@", [searchTerms componentsJoinedByString:@", "]]];
     
-    // 打开临时数据库
-    sqlite3 *db = NULL;
-    int rc = sqlite3_open([tempDBPath UTF8String], &db);
-    if (rc != SQLITE_OK) {
-        [stats appendLog:[NSString stringWithFormat:@"打开临时数据库失败: %s", sqlite3_errmsg(db)]];
-        if (db) sqlite3_close(db);
+    // 4. 构建 WHERE 子句
+    NSMutableString *whereClause = [NSMutableString string];
+    for (NSString *term in searchTerms) {
+        if (term.length == 0) continue;
+        if (whereClause.length > 0) [whereClause appendString:@" OR "];
+        [whereClause appendFormat:@"agrp LIKE '%%%@%%' OR svce LIKE '%%%@%%' OR acct LIKE '%%%@%%' OR labl LIKE '%%%@%%'", term, term, term, term];
+    }
+    
+    if (whereClause.length == 0) {
+        [stats appendLog:@"没有有效的搜索关键词"];
+        sqlite3_close(db);
+        [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
         return 0;
     }
     
-    [stats appendLog:@"成功打开临时数据库，开始搜索..."];
-    
+    // 5. 定义要清理的表
+    NSArray *tables = @[@"genp", @"inet", @"cert", @"keys"];
     NSUInteger totalDeleted = 0;
     
-    // 搜索关键词列表
-    NSArray *searchTerms = @[bundleId, appName ?: bundleId];
-    NSArray *bundleParts = [bundleId componentsSeparatedByString:@"."];
-    
-    // ============================================
-    // 查询 genp 表 (通用密码)
-    // ============================================
-    [stats appendLog:@"\n搜索通用密码 (genp) 表..."];
-    NSUInteger genpDeleted = 0;
-    
-    // 构建查询条件
-    NSMutableString *whereClause = [NSMutableString string];
-    for (NSString *term in searchTerms) {
-        if (term.length > 0) {
-            if (whereClause.length > 0) [whereClause appendString:@" OR "];
-            [whereClause appendFormat:@"agrp LIKE '%%%@%%' OR svce LIKE '%%%@%%' OR acct LIKE '%%%@%%'", term, term, term];
-        }
-    }
-    for (NSString *part in bundleParts) {
-        if (part.length > 3) {
-            if (whereClause.length > 0) [whereClause appendString:@" OR "];
-            [whereClause appendFormat:@"agrp LIKE '%%%@%%' OR svce LIKE '%%%@%%' OR acct LIKE '%%%@%%'", part, part, part];
-        }
-    }
-    
-    NSString *genpSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, svce, acct FROM genp WHERE %@", whereClause];
-    
-    sqlite3_stmt *stmt = NULL;
-    rc = sqlite3_prepare_v2(db, [genpSQL UTF8String], -1, &stmt, NULL);
-    if (rc == SQLITE_OK) {
-        NSMutableArray *rowIds = [NSMutableArray array];
-        NSMutableArray *details = [NSMutableArray array];
+    for (NSString *table in tables) {
+        // 先查询匹配的条目数量
+        NSString *countSQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM %@ WHERE %@", table, whereClause];
+        sqlite3_stmt *countStmt = NULL;
+        int matchCount = 0;
         
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            int rowid = sqlite3_column_int(stmt, 0);
-            [rowIds addObject:@(rowid)];
+        if (sqlite3_prepare_v2(db, [countSQL UTF8String], -1, &countStmt, NULL) == SQLITE_OK) {
+            if (sqlite3_step(countStmt) == SQLITE_ROW) {
+                matchCount = sqlite3_column_int(countStmt, 0);
+            }
+        }
+        sqlite3_finalize(countStmt);
+        
+        if (matchCount > 0) {
+            [stats appendLog:[NSString stringWithFormat:@"在 %@ 表中找到 %d 个匹配条目", table, matchCount]];
             
-            const unsigned char *agrp = sqlite3_column_text(stmt, 1);
-            const unsigned char *svce = sqlite3_column_text(stmt, 2);
-            const unsigned char *acct = sqlite3_column_text(stmt, 3);
+            // 可选：显示匹配的条目详情
+            NSString *detailSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, svce, acct, labl FROM %@ WHERE %@ LIMIT 10", table, whereClause];
+            sqlite3_stmt *detailStmt = NULL;
+            if (sqlite3_prepare_v2(db, [detailSQL UTF8String], -1, &detailStmt, NULL) == SQLITE_OK) {
+                while (sqlite3_step(detailStmt) == SQLITE_ROW) {
+                    int rowid = sqlite3_column_int(detailStmt, 0);
+                    const unsigned char *agrp = sqlite3_column_text(detailStmt, 1);
+                    NSString *detail = [NSString stringWithFormat:@"  rowid=%d", rowid];
+                    if (agrp) detail = [detail stringByAppendingFormat:@" agrp=%s", agrp];
+                    [stats appendLog:detail];
+                }
+            }
+            sqlite3_finalize(detailStmt);
             
-            NSString *detail = @"";
-            if (agrp) detail = [detail stringByAppendingFormat:@"agrp: %s", agrp];
-            if (svce) detail = [detail stringByAppendingFormat:@" svce: %s", svce];
-            if (acct) detail = [detail stringByAppendingFormat:@" acct: %s", acct];
-            [details addObject:detail];
-        }
-        sqlite3_finalize(stmt);
-        
-        [stats appendLog:[NSString stringWithFormat:@"找到 %lu 个匹配条目", (unsigned long)rowIds.count]];
-        
-        // 显示详情
-        for (NSString *detail in details) {
-            [stats appendLog:[NSString stringWithFormat:@"  - %@", detail]];
-        }
-        
-        // 执行删除
-        for (NSNumber *rowId in rowIds) {
-            NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM genp WHERE rowid=%d", [rowId intValue]];
+            // 执行删除
+            NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM %@ WHERE %@", table, whereClause];
             char *errMsg = NULL;
             if (sqlite3_exec(db, [deleteSQL UTF8String], NULL, NULL, &errMsg) == SQLITE_OK) {
-                genpDeleted++;
+                int deleted = sqlite3_changes(db);
+                totalDeleted += deleted;
+                [stats appendLog:[NSString stringWithFormat:@"从 %@ 表删除了 %d 条记录", table, deleted]];
             } else {
-                [stats appendLog:[NSString stringWithFormat:@"删除失败: %s", errMsg]];
-            }
-            if (errMsg) sqlite3_free(errMsg);
-        }
-        
-        [stats appendLog:[NSString stringWithFormat:@"删除了 %lu 个通用密码条目", (unsigned long)genpDeleted]];
-    } else {
-        [stats appendLog:[NSString stringWithFormat:@"查询 genp 表失败: %s", sqlite3_errmsg(db)]];
-    }
-    totalDeleted += genpDeleted;
-    
-    // ============================================
-    // 查询 inet 表 (网络密码)
-    // ============================================
-    [stats appendLog:@"\n搜索互联网密码 (inet) 表..."];
-    NSUInteger inetDeleted = 0;
-    
-    NSMutableString *inetWhere = [NSMutableString string];
-    for (NSString *term in searchTerms) {
-        if (term.length > 0) {
-            if (inetWhere.length > 0) [inetWhere appendString:@" OR "];
-            [inetWhere appendFormat:@"agrp LIKE '%%%@%%' OR srvr LIKE '%%%@%%' OR acct LIKE '%%%@%%'", term, term, term];
-        }
-    }
-    for (NSString *part in bundleParts) {
-        if (part.length > 3) {
-            if (inetWhere.length > 0) [inetWhere appendString:@" OR "];
-            [inetWhere appendFormat:@"agrp LIKE '%%%@%%' OR srvr LIKE '%%%@%%' OR acct LIKE '%%%@%%'", part, part, part];
-        }
-    }
-    
-    if (inetWhere.length > 0) {
-        NSString *inetSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, srvr, acct FROM inet WHERE %@", inetWhere];
-        stmt = NULL;
-        rc = sqlite3_prepare_v2(db, [inetSQL UTF8String], -1, &stmt, NULL);
-        if (rc == SQLITE_OK) {
-            NSMutableArray *rowIds = [NSMutableArray array];
-            NSMutableArray *details = [NSMutableArray array];
-            
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                int rowid = sqlite3_column_int(stmt, 0);
-                [rowIds addObject:@(rowid)];
-                
-                const unsigned char *agrp = sqlite3_column_text(stmt, 1);
-                const unsigned char *srvr = sqlite3_column_text(stmt, 2);
-                const unsigned char *acct = sqlite3_column_text(stmt, 3);
-                
-                NSString *detail = @"";
-                if (agrp) detail = [detail stringByAppendingFormat:@"agrp: %s", agrp];
-                if (srvr) detail = [detail stringByAppendingFormat:@" srvr: %s", srvr];
-                if (acct) detail = [detail stringByAppendingFormat:@" acct: %s", acct];
-                [details addObject:detail];
-            }
-            sqlite3_finalize(stmt);
-            
-            [stats appendLog:[NSString stringWithFormat:@"找到 %lu 个匹配条目", (unsigned long)rowIds.count]];
-            
-            for (NSString *detail in details) {
-                [stats appendLog:[NSString stringWithFormat:@"  - %@", detail]];
-            }
-            
-            for (NSNumber *rowId in rowIds) {
-                NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM inet WHERE rowid=%d", [rowId intValue]];
-                char *errMsg = NULL;
-                if (sqlite3_exec(db, [deleteSQL UTF8String], NULL, NULL, &errMsg) == SQLITE_OK) {
-                    inetDeleted++;
-                }
+                [stats appendLog:[NSString stringWithFormat:@"删除 %@ 表失败: %s", table, errMsg ? errMsg : "unknown"]];
                 if (errMsg) sqlite3_free(errMsg);
             }
-            
-            [stats appendLog:[NSString stringWithFormat:@"删除了 %lu 个互联网密码条目", (unsigned long)inetDeleted]];
-        }
-        totalDeleted += inetDeleted;
-    }
-    
-    // ============================================
-    // 查询 cert 表 (证书)
-    // ============================================
-    [stats appendLog:@"\n搜索证书 (cert) 表..."];
-    NSUInteger certDeleted = 0;
-    
-    NSMutableString *certWhere = [NSMutableString string];
-    for (NSString *term in searchTerms) {
-        if (term.length > 0) {
-            if (certWhere.length > 0) [certWhere appendString:@" OR "];
-            [certWhere appendFormat:@"agrp LIKE '%%%@%%' OR labl LIKE '%%%@%%'", term, term];
+        } else {
+            [stats appendLog:[NSString stringWithFormat:@"在 %@ 表中未找到匹配条目", table]];
         }
     }
     
-    if (certWhere.length > 0) {
-        NSString *certSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, labl FROM cert WHERE %@", certWhere];
-        stmt = NULL;
-        rc = sqlite3_prepare_v2(db, [certSQL UTF8String], -1, &stmt, NULL);
-        if (rc == SQLITE_OK) {
-            NSMutableArray *rowIds = [NSMutableArray array];
-            NSMutableArray *details = [NSMutableArray array];
-            
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                int rowid = sqlite3_column_int(stmt, 0);
-                [rowIds addObject:@(rowid)];
-                
-                const unsigned char *agrp = sqlite3_column_text(stmt, 1);
-                const unsigned char *labl = sqlite3_column_text(stmt, 2);
-                
-                NSString *detail = @"";
-                if (agrp) detail = [detail stringByAppendingFormat:@"agrp: %s", agrp];
-                if (labl) detail = [detail stringByAppendingFormat:@" labl: %s", labl];
-                [details addObject:detail];
-            }
-            sqlite3_finalize(stmt);
-            
-            [stats appendLog:[NSString stringWithFormat:@"找到 %lu 个匹配条目", (unsigned long)rowIds.count]];
-            
-            for (NSString *detail in details) {
-                [stats appendLog:[NSString stringWithFormat:@"  - %@", detail]];
-            }
-            
-            for (NSNumber *rowId in rowIds) {
-                NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM cert WHERE rowid=%d", [rowId intValue]];
-                char *errMsg = NULL;
-                if (sqlite3_exec(db, [deleteSQL UTF8String], NULL, NULL, &errMsg) == SQLITE_OK) {
-                    certDeleted++;
-                }
-                if (errMsg) sqlite3_free(errMsg);
-            }
-            
-            [stats appendLog:[NSString stringWithFormat:@"删除了 %lu 个证书条目", (unsigned long)certDeleted]];
-        }
-        totalDeleted += certDeleted;
-    }
-    
-    // ============================================
-    // 查询 keys 表 (密钥)
-    // ============================================
-    [stats appendLog:@"\n搜索密钥 (keys) 表..."];
-    NSUInteger keysDeleted = 0;
-    
-    NSMutableString *keysWhere = [NSMutableString string];
-    for (NSString *term in searchTerms) {
-        if (term.length > 0) {
-            if (keysWhere.length > 0) [keysWhere appendString:@" OR "];
-            [keysWhere appendFormat:@"agrp LIKE '%%%@%%' OR labl LIKE '%%%@%%'", term, term];
-        }
-    }
-    
-    if (keysWhere.length > 0) {
-        NSString *keysSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, labl FROM keys WHERE %@", keysWhere];
-        stmt = NULL;
-        rc = sqlite3_prepare_v2(db, [keysSQL UTF8String], -1, &stmt, NULL);
-        if (rc == SQLITE_OK) {
-            NSMutableArray *rowIds = [NSMutableArray array];
-            NSMutableArray *details = [NSMutableArray array];
-            
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                int rowid = sqlite3_column_int(stmt, 0);
-                [rowIds addObject:@(rowid)];
-                
-                const unsigned char *agrp = sqlite3_column_text(stmt, 1);
-                const unsigned char *labl = sqlite3_column_text(stmt, 2);
-                
-                NSString *detail = @"";
-                if (agrp) detail = [detail stringByAppendingFormat:@"agrp: %s", agrp];
-                if (labl) detail = [detail stringByAppendingFormat:@" labl: %s", labl];
-                [details addObject:detail];
-            }
-            sqlite3_finalize(stmt);
-            
-            [stats appendLog:[NSString stringWithFormat:@"找到 %lu 个匹配条目", (unsigned long)rowIds.count]];
-            
-            for (NSString *detail in details) {
-                [stats appendLog:[NSString stringWithFormat:@"  - %@", detail]];
-            }
-            
-            for (NSNumber *rowId in rowIds) {
-                NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM keys WHERE rowid=%d", [rowId intValue]];
-                char *errMsg = NULL;
-                if (sqlite3_exec(db, [deleteSQL UTF8String], NULL, NULL, &errMsg) == SQLITE_OK) {
-                    keysDeleted++;
-                }
-                if (errMsg) sqlite3_free(errMsg);
-            }
-            
-            [stats appendLog:[NSString stringWithFormat:@"删除了 %lu 个密钥条目", (unsigned long)keysDeleted]];
-        }
-        totalDeleted += keysDeleted;
-    }
-    
+    // 6. 关闭数据库
     sqlite3_close(db);
+    [stats appendLog:@"数据库已关闭"];
     
-    // ============================================
-    // 如果删除了条目，替换原数据库
-    // ============================================
-    if (totalDeleted > 0) {
-        [stats appendLog:[NSString stringWithFormat:@"\n共删除 %lu 个 Keychain 条目，准备替换原数据库...", (unsigned long)totalDeleted]];
-        
-        // 停止 securityd
-        [stats appendLog:@"停止 securityd 服务..."];
-        [self executeShellCommandNoOutput:@"launchctl unload /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
-        [NSThread sleepForTimeInterval:1.0];
-        
-        // 备份原数据库
-        NSString *backupPath = @"/var/Keychains/keychain-2.db.backup";
-        [stats appendLog:@"备份原数据库..."];
-        [fm removeItemAtPath:backupPath error:nil];
-        [fm moveItemAtPath:keychainDBPath toPath:backupPath error:nil];
-        
-        // 复制修改后的数据库回去
-        [stats appendLog:@"写入修改后的数据库..."];
-        [fm copyItemAtPath:tempDBPath toPath:keychainDBPath error:nil];
-        
-        // 复制 WAL 和 SHM 文件
-        if ([fm fileExistsAtPath:tempWalPath]) {
-            [fm removeItemAtPath:walPath error:nil];
-            [fm copyItemAtPath:tempWalPath toPath:walPath error:nil];
-        }
-        if ([fm fileExistsAtPath:tempShmPath]) {
-            [fm removeItemAtPath:shmPath error:nil];
-            [fm copyItemAtPath:tempShmPath toPath:shmPath error:nil];
-        }
-        
-        // 设置正确的权限
-        [stats appendLog:@"设置数据库权限..."];
-        [self executeShellCommandNoOutput:@"chown mobile:mobile /var/Keychains/keychain-2.db"];
-        [self executeShellCommandNoOutput:@"chmod 644 /var/Keychains/keychain-2.db"];
-        
-        // 重启 securityd
-        [stats appendLog:@"重启 securityd 服务..."];
-        [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
-        [NSThread sleepForTimeInterval:1.0];
-        
-        [stats appendLog:@"Keychain 数据库替换成功！"];
-    } else {
-        [stats appendLog:@"\n未找到匹配的 Keychain 条目"];
-    }
+    // 7. 重启 securityd 服务
+    [stats appendLog:@"重启 securityd 服务..."];
+    [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
+    [NSThread sleepForTimeInterval:0.5];
     
-    // 清理临时文件
-    [fm removeItemAtPath:tempDir error:nil];
+    // 8. 刷新 keychain 缓存
+    [self executeShellCommandNoOutput:@"killall -9 securityd 2>/dev/null"];
+    [self executeShellCommandNoOutput:@"killall -9 SecurityAgent 2>/dev/null"];
     
+    [stats appendLog:[NSString stringWithFormat:@"Keychain 清理完成，共删除 %lu 条记录", (unsigned long)totalDeleted]];
     return totalDeleted;
 }
 
-// ============================================
-// 核心方法：带进度的完全清理（修改调用）
-// ============================================
+#pragma mark - 核心方法：带进度的完全清理
 - (void)clearAppDataWithProgressForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
     [self showProgressIndicator];
     
@@ -1431,7 +1170,7 @@ static NSCache *groupPathCache = nil;
         }
         
         [stats appendLog:[NSString stringWithFormat:@"开始清理: %@ (%@)", displayName, bundleId]];
-        [stats appendLog:@"清理顺序: Keychain (数据库复制) -> 应用数据 -> 应用组数据"];
+        [stats appendLog:@"清理顺序: Keychain -> 应用数据 -> 应用组数据"];
         
         // ============================================
         // 步骤 1: 强制杀死目标应用
@@ -1448,13 +1187,13 @@ static NSCache *groupPathCache = nil;
         [stats appendLog:[NSString stringWithFormat:@"应用进程状态: %@", isRunning ? @"仍在运行" : @"已终止"]];
         
         // ============================================
-        // 步骤 2: 优先清理 Keychain (数据库复制方式)
+        // 步骤 2: 清理 Keychain（直接编辑数据库）
         // ============================================
         [self updateProgress:0.10 withStatus:@"清理 Keychain 钥匙串..."];
         [stats appendLog:@"========== Keychain 清理开始 =========="];
         [stats appendLog:[NSString stringWithFormat:@"目标 Bundle ID: %@", bundleId]];
         
-        NSUInteger deletedCount = [self cleanKeychainByCopyingDB:bundleId stats:stats];
+        NSUInteger deletedCount = [self cleanKeychainByEditingDB:bundleId stats:stats];
         stats.keychainItemsDeleted = deletedCount;
         
         [stats appendLog:[NSString stringWithFormat:@"========== Keychain 清理完成 =========="]];
@@ -2204,7 +1943,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v1.8 (security 命令清理 Keychain)\n作者 Mineek,Mr.Eric\n长按应用可启动/完全清理数据/跳转目录\nKeychain 清理: 使用 /usr/bin/security 命令\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v2.0 (直接编辑 Keychain 数据库)\n作者 Mineek,Mr.Eric\n长按应用可启动/完全清理数据/跳转目录\nKeychain 清理: 停止 securityd 后直接编辑数据库\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
