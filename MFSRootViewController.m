@@ -9,6 +9,7 @@
 #import <fcntl.h>
 #import <os/log.h>
 #import <sqlite3.h>
+#import <StoreKit/StoreKit.h>
 
 // ============================================
 // Tweak 任务文件路径
