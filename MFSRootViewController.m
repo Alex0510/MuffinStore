@@ -9,7 +9,6 @@
 #import <fcntl.h>
 #import <os/log.h>
 #import <sqlite3.h>
-#import <StoreKit/StoreKit.h>
 
 // ============================================
 // Tweak 任务文件路径
@@ -60,26 +59,30 @@ void CleanLog(NSString *format, ...) {
 @end
 
 // ============================================
-// SKUI 相关类 (保持原有下载功能)
+// SKUI 相关类 (使用运行时动态调用，避免链接错误)
 // ============================================
-@interface SKUIItemStateCenter : NSObject
-+ (id)defaultCenter;
-- (id)_newPurchasesWithItems:(id)items;
-- (void)_performPurchases:(id)purchases hasBundlePurchase:(_Bool)purchase withClientContext:(id)context completionBlock:(id /* block */)block;
-- (void)_performSoftwarePurchases:(id)purchases withClientContext:(id)context completionBlock:(id /* block */)block;
-@end
 
-@interface SKUIItem : NSObject
-- (id)initWithLookupDictionary:(id)dictionary;
-@end
+static Class SKUIItemStateCenterClass = nil;
+static Class SKUIItemClass = nil;
+static Class SKUIItemOfferClass = nil;
+static Class SKUIClientContextClass = nil;
 
-@interface SKUIItemOffer : NSObject
-- (id)initWithLookupDictionary:(id)dictionary;
-@end
-
-@interface SKUIClientContext : NSObject
-+ (id)defaultContext;
-@end
+// 延迟加载 SKUI 类
++ (void)loadSKUIClasses {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        SKUIItemStateCenterClass = NSClassFromString(@"SKUIItemStateCenter");
+        SKUIItemClass = NSClassFromString(@"SKUIItem");
+        SKUIItemOfferClass = NSClassFromString(@"SKUIItemOffer");
+        SKUIClientContextClass = NSClassFromString(@"SKUIClientContext");
+        
+        if (SKUIItemStateCenterClass) {
+            CleanLog(@"SKUI 类加载成功");
+        } else {
+            CleanLog(@"SKUI 类加载失败，下载功能可能不可用");
+        }
+    });
+}
 
 // 添加 LSApplicationWorkspace 的额外方法声明
 @interface LSApplicationWorkspace (Private)
@@ -112,6 +115,7 @@ static NSCache *groupPathCache = nil;
     if (self == [MFSRootViewController class]) {
         iconCache = [[NSCache alloc] init];
         groupPathCache = [[NSCache alloc] init];
+        [self loadSKUIClasses];
     }
 }
 
@@ -1040,6 +1044,61 @@ static NSCache *groupPathCache = nil;
     return WEXITSTATUS(retStatus);
 }
 
+#pragma mark - 下载功能（使用运行时动态调用）
+- (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId {
+    // 检查 SKUI 类是否可用
+    if (!SKUIItemOfferClass || !SKUIItemClass || !SKUIItemStateCenterClass || !SKUIClientContextClass) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showAlert:@"错误" message:@"当前系统不支持直接下载，请使用 ID 下载功能"];
+        });
+        return;
+    }
+    
+    NSString* adamId = [NSString stringWithFormat:@"%lld", appId];
+    NSString* pricingParameters = @"pricingParameter";
+    NSString* appExtVrsId = [NSString stringWithFormat:@"%lld", versionId];
+    NSString* installed = @"0";
+    NSString* offerString = nil;
+    if (versionId == 0) {
+        offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, installed];
+    } else {
+        offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&appExtVrsId=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, appExtVrsId, installed];
+    }
+    
+    @try {
+        NSDictionary* offerDict = @{@"buyParams": offerString};
+        NSDictionary* itemDict = @{@"_itemOffer": adamId};
+        
+        id offer = [[SKUIItemOfferClass alloc] performSelector:@selector(initWithLookupDictionary:) withObject:offerDict];
+        id item = [[SKUIItemClass alloc] performSelector:@selector(initWithLookupDictionary:) withObject:itemDict];
+        
+        [item setValue:offer forKey:@"_itemOffer"];
+        [item setValue:@"iosSoftware" forKey:@"_itemKindString"];
+        if(versionId != 0) {
+            [item setValue:@(versionId) forKey:@"_versionIdentifier"];
+        }
+        
+        id center = [SKUIItemStateCenterClass performSelector:@selector(defaultCenter)];
+        NSArray* items = @[item];
+        
+        SEL newPurchasesSel = NSSelectorFromString(@"_newPurchasesWithItems:");
+        SEL performPurchasesSel = NSSelectorFromString(@"_performPurchases:hasBundlePurchase:withClientContext:completionBlock:");
+        
+        if ([center respondsToSelector:newPurchasesSel] && [center respondsToSelector:performPurchasesSel]) {
+            id purchases = [center performSelector:newPurchasesSel withObject:items];
+            id context = [SKUIClientContextClass performSelector:@selector(defaultContext)];
+            
+            [center performSelector:performPurchasesSel withObject:purchases withObject:@0 withObject:context withObject:^(id arg1){}];
+        } else {
+            [self showAlert:@"错误" message:@"StoreKit 接口不可用"];
+        }
+    } @catch (NSException *exception) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showAlert:@"下载错误" message:exception.reason];
+        });
+    }
+}
+
 #pragma mark - 其他功能（保持原有）
 - (void)showAppDetails:(UIButton *)sender {
     NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
@@ -1166,7 +1225,6 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - 下载功能
 - (void)downloadAppShortcut:(PSSpecifier*)specifier {
     NSURL* bundleURL = [specifier propertyForKey:@"bundleURL"];
     NSDictionary* infoPlist = [NSDictionary dictionaryWithContentsOfFile:[bundleURL.path stringByAppendingPathComponent:@"Info.plist"]];
@@ -1339,33 +1397,6 @@ static NSCache *groupPathCache = nil;
     });
 }
 
-- (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId {
-    NSString* adamId = [NSString stringWithFormat:@"%lld", appId];
-    NSString* pricingParameters = @"pricingParameter";
-    NSString* appExtVrsId = [NSString stringWithFormat:@"%lld", versionId];
-    NSString* installed = @"0";
-    NSString* offerString = nil;
-    if (versionId == 0) {
-        offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, installed];
-    } else {
-        offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&appExtVrsId=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, appExtVrsId, installed];
-    }
-    NSDictionary* offerDict = @{@"buyParams": offerString};
-    NSDictionary* itemDict = @{@"_itemOffer": adamId};
-    SKUIItemOffer* offer = [[SKUIItemOffer alloc] initWithLookupDictionary:offerDict];
-    SKUIItem* item = [[SKUIItem alloc] initWithLookupDictionary:itemDict];
-    [item setValue:offer forKey:@"_itemOffer"];
-    [item setValue:@"iosSoftware" forKey:@"_itemKindString"];
-    if(versionId != 0) {
-        [item setValue:@(versionId) forKey:@"_versionIdentifier"];
-    }
-    SKUIItemStateCenter* center = [SKUIItemStateCenter defaultCenter];
-    NSArray* items = @[item];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [center _performPurchases:[center _newPurchasesWithItems:items] hasBundlePurchase:0 withClientContext:[SKUIClientContext defaultContext] completionBlock:^(id arg1){}];
-    });
-}
-
 - (void)downloadAppWithLink:(NSString*)link {
     NSString* targetAppIdParsed = nil;
     if([link containsString:@"id"]) {
@@ -1398,7 +1429,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v10.0 (Tweak 清理版)\n作者 Mineek,Mr.Eric\n长按应用选择「完全清理 (Tweak)」\n通过注入 Tweak 彻底清理 Keychain 和沙盒数据\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v11.0 (Tweak 清理版)\n作者 Mineek,Mr.Eric\n长按应用选择「完全清理 (Tweak)」\n通过注入 Tweak 彻底清理 Keychain 和沙盒数据\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
