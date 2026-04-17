@@ -1024,23 +1024,16 @@ static NSCache *groupPathCache = nil;
     return WEXITSTATUS(retStatus);
 }
 
-#pragma mark - Keychain 清理（使用 security 命令）
+#pragma mark - Keychain 清理（直接文件操作版）
 
 - (NSUInteger)cleanKeychainDirect:(NSString *)bundleId stats:(CleaningStats *)stats {
-    [stats appendLog:@"========== Keychain 清理（security 命令版）=========="];
+    [stats appendLog:@"========== Keychain 清理（直接文件操作版）=========="];
     [stats appendLog:[NSString stringWithFormat:@"目标 Bundle ID: %@", bundleId]];
     
     NSUInteger totalDeleted = 0;
     
-    // 获取应用信息
-    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
-    NSString *appName = nil;
-    if (appProxy) {
-        appName = [appProxy valueForKey:@"localizedName"];
-        [stats appendLog:[NSString stringWithFormat:@"应用名称: %@", appName]];
-    }
-    
     // 获取 Team ID
+    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     NSString *teamID = nil;
     if (appProxy) {
         @try {
@@ -1060,111 +1053,99 @@ static NSCache *groupPathCache = nil;
     [stats appendLog:[NSString stringWithFormat:@"完整 Access Group: %@", fullAccessGroup]];
     
     // ============================================
-    // 方法1: 使用 security dump-keychain 导出并删除
+    // 步骤1: 创建临时目录并复制数据库
     // ============================================
-    [stats appendLog:@"\n方法1: 使用 security 命令查找并删除..."];
+    [stats appendLog:@"\n步骤1: 准备临时数据库..."];
     
-    // 导出所有 keychain 条目
-    NSString *dumpCmd = @"/usr/bin/security dump-keychain 2>/dev/null";
-    NSString *dumpOutput = [self executeShellCommand:dumpCmd];
+    NSString *tempDir = @"/var/mobile/Documents/keychain_clean";
+    NSString *tempDbPath = [tempDir stringByAppendingPathComponent:@"keychain.db"];
     
-    if (dumpOutput && dumpOutput.length > 0) {
-        NSArray *lines = [dumpOutput componentsSeparatedByString:@"\n"];
-        NSMutableArray *matchedLines = [NSMutableArray array];
-        
-        for (NSString *line in lines) {
-            if ([line rangeOfString:bundleId options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                [line rangeOfString:appName options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                [line rangeOfString:teamID options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                [matchedLines addObject:line];
-                [stats appendLog:[NSString stringWithFormat:@"找到匹配: %@", line]];
-            }
+    // 清理旧临时文件
+    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"rm -rf %@", tempDir]];
+    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"mkdir -p %@", tempDir]];
+    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"chmod 777 %@", tempDir]];
+    
+    // 复制数据库（使用 cp 命令）
+    [stats appendLog:@"复制数据库文件..."];
+    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"cp /var/Keychains/keychain-2.db %@", tempDbPath]];
+    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"chmod 666 %@", tempDbPath]];
+    
+    // ============================================
+    // 步骤2: 使用 sqlite3 操作临时数据库
+    // ============================================
+    [stats appendLog:@"\n步骤2: 操作临时数据库..."];
+    
+    // 先查询看看有什么数据
+    NSString *querySQL = [NSString stringWithFormat:@"/usr/bin/sqlite3 \"%@\" \"SELECT rowid, agrp FROM genp LIMIT 10;\"", tempDbPath];
+    NSString *sampleData = [self executeShellCommand:querySQL];
+    [stats appendLog:[NSString stringWithFormat:@"数据库示例数据:\n%@", sampleData ?: @"(无数据)"]];
+
+    // 查询匹配的条目
+    NSString *countSQL = [NSString stringWithFormat:@"/usr/bin/sqlite3 \"%@\" \"SELECT COUNT(*) FROM genp WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", tempDbPath, bundleId, fullAccessGroup];
+    NSString *countResult = [self executeShellCommand:countSQL];
+    int matchCount = [countResult intValue];
+    
+    [stats appendLog:[NSString stringWithFormat:@"找到 %d 个匹配条目", matchCount]];
+    
+    if (matchCount > 0) {
+        // 显示匹配的条目
+        NSString *selectSQL = [NSString stringWithFormat:@"/usr/bin/sqlite3 \"%@\" \"SELECT rowid, agrp, svce, acct FROM genp WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", tempDbPath, bundleId, fullAccessGroup];
+        NSString *details = [self executeShellCommand:selectSQL];
+        if (details && details.length > 0) {
+            [stats appendLog:[NSString stringWithFormat:@"匹配条目:\n%@", details]];
         }
         
-        if (matchedLines.count > 0) {
-            [stats appendLog:[NSString stringWithFormat:@"找到 %lu 个匹配的 Keychain 条目", (unsigned long)matchedLines.count]];
-            totalDeleted = matchedLines.count;
-        }
+        // 执行删除
+        NSString *deleteSQL = [NSString stringWithFormat:@"/usr/bin/sqlite3 \"%@\" \"DELETE FROM genp WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", tempDbPath, bundleId, fullAccessGroup];
+        [self executeShellCommand:deleteSQL];
+        
+        // 删除其他表
+        [self executeShellCommand:[NSString stringWithFormat:@"/usr/bin/sqlite3 \"%@\" \"DELETE FROM inet WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", tempDbPath, bundleId, fullAccessGroup]];
+        [self executeShellCommand:[NSString stringWithFormat:@"/usr/bin/sqlite3 \"%@\" \"DELETE FROM cert WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", tempDbPath, bundleId, fullAccessGroup]];
+        [self executeShellCommand:[NSString stringWithFormat:@"/usr/bin/sqlite3 \"%@\" \"DELETE FROM keys WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", tempDbPath, bundleId, fullAccessGroup]];
+        
+        totalDeleted += matchCount;
+        [stats appendLog:[NSString stringWithFormat:@"✅ 已删除 %d 条记录", matchCount]];
+        
+        // ============================================
+        // 步骤3: 停止 securityd 并替换原数据库
+        // ============================================
+        [stats appendLog:@"\n步骤3: 停止 securityd 服务..."];
+        [self executeShellCommandNoOutput:@"launchctl unload /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
+        [NSThread sleepForTimeInterval:1.0];
+        
+        [stats appendLog:@"替换原数据库..."];
+        [self executeShellCommandNoOutput:[NSString stringWithFormat:@"cp -f %@ /var/Keychains/keychain-2.db", tempDbPath]];
+        [self executeShellCommandNoOutput:@"chmod 600 /var/Keychains/keychain-2.db"];
+        [self executeShellCommandNoOutput:@"chown root:wheel /var/Keychains/keychain-2.db"];
+        
+        // 同时删除 -wal 和 -shm 文件
+        [self executeShellCommandNoOutput:@"rm -f /var/Keychains/keychain-2.db-wal 2>/dev/null"];
+        [self executeShellCommandNoOutput:@"rm -f /var/Keychains/keychain-2.db-shm 2>/dev/null"];
+        
+        [stats appendLog:@"重启 securityd 服务..."];
+        [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
+        [NSThread sleepForTimeInterval:0.5];
     }
     
     // ============================================
-    // 方法2: 使用 security delete-generic-password 删除
+    // 步骤4: 清理临时文件
     // ============================================
-    [stats appendLog:@"\n方法2: 尝试删除通用密码..."];
-    
-    // 先查找所有通用密码
-    NSString *findCmd = [NSString stringWithFormat:@"/usr/bin/security find-generic-password -a '%@' 2>/dev/null", bundleId];
-    NSString *findResult = [self executeShellCommand:findCmd];
-    
-    if (findResult && findResult.length > 0) {
-        [stats appendLog:[NSString stringWithFormat:@"找到通用密码: %@", findResult]];
-        [self executeShellCommandNoOutput:[NSString stringWithFormat:@"/usr/bin/security delete-generic-password -a '%@' 2>/dev/null", bundleId]];
-        totalDeleted++;
-    }
-    
-    // 按服务名删除
-    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"/usr/bin/security delete-generic-password -s '%@' 2>/dev/null", bundleId]];
-    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"/usr/bin/security delete-generic-password -s '%@' 2>/dev/null", fullAccessGroup]];
+    [stats appendLog:@"\n步骤4: 清理临时文件..."];
+    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"rm -rf %@", tempDir]];
     
     // ============================================
-    // 方法3: 使用 security delete-internet-password 删除
+    // 步骤5: 验证
     // ============================================
-    [stats appendLog:@"\n方法3: 尝试删除互联网密码..."];
-    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"/usr/bin/security delete-internet-password -s '%@' 2>/dev/null", bundleId]];
-    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"/usr/bin/security delete-internet-password -a '%@' 2>/dev/null", bundleId]];
-    
-    // ============================================
-    // 方法4: 使用 security delete-certificate 删除证书
-    // ============================================
-    [stats appendLog:@"\n方法4: 尝试删除证书..."];
-    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"/usr/bin/security delete-certificate -c '%@' 2>/dev/null", bundleId]];
-    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"/usr/bin/security delete-certificate -c '%@' 2>/dev/null", appName]];
-    
-    // ============================================
-    // 方法5: 使用 sqlite3 但通过临时文件方式
-    // ============================================
-    [stats appendLog:@"\n方法5: 使用临时文件方式操作数据库..."];
-    
-    // 先恢复 securityd 以便正常访问
-    [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
-    [NSThread sleepForTimeInterval:0.5];
-    
-    // 创建临时脚本
-    NSString *scriptPath = @"/tmp/clean_keychain.sh";
-    NSString *scriptContent = [NSString stringWithFormat:
-        @"#!/bin/bash\n"
-        "echo '开始清理 Keychain...'\n"
-        "/usr/bin/security delete-generic-password -a '%@' 2>/dev/null\n"
-        "/usr/bin/security delete-generic-password -s '%@' 2>/dev/null\n"
-        "/usr/bin/security delete-generic-password -s '%@' 2>/dev/null\n"
-        "/usr/bin/security delete-internet-password -s '%@' 2>/dev/null\n"
-        "/usr/bin/security delete-certificate -c '%@' 2>/dev/null\n"
-        "/usr/bin/security delete-certificate -c '%@' 2>/dev/null\n"
-        "echo '清理完成'\n",
-        bundleId, bundleId, fullAccessGroup, bundleId, bundleId, appName ? appName : @""];
-    
-    [scriptContent writeToFile:scriptPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"chmod +x %@ && %@", scriptPath, scriptPath]];
-    [self executeShellCommandNoOutput:[NSString stringWithFormat:@"rm %@", scriptPath]];
-    
-    // ============================================
-    // 方法6: 使用 killall 重启相关服务
-    // ============================================
-    [stats appendLog:@"\n方法6: 刷新 Keychain 缓存..."];
-    [self executeShellCommandNoOutput:@"killall -9 securityd 2>/dev/null"];
-    [self executeShellCommandNoOutput:@"killall -9 SecurityAgent 2>/dev/null"];
-    [self executeShellCommandNoOutput:@"killall -9 cfprefsd 2>/dev/null"];
-    
-    // ============================================
-    // 最终验证
-    // ============================================
-    [stats appendLog:@"\n最终验证: 请重启应用后检查登录状态是否已清除"];
-    [stats appendLog:@"如果仍然有残留，建议:\n1. 重启设备\n2. 使用 Filza 手动删除 /var/Keychains/keychain-2.db 中的相关条目"];
+    [stats appendLog:@"\n步骤5: 验证结果..."];
+    [stats appendLog:@"请重启应用后检查登录状态是否已清除"];
     
     [stats appendLog:[NSString stringWithFormat:@"\n========== Keychain 清理完成 =========="]];
+    [stats appendLog:[NSString stringWithFormat:@"总计删除: %lu 条记录", (unsigned long)totalDeleted]];
     
-    return totalDeleted > 0 ? totalDeleted : 1;
+    return totalDeleted > 0 ? totalDeleted : (matchCount > 0 ? matchCount : 1);
 }
+
 #pragma mark - 核心方法：带进度的完全清理
 - (void)clearAppDataWithProgressForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
     [self showProgressIndicator];
