@@ -1021,7 +1021,7 @@ static NSCache *groupPathCache = nil;
     return WEXITSTATUS(retStatus);
 }
 
-#pragma mark - 下载功能（使用运行时动态调用）
+#pragma mark - 下载功能（使用运行时动态调用，避免链接错误）
 - (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId {
     NSString* adamId = [NSString stringWithFormat:@"%lld", appId];
     NSString* pricingParameters = @"pricingParameter";
@@ -1066,20 +1066,13 @@ static NSCache *groupPathCache = nil;
         SEL performPurchasesSel = NSSelectorFromString(@"_performPurchases:hasBundlePurchase:withClientContext:completionBlock:");
         
         if ([center respondsToSelector:newPurchasesSel] && [center respondsToSelector:performPurchasesSel]) {
+            // 使用 performSelector 但忽略警告
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
             id purchases = [center performSelector:newPurchasesSel withObject:items];
             id context = [SKUIClientContextClass performSelector:@selector(defaultContext)];
-            
-            // 使用 NSInvocation 避免 performSelector 警告
-            NSMethodSignature *sig = [center methodSignatureForSelector:performPurchasesSel];
-            NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:sig];
-            [invocation setTarget:center];
-            [invocation setSelector:performPurchasesSel];
-            [invocation setArgument:&purchases atIndex:2];
-            [invocation setArgument:&(NSNumber){0} atIndex:3];
-            [invocation setArgument:&context atIndex:4];
-            void (^block)(id) = ^(id arg1){};
-            [invocation setArgument:&block atIndex:5];
-            [invocation invoke];
+            [center performSelector:performPurchasesSel withObject:purchases withObject:@0 withObject:context withObject:^(id arg1){}];
+            #pragma clang diagnostic pop
         } else {
             [self showAlert:@"错误" message:@"StoreKit 接口不可用"];
         }
@@ -1360,7 +1353,7 @@ static NSCache *groupPathCache = nil;
 
 - (void)promptForVersionId:(long long)appId {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController* versionAlert = [UIAlertAlertController alertControllerWithTitle:@"版本ID" message:@"请输入要下载的应用版本ID" preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请输入要下载的应用版本ID" preferredStyle:UIAlertControllerStyleAlert];
         [versionAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
             textField.placeholder = @"版本ID";
         }];
