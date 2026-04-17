@@ -9,7 +9,6 @@
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     BOOL result = %orig;
     
-    // 检查是否有清理任务
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSFileManager *fm = [NSFileManager defaultManager];
         if ([fm fileExistsAtPath:TASK_FILE_PATH]) {
