@@ -1066,13 +1066,27 @@ static NSCache *groupPathCache = nil;
         SEL performPurchasesSel = NSSelectorFromString(@"_performPurchases:hasBundlePurchase:withClientContext:completionBlock:");
         
         if ([center respondsToSelector:newPurchasesSel] && [center respondsToSelector:performPurchasesSel]) {
-            // 使用 performSelector 但忽略警告
             #pragma clang diagnostic push
             #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
             id purchases = [center performSelector:newPurchasesSel withObject:items];
             id context = [SKUIClientContextClass performSelector:@selector(defaultContext)];
-            [center performSelector:performPurchasesSel withObject:purchases withObject:@0 withObject:context withObject:^(id arg1){}];
             #pragma clang diagnostic pop
+            
+            // 使用 NSInvocation 调用有5个参数的方法
+            NSMethodSignature *sig = [center methodSignatureForSelector:performPurchasesSel];
+            NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:sig];
+            [invocation setTarget:center];
+            [invocation setSelector:performPurchasesSel];
+            
+            // 参数索引: 0=self, 1=_cmd, 2=purchases, 3=hasBundlePurchase, 4=context, 5=completionBlock
+            [invocation setArgument:&purchases atIndex:2];
+            BOOL hasBundlePurchase = 0;
+            [invocation setArgument:&hasBundlePurchase atIndex:3];
+            [invocation setArgument:&context atIndex:4];
+            void (^completionBlock)(id) = ^(id arg1){};
+            [invocation setArgument:&completionBlock atIndex:5];
+            
+            [invocation invoke];
         } else {
             [self showAlert:@"错误" message:@"StoreKit 接口不可用"];
         }
