@@ -2,6 +2,8 @@
 ARCHS = arm64
 TARGET = iphone:clang:14.5:11.0
 
+INSTALL_TARGET_PROCESSES = MuffinStore
+
 include $(THEOS)/makefiles/common.mk
 
 # Tweak 配置（注入到所有应用）
@@ -15,9 +17,10 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 # 主应用配置
 APPLICATION_NAME = MuffinStore
 MuffinStore_FILES = main.m MFSAppDelegate.m MFSRootViewController.m
-MuffinStore_FRAMEWORKS = UIKit Foundation CoreGraphics Security
+MuffinStore_FRAMEWORKS = UIKit Foundation CoreGraphics Security CoreServices StoreKit
 MuffinStore_CFLAGS = -fobjc-arc
 MuffinStore_CODESIGN_FLAGS = -Sentitlements.plist
+MuffinStore_PRIVATE_FRAMEWORKS = 
 
 include $(THEOS_MAKE_PATH)/application.mk
 
