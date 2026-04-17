@@ -20,7 +20,6 @@ MuffinStore_FILES = main.m MFSAppDelegate.m MFSRootViewController.m
 MuffinStore_FRAMEWORKS = UIKit Foundation CoreGraphics Security StoreKit
 MuffinStore_CFLAGS = -fobjc-arc
 MuffinStore_CODESIGN_FLAGS = -Sentitlements.plist
-MuffinStore_LDFLAGS = -undefined dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/application.mk
 
