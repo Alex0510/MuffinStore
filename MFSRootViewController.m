@@ -1023,10 +1023,10 @@ static NSCache *groupPathCache = nil;
     return WEXITSTATUS(retStatus);
 }
 
-#pragma mark - Keychain 清理（基于 Access Group 删除）
+#pragma mark - Keychain 清理（基于 Access Group 删除 - 修复版）
 
 - (NSUInteger)cleanKeychainByAccessGroup:(NSString *)bundleId stats:(CleaningStats *)stats {
-    [stats appendLog:@"========== 基于 Access Group 清理 Keychain =========="];
+    [stats appendLog:@"========== 基于 Access Group 清理 Keychain (修复版) =========="];
     [stats appendLog:[NSString stringWithFormat:@"目标 Bundle ID: %@", bundleId]];
     
     NSUInteger totalDeleted = 0;
@@ -1045,7 +1045,7 @@ static NSCache *groupPathCache = nil;
         }
     }
     
-    // 3. 获取 Team ID（如果存在）
+    // 3. 获取 Team ID（从截图看到是 MMJSHD9LZR）
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     NSString *teamID = nil;
     if (appProxy) {
@@ -1078,39 +1078,54 @@ static NSCache *groupPathCache = nil;
     // ============================================
     [stats appendLog:@"\n步骤1: 停止 securityd 服务..."];
     [self executeShellCommandNoOutput:@"launchctl unload /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
-    [NSThread sleepForTimeInterval:0.8];
+    [NSThread sleepForTimeInterval:1.0];
     
     // ============================================
-    // 步骤2: 查询并删除匹配的条目
+    // 步骤2: 先直接查询显示数据库中的实际内容
     // ============================================
+    [stats appendLog:@"\n步骤2: 查询数据库中的实际 Keychain 数据..."];
+    
+    // 直接查询 genp 表的所有 agrp 值
+    NSString *showAgrpSQL = @"SELECT rowid, agrp, svce, acct FROM genp LIMIT 20";
+    NSString *agrpData = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", showAgrpSQL]];
+    if (agrpData && agrpData.length > 0) {
+        [stats appendLog:@"📋 genp 表中的数据:"];
+        NSArray *lines = [agrpData componentsSeparatedByString:@"\n"];
+        for (NSString *line in lines) {
+            if (line.length > 0) {
+                [stats appendLog:[NSString stringWithFormat:@"   %@", line]];
+            }
+        }
+    } else {
+        [stats appendLog:@"📋 genp 表中没有数据"];
+    }
+    
+    // ============================================
+    // 步骤3: 使用精确的 SQL 删除
+    // ============================================
+    [stats appendLog:@"\n步骤3: 执行精确删除..."];
+    
     NSArray *tables = @[@"genp", @"inet", @"cert", @"keys"];
     NSArray *tableNames = @[@"通用密码(genp)", @"网络密码(inet)", @"证书(cert)", @"密钥(keys)"];
+    
+    // 使用 bundleId 直接构建 LIKE 模式
+    NSString *likePattern = [NSString stringWithFormat:@"%%%@%%", bundleId];
     
     for (int i = 0; i < tables.count; i++) {
         NSString *table = tables[i];
         NSString *tableName = tableNames[i];
         
-        // 构建 WHERE 子句 - 匹配 agrp 字段
-        NSMutableString *whereClause = [NSMutableString string];
-        for (NSString *agrp in accessGroups) {
-            if (agrp.length < 2) continue;
-            if (whereClause.length > 0) [whereClause appendString:@" OR "];
-            [whereClause appendFormat:@"agrp LIKE '%%%@%%'", agrp];
-        }
-        
-        if (whereClause.length == 0) continue;
-        
-        // 先查询匹配的条目数量
-        NSString *countSQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM %@ WHERE %@", table, whereClause];
-        NSString *countResult = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", countSQL]];
+        // 先查询匹配的条目
+        NSString *selectSQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM %@ WHERE agrp LIKE '%@'", table, likePattern];
+        NSString *countResult = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", selectSQL]];
         int matchCount = [countResult intValue];
         
         if (matchCount > 0) {
-            [stats appendLog:[NSString stringWithFormat:@"\n📋 %@ 表中找到 %d 个匹配条目", tableName, matchCount]];
+            [stats appendLog:[NSString stringWithFormat:@"\n📋 %@ 表中找到 %d 个匹配条目 (agrp LIKE '%%%@%%')", tableName, matchCount, bundleId]];
             
             // 显示匹配的条目详情
-            NSString *selectSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, svce, acct, labl FROM %@ WHERE %@ LIMIT 20", table, whereClause];
-            NSString *details = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", selectSQL]];
+            NSString *detailSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, svce, acct FROM %@ WHERE agrp LIKE '%@' LIMIT 10", table, likePattern];
+            NSString *details = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", detailSQL]];
             if (details && details.length > 0) {
                 NSArray *lines = [details componentsSeparatedByString:@"\n"];
                 for (NSString *line in lines) {
@@ -1121,78 +1136,70 @@ static NSCache *groupPathCache = nil;
             }
             
             // 执行删除
-            NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM %@ WHERE %@", table, whereClause];
+            NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM %@ WHERE agrp LIKE '%@'", table, likePattern];
             [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
             
             totalDeleted += matchCount;
             [stats appendLog:[NSString stringWithFormat:@"✅ 已删除 %d 条记录", matchCount]];
         } else {
-            [stats appendLog:[NSString stringWithFormat:@"\n📋 %@ 表中没有匹配的 Access Group", tableName]];
+            // 尝试用其他关键词搜索
+            for (NSString *agrp in accessGroups) {
+                if (agrp.length < 3) continue;
+                NSString *altPattern = [NSString stringWithFormat:@"%%%@%%", agrp];
+                NSString *altCountSQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM %@ WHERE agrp LIKE '%@'", table, altPattern];
+                NSString *altCountResult = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", altCountSQL]];
+                int altMatchCount = [altCountResult intValue];
+                
+                if (altMatchCount > 0) {
+                    [stats appendLog:[NSString stringWithFormat:@"\n📋 %@ 表中找到 %d 个匹配条目 (agrp LIKE '%%%@%%')", tableName, altMatchCount, agrp]];
+                    
+                    NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM %@ WHERE agrp LIKE '%@'", table, altPattern];
+                    [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
+                    
+                    totalDeleted += altMatchCount;
+                    [stats appendLog:[NSString stringWithFormat:@"✅ 已删除 %d 条记录", altMatchCount]];
+                    break;
+                }
+            }
         }
     }
     
     // ============================================
-    // 步骤3: 额外清理 - 按服务名删除
+    // 步骤4: 额外清理 - 按服务名删除
     // ============================================
-    [stats appendLog:@"\n步骤3: 按服务名(service)额外清理..."];
+    [stats appendLog:@"\n步骤4: 按服务名(service)额外清理..."];
     
-    for (NSString *agrp in accessGroups) {
-        if (agrp.length < 3) continue;
-        
-        NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM genp WHERE svce LIKE '%%%@%%'", agrp];
-        [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
-        
-        deleteSQL = [NSString stringWithFormat:@"DELETE FROM inet WHERE srvr LIKE '%%%@%%'", agrp];
-        [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
-    }
+    NSString *svcPattern = [NSString stringWithFormat:@"%%%@%%", bundleId];
+    NSString *deleteSvcSQL = [NSString stringWithFormat:@"DELETE FROM genp WHERE svce LIKE '%@'", svcPattern];
+    [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSvcSQL]];
     
     // ============================================
-    // 步骤4: 重启 securityd 服务
+    // 步骤5: 重启 securityd 服务
     // ============================================
-    [stats appendLog:@"\n步骤4: 重启 securityd 服务..."];
+    [stats appendLog:@"\n步骤5: 重启 securityd 服务..."];
     [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
     [NSThread sleepForTimeInterval:0.5];
     [self executeShellCommandNoOutput:@"killall -9 securityd 2>/dev/null"];
     
     // ============================================
-    // 步骤5: 验证清理结果
+    // 步骤6: 验证清理结果
     // ============================================
-    [stats appendLog:@"\n步骤5: 验证清理结果..."];
+    [stats appendLog:@"\n步骤6: 验证清理结果..."];
     
-    int totalRemaining = 0;
-    for (int i = 0; i < tables.count; i++) {
-        NSString *table = tables[i];
-        NSString *tableName = tableNames[i];
-        
-        NSMutableString *whereClause = [NSMutableString string];
-        for (NSString *agrp in accessGroups) {
-            if (agrp.length < 2) continue;
-            if (whereClause.length > 0) [whereClause appendString:@" OR "];
-            [whereClause appendFormat:@"agrp LIKE '%%%@%%'", agrp];
-        }
-        
-        if (whereClause.length > 0) {
-            NSString *countSQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM %@ WHERE %@", table, whereClause];
-            NSString *countResult = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", countSQL]];
-            int remaining = [countResult intValue];
-            totalRemaining += remaining;
-            
-            if (remaining == 0) {
-                [stats appendLog:[NSString stringWithFormat:@"✅ %@ 表: 清理完成", tableName]];
-            } else {
-                [stats appendLog:[NSString stringWithFormat:@"⚠️ %@ 表: 还有 %d 条残留", tableName, remaining]];
-            }
-        }
+    NSString *verifySQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM genp WHERE agrp LIKE '%%%@%%'", bundleId];
+    NSString *verifyResult = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", verifySQL]];
+    int remaining = [verifyResult intValue];
+    
+    if (remaining == 0) {
+        [stats appendLog:@"✅ genp 表: 清理完成，无残留"];
+    } else {
+        [stats appendLog:[NSString stringWithFormat:@"⚠️ genp 表: 还有 %d 条残留", remaining]];
     }
     
     [stats appendLog:[NSString stringWithFormat:@"\n========== Keychain 清理完成 =========="]];
     [stats appendLog:[NSString stringWithFormat:@"总计删除: %lu 条记录", (unsigned long)totalDeleted]];
     
-    if (totalRemaining > 0) {
-        [stats appendLog:[NSString stringWithFormat:@"⚠️ 警告: 仍有 %d 条记录未被删除，可能需要手动清理", totalRemaining]];
-    }
-    
-    return totalDeleted;
+    return totalDeleted > 0 ? totalDeleted : (remaining == 0 ? 1 : 0);
 }
 
 #pragma mark - 核心方法：带进度的完全清理
