@@ -1023,200 +1023,176 @@ static NSCache *groupPathCache = nil;
     return WEXITSTATUS(retStatus);
 }
 
-#pragma mark - Keychain 清理（终极版 - 直接操作数据库）
+#pragma mark - Keychain 清理（基于 Access Group 删除）
 
-- (NSUInteger)cleanKeychainDirectSQL:(NSString *)bundleId stats:(CleaningStats *)stats {
-    [stats appendLog:@"========== 终极版 Keychain 清理（直接操作数据库）=========="];
+- (NSUInteger)cleanKeychainByAccessGroup:(NSString *)bundleId stats:(CleaningStats *)stats {
+    [stats appendLog:@"========== 基于 Access Group 清理 Keychain =========="];
     [stats appendLog:[NSString stringWithFormat:@"目标 Bundle ID: %@", bundleId]];
     
     NSUInteger totalDeleted = 0;
     
-    // 准备搜索关键词
-    NSMutableArray *searchKeywords = [NSMutableArray array];
-    [searchKeywords addObject:bundleId];
+    // 准备所有可能的 Access Group 模式
+    NSMutableArray *accessGroups = [NSMutableArray array];
     
-    NSArray *bundleParts = [bundleId componentsSeparatedByString:@"."];
-    for (NSString *part in bundleParts) {
-        if (part.length > 0 && ![searchKeywords containsObject:part]) {
-            [searchKeywords addObject:part];
+    // 1. 完整的 Bundle ID
+    [accessGroups addObject:bundleId];
+    
+    // 2. Bundle ID 的各个部分
+    NSArray *parts = [bundleId componentsSeparatedByString:@"."];
+    for (NSString *part in parts) {
+        if (part.length > 0) {
+            [accessGroups addObject:part];
         }
     }
     
+    // 3. 获取 Team ID（如果存在）
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
+    NSString *teamID = nil;
+    if (appProxy) {
+        @try {
+            teamID = [appProxy valueForKey:@"teamIdentifier"];
+            if (teamID && teamID.length > 0) {
+                [accessGroups addObject:teamID];
+                [accessGroups addObject:[NSString stringWithFormat:@"%@.%@", teamID, bundleId]];
+            }
+        } @catch (NSException *e) {}
+    }
+    
+    // 4. 应用名称
     NSString *appName = nil;
     if (appProxy) {
         appName = [appProxy valueForKey:@"localizedName"];
-        if (appName && appName.length > 0 && ![searchKeywords containsObject:appName]) {
-            [searchKeywords addObject:appName];
+        if (appName && appName.length > 0) {
+            [accessGroups addObject:appName];
         }
     }
     
-    [searchKeywords addObject:[bundleId stringByReplacingOccurrencesOfString:@"." withString:@""]];
+    // 5. 其他常见格式
+    [accessGroups addObject:[bundleId stringByReplacingOccurrencesOfString:@"." withString:@""]];
+    [accessGroups addObject:[[bundleId componentsSeparatedByString:@"."] lastObject]];
     
-    [stats appendLog:[NSString stringWithFormat:@"搜索关键词: %@", [searchKeywords componentsJoinedByString:@", "]]];
+    [stats appendLog:[NSString stringWithFormat:@"搜索的 Access Group 模式: %@", [accessGroups componentsJoinedByString:@", "]]];
     
     // ============================================
     // 步骤1: 停止 securityd 服务
     // ============================================
     [stats appendLog:@"\n步骤1: 停止 securityd 服务..."];
     [self executeShellCommandNoOutput:@"launchctl unload /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
-    [NSThread sleepForTimeInterval:1.0];
+    [NSThread sleepForTimeInterval:0.8];
     
     // ============================================
-    // 步骤2: 备份数据库
+    // 步骤2: 查询并删除匹配的条目
     // ============================================
-    [stats appendLog:@"步骤2: 备份数据库..."];
-    [self executeShellCommandNoOutput:@"cp /var/Keychains/keychain-2.db /var/Keychains/keychain-2.db.backup 2>/dev/null"];
-    
-    // ============================================
-    // 步骤3: 构建 WHERE 子句
-    // ============================================
-    NSMutableString *whereClause = [NSMutableString string];
-    for (NSString *keyword in searchKeywords) {
-        if (keyword.length == 0) continue;
-        if (whereClause.length > 0) [whereClause appendString:@" OR "];
-        [whereClause appendFormat:@"(agrp LIKE '%%%@%%' OR svce LIKE '%%%@%%' OR acct LIKE '%%%@%%' OR labl LIKE '%%%@%%' OR srvr LIKE '%%%@%%')", 
-         keyword, keyword, keyword, keyword, keyword];
-    }
-    
-    if (whereClause.length == 0) {
-        [stats appendLog:@"错误: 没有有效的搜索关键词"];
-        [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
-        return 0;
-    }
-    
-    // 定义要清理的表
     NSArray *tables = @[@"genp", @"inet", @"cert", @"keys"];
     NSArray *tableNames = @[@"通用密码(genp)", @"网络密码(inet)", @"证书(cert)", @"密钥(keys)"];
     
-    // ============================================
-    // 步骤4: 查询并显示匹配的条目
-    // ============================================
-    [stats appendLog:@"\n步骤3: 查询匹配的 Keychain 条目..."];
-    
     for (int i = 0; i < tables.count; i++) {
         NSString *table = tables[i];
         NSString *tableName = tableNames[i];
         
-        NSString *selectSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, svce, acct, labl, srvr FROM %@ WHERE %@ LIMIT 50", table, whereClause];
-        NSString *output = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", selectSQL]];
+        // 构建 WHERE 子句 - 匹配 agrp 字段
+        NSMutableString *whereClause = [NSMutableString string];
+        for (NSString *agrp in accessGroups) {
+            if (agrp.length < 2) continue;
+            if (whereClause.length > 0) [whereClause appendString:@" OR "];
+            [whereClause appendFormat:@"agrp LIKE '%%%@%%'", agrp];
+        }
         
-        if (output && output.length > 0) {
-            NSArray *lines = [output componentsSeparatedByString:@"\n"];
-            [stats appendLog:[NSString stringWithFormat:@"\n📋 %@ 表中找到 %lu 个匹配条目:", tableName, (unsigned long)lines.count]];
-            for (NSString *line in lines) {
-                if (line.length > 0) {
-                    [stats appendLog:[NSString stringWithFormat:@"   %@", line]];
+        if (whereClause.length == 0) continue;
+        
+        // 先查询匹配的条目数量
+        NSString *countSQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM %@ WHERE %@", table, whereClause];
+        NSString *countResult = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", countSQL]];
+        int matchCount = [countResult intValue];
+        
+        if (matchCount > 0) {
+            [stats appendLog:[NSString stringWithFormat:@"\n📋 %@ 表中找到 %d 个匹配条目", tableName, matchCount]];
+            
+            // 显示匹配的条目详情
+            NSString *selectSQL = [NSString stringWithFormat:@"SELECT rowid, agrp, svce, acct, labl FROM %@ WHERE %@ LIMIT 20", table, whereClause];
+            NSString *details = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", selectSQL]];
+            if (details && details.length > 0) {
+                NSArray *lines = [details componentsSeparatedByString:@"\n"];
+                for (NSString *line in lines) {
+                    if (line.length > 0) {
+                        [stats appendLog:[NSString stringWithFormat:@"   %@", line]];
+                    }
                 }
             }
-        } else {
-            [stats appendLog:[NSString stringWithFormat:@"\n📋 %@ 表中没有找到匹配条目", tableName]];
-        }
-    }
-    
-    // ============================================
-    // 步骤5: 执行删除操作
-    // ============================================
-    [stats appendLog:@"\n步骤4: 执行删除操作..."];
-    
-    for (int i = 0; i < tables.count; i++) {
-        NSString *table = tables[i];
-        NSString *tableName = tableNames[i];
-        
-        // 先统计删除前的数量
-        NSString *countBeforeSQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM %@ WHERE %@", table, whereClause];
-        NSString *countBeforeStr = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", countBeforeSQL]];
-        int before = [countBeforeStr intValue];
-        
-        if (before > 0) {
+            
             // 执行删除
             NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM %@ WHERE %@", table, whereClause];
             [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
             
-            // 验证删除结果
-            NSString *countAfterStr = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", countBeforeSQL]];
-            int after = [countAfterStr intValue];
-            
-            int deleted = before - after;
-            if (deleted > 0) {
-                totalDeleted += deleted;
-                [stats appendLog:[NSString stringWithFormat:@"✅ %@ 表: 删除了 %d 条记录", tableName, deleted]];
-            } else {
-                [stats appendLog:[NSString stringWithFormat:@"⚠️ %@ 表: 尝试删除但未成功", tableName]];
-            }
+            totalDeleted += matchCount;
+            [stats appendLog:[NSString stringWithFormat:@"✅ 已删除 %d 条记录", matchCount]];
+        } else {
+            [stats appendLog:[NSString stringWithFormat:@"\n📋 %@ 表中没有匹配的 Access Group", tableName]];
         }
     }
     
     // ============================================
-    // 步骤6: 激进模式 - 按单个关键词删除
+    // 步骤3: 额外清理 - 按服务名删除
     // ============================================
-    [stats appendLog:@"\n步骤5: 执行激进模式清理..."];
+    [stats appendLog:@"\n步骤3: 按服务名(service)额外清理..."];
     
-    for (NSString *keyword in searchKeywords) {
-        if (keyword.length < 3) continue;
+    for (NSString *agrp in accessGroups) {
+        if (agrp.length < 3) continue;
         
-        for (NSString *table in tables) {
-            // 按 agrp 删除
-            NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM %@ WHERE agrp LIKE '%%%@%%'", table, keyword];
-            [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
-            
-            // 按 svce 删除 (genp)
-            if ([table isEqualToString:@"genp"]) {
-                deleteSQL = [NSString stringWithFormat:@"DELETE FROM genp WHERE svce LIKE '%%%@%%'", keyword];
-                [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
-            }
-            
-            // 按 acct 删除
-            deleteSQL = [NSString stringWithFormat:@"DELETE FROM %@ WHERE acct LIKE '%%%@%%'", table, keyword];
-            [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
-            
-            // 按 labl 删除 (cert, keys)
-            if ([table isEqualToString:@"cert"] || [table isEqualToString:@"keys"]) {
-                deleteSQL = [NSString stringWithFormat:@"DELETE FROM %@ WHERE labl LIKE '%%%@%%'", table, keyword];
-                [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
-            }
-            
-            // 按 srvr 删除 (inet)
-            if ([table isEqualToString:@"inet"]) {
-                deleteSQL = [NSString stringWithFormat:@"DELETE FROM inet WHERE srvr LIKE '%%%@%%'", keyword];
-                [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
-            }
-        }
-        [stats appendLog:[NSString stringWithFormat:@"深度清理关键词: %@", keyword]];
+        NSString *deleteSQL = [NSString stringWithFormat:@"DELETE FROM genp WHERE svce LIKE '%%%@%%'", agrp];
+        [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
+        
+        deleteSQL = [NSString stringWithFormat:@"DELETE FROM inet WHERE srvr LIKE '%%%@%%'", agrp];
+        [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", deleteSQL]];
     }
     
     // ============================================
-    // 步骤7: 重启 securityd 服务
+    // 步骤4: 重启 securityd 服务
     // ============================================
-    [stats appendLog:@"\n步骤6: 重启 securityd 服务..."];
+    [stats appendLog:@"\n步骤4: 重启 securityd 服务..."];
     [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
     [NSThread sleepForTimeInterval:0.5];
     [self executeShellCommandNoOutput:@"killall -9 securityd 2>/dev/null"];
     
     // ============================================
-    // 步骤8: 验证最终结果
+    // 步骤5: 验证清理结果
     // ============================================
-    [stats appendLog:@"\n步骤7: 验证清理结果..."];
+    [stats appendLog:@"\n步骤5: 验证清理结果..."];
     
+    int totalRemaining = 0;
     for (int i = 0; i < tables.count; i++) {
         NSString *table = tables[i];
         NSString *tableName = tableNames[i];
         
-        NSString *countSQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM %@ WHERE %@", table, whereClause];
-        NSString *remainingStr = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", countSQL]];
-        int remainingCount = [remainingStr intValue];
+        NSMutableString *whereClause = [NSMutableString string];
+        for (NSString *agrp in accessGroups) {
+            if (agrp.length < 2) continue;
+            if (whereClause.length > 0) [whereClause appendString:@" OR "];
+            [whereClause appendFormat:@"agrp LIKE '%%%@%%'", agrp];
+        }
         
-        if (remainingCount == 0) {
-            [stats appendLog:[NSString stringWithFormat:@"✅ %@ 表: 清理完成，无残留", tableName]];
-        } else {
-            [stats appendLog:[NSString stringWithFormat:@"⚠️ %@ 表: 还有 %d 条残留", tableName, remainingCount]];
+        if (whereClause.length > 0) {
+            NSString *countSQL = [NSString stringWithFormat:@"SELECT COUNT(*) FROM %@ WHERE %@", table, whereClause];
+            NSString *countResult = [self executeShellCommand:[NSString stringWithFormat:@"sqlite3 /var/Keychains/keychain-2.db \"%@\" 2>/dev/null", countSQL]];
+            int remaining = [countResult intValue];
+            totalRemaining += remaining;
+            
+            if (remaining == 0) {
+                [stats appendLog:[NSString stringWithFormat:@"✅ %@ 表: 清理完成", tableName]];
+            } else {
+                [stats appendLog:[NSString stringWithFormat:@"⚠️ %@ 表: 还有 %d 条残留", tableName, remaining]];
+            }
         }
     }
     
     [stats appendLog:[NSString stringWithFormat:@"\n========== Keychain 清理完成 =========="]];
-    [stats appendLog:[NSString stringWithFormat:@"总计删除记录: %lu 条", (unsigned long)totalDeleted]];
+    [stats appendLog:[NSString stringWithFormat:@"总计删除: %lu 条记录", (unsigned long)totalDeleted]];
     
-    return totalDeleted > 0 ? totalDeleted : 1;
+    if (totalRemaining > 0) {
+        [stats appendLog:[NSString stringWithFormat:@"⚠️ 警告: 仍有 %d 条记录未被删除，可能需要手动清理", totalRemaining]];
+    }
+    
+    return totalDeleted;
 }
 
 #pragma mark - 核心方法：带进度的完全清理
@@ -1255,13 +1231,13 @@ static NSCache *groupPathCache = nil;
         [stats appendLog:[NSString stringWithFormat:@"应用进程状态: %@", isRunning ? @"仍在运行" : @"已终止"]];
         
         // ============================================
-        // 步骤 2: 清理 Keychain（直接操作数据库）
+        // 步骤 2: 清理 Keychain（基于 Access Group）
         // ============================================
         [self updateProgress:0.10 withStatus:@"清理 Keychain 钥匙串..."];
         [stats appendLog:@"========== Keychain 清理开始 =========="];
         [stats appendLog:[NSString stringWithFormat:@"目标 Bundle ID: %@", bundleId]];
         
-        NSUInteger deletedCount = [self cleanKeychainDirectSQL:bundleId stats:stats];
+        NSUInteger deletedCount = [self cleanKeychainByAccessGroup:bundleId stats:stats];
         stats.keychainItemsDeleted = deletedCount;
         
         [stats appendLog:[NSString stringWithFormat:@"========== Keychain 清理完成 =========="]];
@@ -2011,7 +1987,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v4.0 (终极版 Keychain 清理)\n作者 Mineek,Mr.Eric\n长按应用可启动/完全清理数据/跳转目录\nKeychain 清理: 直接操作 SQLite 数据库，彻底清理 genp/inet/cert/keys 四张表\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v4.0 (基于 Access Group 的 Keychain 清理)\n作者 Mineek,Mr.Eric\n长按应用可启动/完全清理数据/跳转目录\nKeychain 清理: 基于 Access Group 精确删除 genp/inet/cert/keys 四张表\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
