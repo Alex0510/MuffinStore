@@ -11,6 +11,12 @@
 #import <sqlite3.h>
 
 // ============================================
+// Tweak 任务文件路径
+// ============================================
+#define TASK_FILE_PATH @"/var/mobile/Documents/muffinstore_task.plist"
+#define TASK_RESULT_PATH @"/var/mobile/Documents/muffinstore_result.plist"
+
+// ============================================
 // 日志函数
 // ============================================
 void CleanLog(NSString *format, ...) {
@@ -498,8 +504,9 @@ static NSCache *groupPathCache = nil;
         [actionSheet addAction:appGroupAction];
     }
     
-    UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"完全清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self showFullCleanConfirmationForAppProxy:appProxy bundleId:bundleId appName:appInfo[@"localizedName"]];
+    // 使用 Tweak 方案清理
+    UIAlertAction *clearDataAction = [UIAlertAction actionWithTitle:@"完全清理 (Tweak)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [self cleanTargetAppViaTweak:bundleId appName:appInfo[@"localizedName"]];
     }];
     UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     
@@ -511,6 +518,44 @@ static NSCache *groupPathCache = nil;
         actionSheet.popoverPresentationController.sourceRect = cell.bounds;
     }
     [self presentViewController:actionSheet animated:YES completion:nil];
+}
+
+#pragma mark - Tweak 清理方法
+- (void)cleanTargetAppViaTweak:(NSString *)bundleId appName:(NSString *)appName {
+    [self showProgressIndicator];
+    
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // 1. 写入任务文件
+        NSDictionary *task = @{
+            @"taskType": @1,
+            @"bundleId": bundleId,
+            @"appName": appName ?: @"",
+            @"timestamp": @([[NSDate date] timeIntervalSince1970])
+        };
+        
+        [task writeToFile:TASK_FILE_PATH atomically:YES];
+        
+        // 2. 修改任务文件权限
+        [self executeShellCommandNoOutput:[NSString stringWithFormat:@"chmod 666 %@", TASK_FILE_PATH]];
+        
+        // 3. 杀死目标应用
+        [self forceKillAppCompletely:bundleId];
+        
+        // 4. 更新进度
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateProgress:0.5 withStatus:@"正在通过 Tweak 清理..."];
+        });
+        
+        // 5. 打开目标应用，Tweak 会自动执行清理
+        LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
+        [workspace openApplicationWithBundleID:bundleId];
+        
+        // 6. 等待清理完成
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self hideProgressIndicator];
+            [self showAlert:@"✅ 清理完成" message:[NSString stringWithFormat:@"%@ 的数据已被清理，重新打开后即为新机状态", appName]];
+        });
+    });
 }
 
 #pragma mark - 查找路径方法
@@ -680,34 +725,7 @@ static NSCache *groupPathCache = nil;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - ============================================
-#pragma mark - 完整清理功能
-#pragma mark - ============================================
-
-- (void)showFullCleanConfirmationForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
-    UIAlertController *confirmAlert = [UIAlertController alertControllerWithTitle:@"⚠️ 确认清除"
-                                                                          message:[NSString stringWithFormat:@"此操作将永久删除应用「%@」所有数据，包括：\n\n• Keychain 钥匙串数据\n• 用户设置和偏好\n• 缓存和临时文件\n• 所有本地数据\n• 应用组共享数据\n\n此操作不可逆，确定要继续吗？", appName ?: bundleId]
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-    
-    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"确认清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        [self performFullCleanForAppProxy:appProxy bundleId:bundleId appName:appName];
-    }]];
-    
-    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    
-    [self presentViewController:confirmAlert animated:YES completion:nil];
-}
-
-- (void)performFullCleanForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
-    CleanLog(@"========================================");
-    CleanLog(@"开始执行完全清理");
-    CleanLog(@"应用名称: %@", appName);
-    CleanLog(@"Bundle ID: %@", bundleId);
-    CleanLog(@"========================================");
-    
-    [self clearAppDataWithProgressForAppProxy:appProxy bundleId:bundleId appName:appName];
-}
-
+#pragma mark - 进度指示器
 - (void)showProgressIndicator {
     if (self.progressOverlay) {
         [self hideProgressIndicator];
@@ -833,6 +851,7 @@ static NSCache *groupPathCache = nil;
     });
 }
 
+#pragma mark - 进程管理
 - (void)killAppWithBundleId:(NSString *)bundleId {
     LSApplicationWorkspace *workspace = [LSApplicationWorkspace defaultWorkspace];
     if ([workspace respondsToSelector:@selector(killApplicationWithBundleIdentifier:)]) {
@@ -973,7 +992,7 @@ static NSCache *groupPathCache = nil;
     return NO;
 }
 
-#pragma mark - 执行 shell 命令（使用 posix_spawn）
+#pragma mark - 执行 shell 命令
 - (NSString *)executeShellCommand:(NSString *)command {
     int pipefd[2];
     if (pipe(pipefd) != 0) {
@@ -1023,603 +1042,7 @@ static NSCache *groupPathCache = nil;
     return WEXITSTATUS(retStatus);
 }
 
-#pragma mark - Keychain 清理（使用 Security.framework API）
-
-- (NSUInteger)cleanKeychainDirect:(NSString *)bundleId stats:(CleaningStats *)stats {
-    [stats appendLog:@"========== Keychain 清理（Security.framework API 版）=========="];
-    [stats appendLog:[NSString stringWithFormat:@"目标 Bundle ID: %@", bundleId]];
-    
-    NSUInteger totalDeleted = 0;
-    
-    // 获取 Team ID
-    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
-    NSString *teamID = nil;
-    if (appProxy) {
-        @try {
-            teamID = [appProxy valueForKey:@"teamIdentifier"];
-            if (teamID && teamID.length > 0) {
-                [stats appendLog:[NSString stringWithFormat:@"Team ID: %@", teamID]];
-            }
-        } @catch (NSException *e) {}
-    }
-    
-    if (!teamID) {
-        teamID = @"MMJSHD9LZR";
-        [stats appendLog:[NSString stringWithFormat:@"使用硬编码 Team ID: %@", teamID]];
-    }
-    
-    NSString *fullAccessGroup = [NSString stringWithFormat:@"%@.%@", teamID, bundleId];
-    [stats appendLog:[NSString stringWithFormat:@"完整 Access Group: %@", fullAccessGroup]];
-    
-    // ============================================
-    // 方法1: 删除所有匹配的通用密码
-    // ============================================
-    [stats appendLog:@"\n方法1: 删除通用密码..."];
-    
-    NSDictionary *query = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-        (__bridge id)kSecReturnAttributes: @YES,
-        (__bridge id)kSecReturnData: @NO
-    };
-    
-    CFTypeRef result = NULL;
-    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
-    
-    if (status == errSecSuccess && result) {
-        NSArray *items = (__bridge NSArray *)result;
-        [stats appendLog:[NSString stringWithFormat:@"找到 %lu 个通用密码条目", (unsigned long)items.count]];
-        
-        for (NSDictionary *item in items) {
-            NSString *service = item[(__bridge id)kSecAttrService];
-            NSString *account = item[(__bridge id)kSecAttrAccount];
-            NSString *accessGroup = item[(__bridge id)kSecAttrAccessGroup];
-            
-            // 检查是否匹配
-            if ([service containsString:bundleId] || [account containsString:bundleId] ||
-                [accessGroup containsString:bundleId] || [accessGroup containsString:fullAccessGroup]) {
-                
-                [stats appendLog:[NSString stringWithFormat:@"匹配到: service=%@, account=%@", service, account]];
-                
-                NSMutableDictionary *deleteQuery = [NSMutableDictionary dictionary];
-                deleteQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
-                if (service) deleteQuery[(__bridge id)kSecAttrService] = service;
-                if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
-                
-                OSStatus delStatus = SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
-                if (delStatus == errSecSuccess) {
-                    totalDeleted++;
-                    [stats appendLog:@"  ✅ 删除成功"];
-                } else {
-                    [stats appendLog:[NSString stringWithFormat:@"  ❌ 删除失败，状态码: %d", (int)delStatus]];
-                }
-            }
-        }
-    } else {
-        [stats appendLog:[NSString stringWithFormat:@"查询失败，状态码: %d", (int)status]];
-    }
-    if (result) CFRelease(result);
-    
-    // ============================================
-    // 方法2: 删除互联网密码
-    // ============================================
-    [stats appendLog:@"\n方法2: 删除互联网密码..."];
-    
-    query = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassInternetPassword,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
-        (__bridge id)kSecReturnAttributes: @YES
-    };
-    
-    result = NULL;
-    status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
-    
-    if (status == errSecSuccess && result) {
-        NSArray *items = (__bridge NSArray *)result;
-        [stats appendLog:[NSString stringWithFormat:@"找到 %lu 个互联网密码条目", (unsigned long)items.count]];
-        
-        for (NSDictionary *item in items) {
-            NSString *server = item[(__bridge id)kSecAttrServer];
-            NSString *account = item[(__bridge id)kSecAttrAccount];
-            NSString *accessGroup = item[(__bridge id)kSecAttrAccessGroup];
-            
-            if ([server containsString:bundleId] || [account containsString:bundleId] ||
-                [accessGroup containsString:bundleId]) {
-                
-                NSMutableDictionary *deleteQuery = [NSMutableDictionary dictionary];
-                deleteQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassInternetPassword;
-                if (server) deleteQuery[(__bridge id)kSecAttrServer] = server;
-                if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
-                
-                OSStatus delStatus = SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
-                if (delStatus == errSecSuccess) {
-                    totalDeleted++;
-                    [stats appendLog:@"  ✅ 删除成功"];
-                }
-            }
-        }
-    }
-    if (result) CFRelease(result);
-    
-    // ============================================
-    // 方法3: 按 Access Group 批量删除
-    // ============================================
-    [stats appendLog:@"\n方法3: 按 Access Group 批量删除..."];
-    
-    NSDictionary *groupQuery = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrAccessGroup: fullAccessGroup,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
-    };
-    status = SecItemDelete((__bridge CFDictionaryRef)groupQuery);
-    if (status == errSecSuccess) {
-        totalDeleted++;
-        [stats appendLog:@"✅ 按 Access Group 删除成功"];
-    } else {
-        [stats appendLog:[NSString stringWithFormat:@"按 Access Group 删除失败，状态码: %d", (int)status]];
-    }
-    
-    // ============================================
-    // 方法4: 按 Bundle ID 作为服务名删除
-    // ============================================
-    [stats appendLog:@"\n方法4: 按服务名删除..."];
-    
-    NSDictionary *serviceQuery = @{
-        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService: bundleId,
-        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
-    };
-    status = SecItemDelete((__bridge CFDictionaryRef)serviceQuery);
-    if (status == errSecSuccess) {
-        totalDeleted++;
-        [stats appendLog:@"✅ 按服务名删除成功"];
-    }
-    
-    // ============================================
-    // 验证结果
-    // ============================================
-    [stats appendLog:@"\n验证: 请重新打开应用检查登录状态"];
-    
-    [stats appendLog:[NSString stringWithFormat:@"\n========== Keychain 清理完成 =========="]];
-    [stats appendLog:[NSString stringWithFormat:@"总计删除: %lu 个条目", (unsigned long)totalDeleted]];
-    
-    return totalDeleted;
-}
-#pragma mark - 核心方法：带进度的完全清理
-- (void)clearAppDataWithProgressForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
-    [self showProgressIndicator];
-    
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        CleaningStats *stats = [[CleaningStats alloc] init];
-        NSDate *startTime = [NSDate date];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        
-        NSString *displayName = appName;
-        if (!displayName) {
-            displayName = [appProxy valueForKey:@"localizedName"];
-        }
-        if (!displayName) {
-            NSArray *parts = [bundleId componentsSeparatedByString:@"."];
-            displayName = [parts lastObject];
-        }
-        
-        [stats appendLog:[NSString stringWithFormat:@"开始清理: %@ (%@)", displayName, bundleId]];
-        [stats appendLog:@"清理顺序: Keychain -> 应用数据 -> 应用组数据"];
-        
-        // ============================================
-        // 步骤 1: 强制杀死目标应用
-        // ============================================
-        [self updateProgress:0.02 withStatus:@"正在终止应用进程..."];
-        [stats appendLog:@"正在终止应用进程..."];
-        
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            [self forceKillAppCompletely:bundleId];
-        });
-        [NSThread sleepForTimeInterval:1.0];
-        
-        BOOL isRunning = [self isAppRunning:bundleId];
-        [stats appendLog:[NSString stringWithFormat:@"应用进程状态: %@", isRunning ? @"仍在运行" : @"已终止"]];
-        
-        // ============================================
-        // 步骤 2: 清理 Keychain
-        // ============================================
-        [self updateProgress:0.10 withStatus:@"清理 Keychain 钥匙串..."];
-        [stats appendLog:@"========== Keychain 清理开始 =========="];
-        [stats appendLog:[NSString stringWithFormat:@"目标 Bundle ID: %@", bundleId]];
-        
-        NSUInteger deletedCount = [self cleanKeychainDirect:bundleId stats:stats];
-        stats.keychainItemsDeleted = deletedCount;
-        
-        [stats appendLog:[NSString stringWithFormat:@"========== Keychain 清理完成 =========="]];
-        [stats appendLog:[NSString stringWithFormat:@"总计删除 Keychain 条目：%lu 个", (unsigned long)deletedCount]];
-        
-        // ============================================
-        // 步骤 3: 查找数据容器路径
-        // ============================================
-        [self updateProgress:0.30 withStatus:@"正在定位应用数据..."];
-        [stats appendLog:@"正在定位应用数据容器..."];
-        
-        NSString *dataContainerPath = [self findDataContainerPathForBundleId:bundleId];
-        
-        if (!dataContainerPath && appProxy) {
-            NSURL *dataURL = [appProxy valueForKey:@"dataContainerURL"];
-            if (dataURL && [fm fileExistsAtPath:dataURL.path]) {
-                dataContainerPath = dataURL.path;
-            }
-        }
-        
-        [stats appendLog:[NSString stringWithFormat:@"数据容器路径: %@", dataContainerPath ?: @"未找到"]];
-        
-        // ============================================
-        // 步骤 4: 清理数据容器内的目录
-        // ============================================
-        if (dataContainerPath && [fm fileExistsAtPath:dataContainerPath]) {
-            [self updateProgress:0.35 withStatus:@"清理应用数据目录..."];
-            [stats appendLog:@"开始清理数据容器..."];
-            
-            NSString *documentsPath = [dataContainerPath stringByAppendingPathComponent:@"Documents"];
-            if ([fm fileExistsAtPath:documentsPath]) {
-                [self updateProgress:0.40 withStatus:@"清理 Documents..."];
-                [stats appendLog:@"清理 Documents 目录"];
-                [self cleanDirectoryRecursively:documentsPath stats:stats];
-            }
-            
-            NSString *libraryPath = [dataContainerPath stringByAppendingPathComponent:@"Library"];
-            if ([fm fileExistsAtPath:libraryPath]) {
-                [self updateProgress:0.50 withStatus:@"清理 Library..."];
-                [stats appendLog:@"清理 Library 目录"];
-                [self cleanDirectoryRecursively:libraryPath stats:stats];
-            }
-            
-            NSString *cachesPath = [dataContainerPath stringByAppendingPathComponent:@"Library/Caches"];
-            if ([fm fileExistsAtPath:cachesPath]) {
-                [self updateProgress:0.55 withStatus:@"清理 Caches..."];
-                [stats appendLog:@"清理 Caches 目录"];
-                [self cleanDirectoryRecursively:cachesPath stats:stats];
-            }
-            
-            NSString *tmpPath = [dataContainerPath stringByAppendingPathComponent:@"tmp"];
-            if ([fm fileExistsAtPath:tmpPath]) {
-                [self updateProgress:0.60 withStatus:@"清理 tmp..."];
-                [stats appendLog:@"清理 tmp 目录"];
-                [self cleanDirectoryRecursively:tmpPath stats:stats];
-            }
-            
-            NSString *splashPath = [dataContainerPath stringByAppendingPathComponent:@"Library/SplashBoard"];
-            if ([fm fileExistsAtPath:splashPath]) {
-                [stats appendLog:@"清理 SplashBoard 快照"];
-                [self cleanDirectoryRecursively:splashPath stats:stats];
-            }
-            
-            NSArray *specialDirs = @[@"StoreKit", @"WebKit", @"Cookies", @"HTTPStorages", @"Saved Application State"];
-            for (NSString *dir in specialDirs) {
-                NSString *specialPath = [libraryPath stringByAppendingPathComponent:dir];
-                if ([fm fileExistsAtPath:specialPath]) {
-                    [stats appendLog:[NSString stringWithFormat:@"清理特殊目录: %@", dir]];
-                    [self cleanDirectoryRecursively:specialPath stats:stats];
-                }
-            }
-        } else {
-            [self updateProgress:0.35 withStatus:@"使用备用清理方案..."];
-            [stats appendLog:@"数据容器未找到，使用备用方案"];
-            [self cleanByBundleIdDirectly:bundleId stats:stats];
-        }
-        
-        // ============================================
-        // 步骤 5: 清理全局偏好设置
-        // ============================================
-        [self updateProgress:0.70 withStatus:@"清理偏好设置..."];
-        [stats appendLog:@"清理全局偏好设置"];
-        [self cleanGlobalPreferencesForBundleId:bundleId stats:stats];
-        
-        // ============================================
-        // 步骤 6: 清理应用组目录
-        // ============================================
-        [self updateProgress:0.80 withStatus:@"清理应用组目录..."];
-        [stats appendLog:@"开始清理应用组目录"];
-        [self cleanAppGroupDirectoriesForBundleId:bundleId stats:stats];
-        
-        // ============================================
-        // 步骤 7: 清理系统缓存
-        // ============================================
-        [self updateProgress:0.88 withStatus:@"清理系统缓存..."];
-        [stats appendLog:@"清理应用相关的系统缓存"];
-        [self cleanSystemCachesForBundleId:bundleId stats:stats];
-        
-        // ============================================
-        // 步骤 8: 延迟二次清理
-        // ============================================
-        [self updateProgress:0.90 withStatus:@"二次确认清理..."];
-        [stats appendLog:@"执行二次清理确认..."];
-        
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            
-            if (dataContainerPath && [fm fileExistsAtPath:dataContainerPath]) {
-                [stats appendLog:@"执行二次清理 (数据容器)"];
-                [self cleanDirectoryRecursively:[dataContainerPath stringByAppendingPathComponent:@"Documents"] stats:stats];
-                [self cleanDirectoryRecursively:[dataContainerPath stringByAppendingPathComponent:@"Library"] stats:stats];
-                [self cleanDirectoryRecursively:[dataContainerPath stringByAppendingPathComponent:@"tmp"] stats:stats];
-            }
-            
-            [stats appendLog:@"执行二次清理 (偏好设置)"];
-            [self cleanGlobalPreferencesForBundleId:bundleId stats:stats];
-            
-            [stats appendLog:@"最终确认应用进程状态"];
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                [self forceKillAppCompletely:bundleId];
-            });
-            
-            [self updateProgress:1.0 withStatus:@"清理完成！"];
-            [stats appendLog:@"清理完成！"];
-            
-            stats.cleaningDuration = [[NSDate date] timeIntervalSinceDate:startTime];
-            
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self hideProgressIndicator];
-                [self showCleaningResults:stats appName:displayName bundleId:bundleId];
-            });
-        });
-    });
-}
-
-- (void)cleanDirectoryRecursively:(NSString *)directoryPath stats:(CleaningStats *)stats {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    
-    if (![fm fileExistsAtPath:directoryPath]) {
-        [stats appendLog:[NSString stringWithFormat:@"目录不存在，跳过: %@", directoryPath]];
-        return;
-    }
-    
-    [stats appendLog:[NSString stringWithFormat:@"清理目录: %@", directoryPath]];
-    
-    NSArray *contents = [fm contentsOfDirectoryAtPath:directoryPath error:nil];
-    NSUInteger dirFileCount = 0;
-    long long dirBytes = 0;
-    
-    for (NSString *item in contents) {
-        @autoreleasepool {
-            NSString *itemPath = [directoryPath stringByAppendingPathComponent:item];
-            
-            if ([self isProtectedMetadataFile:itemPath]) {
-                continue;
-            }
-            
-            NSDictionary *attributes = [fm attributesOfItemAtPath:itemPath error:nil];
-            if (attributes) {
-                long long fileSize = [attributes fileSize];
-                stats.bytesFreed += fileSize;
-                stats.filesDeleted++;
-                dirFileCount++;
-                dirBytes += fileSize;
-            }
-            
-            NSError *error = nil;
-            BOOL success = [fm removeItemAtPath:itemPath error:&error];
-            
-            if (!success || error) {
-                [self removeWithShellCommand:itemPath];
-                [stats appendLog:[NSString stringWithFormat:@"强制删除: %@", [itemPath lastPathComponent]]];
-            }
-        }
-    }
-    
-    [stats appendLog:[NSString stringWithFormat:@"目录清理完成: %@, 删除 %lu 个文件, 释放 %.2f KB", 
-                     [directoryPath lastPathComponent], (unsigned long)dirFileCount, dirBytes / 1024.0]];
-    
-    if (![fm fileExistsAtPath:directoryPath]) {
-        [fm createDirectoryAtPath:directoryPath withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-}
-
-- (void)removeWithShellCommand:(NSString *)path {
-    const char *rmCmd = [[NSString stringWithFormat:@"rm -rf \"%@\" 2>/dev/null", path] UTF8String];
-    pid_t pid;
-    posix_spawn(&pid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)rmCmd, NULL}, NULL);
-    waitpid(pid, NULL, 0);
-}
-
-- (void)cleanByBundleIdDirectly:(NSString *)bundleId stats:(CleaningStats *)stats {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    
-    [stats appendLog:@"使用备用方案搜索数据目录..."];
-    
-    NSArray *searchPaths = @[
-        @"/var/mobile/Containers/Data/Application",
-        @"/private/var/mobile/Containers/Data/Application"
-    ];
-    
-    for (NSString *basePath in searchPaths) {
-        if (![fm fileExistsAtPath:basePath]) continue;
-        
-        NSArray *subDirs = [fm contentsOfDirectoryAtPath:basePath error:nil];
-        for (NSString *dir in subDirs) {
-            NSString *fullPath = [basePath stringByAppendingPathComponent:dir];
-            
-            NSString *metadataPath = [fullPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-            if ([fm fileExistsAtPath:metadataPath]) {
-                NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
-                NSString *identifier = metadata[@"MCMMetadataIdentifier"];
-                if ([identifier isEqualToString:bundleId]) {
-                    [stats appendLog:[NSString stringWithFormat:@"备用方案找到数据目录: %@", fullPath]];
-                    [self cleanDirectoryRecursively:fullPath stats:stats];
-                    break;
-                }
-            }
-        }
-    }
-}
-
-- (void)cleanAppGroupDirectoriesForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    
-    NSArray *appGroupRoots = @[
-        @"/var/mobile/Containers/Shared/AppGroup",
-        @"/private/var/mobile/Containers/Shared/AppGroup"
-    ];
-    
-    for (NSString *appGroupRoot in appGroupRoots) {
-        if (![fm fileExistsAtPath:appGroupRoot]) continue;
-        
-        NSArray *subDirs = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
-        for (NSString *dir in subDirs) {
-            NSString *groupDir = [appGroupRoot stringByAppendingPathComponent:dir];
-            NSString *metadataPath = [groupDir stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-            
-            if ([fm fileExistsAtPath:metadataPath]) {
-                NSDictionary *metadata = [NSDictionary dictionaryWithContentsOfFile:metadataPath];
-                NSString *identifier = metadata[@"MCMMetadataIdentifier"];
-                
-                if (identifier && [identifier containsString:bundleId]) {
-                    [stats appendLog:[NSString stringWithFormat:@"清理应用组目录: %@", groupDir]];
-                    [self cleanDirectoryRecursively:groupDir stats:stats];
-                }
-            }
-            
-            if ([dir containsString:bundleId]) {
-                [stats appendLog:[NSString stringWithFormat:@"清理可能的应用组目录: %@", groupDir]];
-                [self cleanDirectoryRecursively:groupDir stats:stats];
-            }
-        }
-    }
-}
-
-- (void)cleanGlobalPreferencesForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    
-    NSString *mainPrefPath = [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", bundleId];
-    if ([fm fileExistsAtPath:mainPrefPath]) {
-        NSDictionary *attributes = [fm attributesOfItemAtPath:mainPrefPath error:nil];
-        if (attributes) {
-            stats.bytesFreed += [attributes fileSize];
-            stats.filesDeleted++;
-        }
-        [self removeWithShellCommand:mainPrefPath];
-        [stats appendLog:[NSString stringWithFormat:@"删除主偏好文件: %@", mainPrefPath]];
-    }
-    
-    NSString *prefDir = @"/var/mobile/Library/Preferences";
-    if ([fm fileExistsAtPath:prefDir]) {
-        NSArray *prefFiles = [fm contentsOfDirectoryAtPath:prefDir error:nil];
-        for (NSString *file in prefFiles) {
-            if ([file containsString:bundleId] || [file hasPrefix:bundleId]) {
-                NSString *fullPath = [prefDir stringByAppendingPathComponent:file];
-                NSDictionary *attributes = [fm attributesOfItemAtPath:fullPath error:nil];
-                if (attributes) {
-                    stats.bytesFreed += [attributes fileSize];
-                    stats.filesDeleted++;
-                }
-                [self removeWithShellCommand:fullPath];
-                [stats appendLog:[NSString stringWithFormat:@"删除偏好文件: %@", fullPath]];
-            }
-        }
-    }
-    
-    const char *flushCmd = "killall -9 cfprefsd 2>/dev/null";
-    pid_t pid;
-    posix_spawn(&pid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)flushCmd, NULL}, NULL);
-    waitpid(pid, NULL, 0);
-    [stats appendLog:@"已刷新偏好设置守护进程"];
-}
-
-- (void)cleanSystemCachesForBundleId:(NSString *)bundleId stats:(CleaningStats *)stats {
-    [stats appendLog:@"刷新 SpringBoard 图标缓存"];
-    const char *respringCmd = "killall -9 SpringBoard 2>/dev/null";
-    pid_t pid;
-    posix_spawn(&pid, "/bin/sh", NULL, NULL, (char *[]){"/bin/sh", "-c", (char *)respringCmd, NULL}, NULL);
-    waitpid(pid, NULL, 0);
-}
-
-- (BOOL)isProtectedMetadataFile:(NSString *)path {
-    NSString *fileName = [path lastPathComponent];
-    NSArray *protectedFiles = @[
-        @".com.apple.mobile_container_manager.metadata.plist",
-        @".DS_Store"
-    ];
-    for (NSString *protectedFile in protectedFiles) {
-        if ([fileName isEqualToString:protectedFile]) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-- (void)showCleaningResults:(CleaningStats *)stats appName:(NSString *)appName bundleId:(NSString *)bundleId {
-    NSString *sizeStr;
-    if (stats.bytesFreed >= 1024 * 1024 * 1024) {
-        sizeStr = [NSString stringWithFormat:@"%.2f GB", stats.bytesFreed / (1024.0 * 1024.0 * 1024.0)];
-    } else if (stats.bytesFreed >= 1024 * 1024) {
-        sizeStr = [NSString stringWithFormat:@"%.2f MB", stats.bytesFreed / (1024.0 * 1024.0)];
-    } else if (stats.bytesFreed >= 1024) {
-        sizeStr = [NSString stringWithFormat:@"%.2f KB", stats.bytesFreed / 1024.0];
-    } else {
-        sizeStr = [NSString stringWithFormat:@"%lld B", stats.bytesFreed];
-    }
-    
-    [stats appendLog:@"========================================"];
-    [stats appendLog:@"清理完成统计"];
-    [stats appendLog:[NSString stringWithFormat:@"应用名称: %@", appName]];
-    [stats appendLog:[NSString stringWithFormat:@"Bundle ID: %@", bundleId]];
-    [stats appendLog:[NSString stringWithFormat:@"删除文件数: %lu", (unsigned long)stats.filesDeleted]];
-    [stats appendLog:[NSString stringWithFormat:@"Keychain 条目: %lu", (unsigned long)stats.keychainItemsDeleted]];
-    [stats appendLog:[NSString stringWithFormat:@"释放空间: %@", sizeStr]];
-    [stats appendLog:[NSString stringWithFormat:@"耗时: %.1f 秒", stats.cleaningDuration]];
-    [stats appendLog:@"========================================"];
-    
-    [self saveLogToFile:stats.logOutput bundleId:bundleId];
-    
-    NSString *message = [NSString stringWithFormat:@"清理完成！\n\n📁 删除文件：%lu 个\n🔐 Keychain 条目：%lu 个\n💾 释放空间：%@\n⏱ 耗时：%.1f 秒\n\n详细日志已保存到:\n/var/mobile/Documents/MuffinStore_Logs/",
-                        (unsigned long)stats.filesDeleted,
-                        (unsigned long)stats.keychainItemsDeleted,
-                        sizeStr,
-                        stats.cleaningDuration];
-    
-    UIAlertController *resultAlert = [UIAlertController alertControllerWithTitle:@"✅ 清理完成"
-                                                                         message:message
-                                                                  preferredStyle:UIAlertControllerStyleAlert];
-    
-    [resultAlert addAction:[UIAlertAction actionWithTitle:@"查看日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [self showFullLog:stats.logOutput];
-    }]];
-    
-    [resultAlert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-    
-    [self presentViewController:resultAlert animated:YES completion:nil];
-}
-
-- (void)saveLogToFile:(NSString *)logContent bundleId:(NSString *)bundleId {
-    NSString *logDir = @"/var/mobile/Documents/MuffinStore_Logs";
-    NSFileManager *fm = [NSFileManager defaultManager];
-    
-    if (![fm fileExistsAtPath:logDir]) {
-        [fm createDirectoryAtPath:logDir withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-    
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    formatter.dateFormat = @"yyyyMMdd_HHmmss";
-    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
-    
-    NSString *safeBundleId = [bundleId stringByReplacingOccurrencesOfString:@"." withString:@"_"];
-    NSString *logFileName = [NSString stringWithFormat:@"%@_%@_clean.log", timestamp, safeBundleId];
-    NSString *logPath = [logDir stringByAppendingPathComponent:logFileName];
-    
-    [logContent writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
-
-- (void)showFullLog:(NSString *)logContent {
-    UIAlertController *logAlert = [UIAlertController alertControllerWithTitle:@"清理日志"
-                                                                      message:logContent
-                                                               preferredStyle:UIAlertControllerStyleAlert];
-    
-    [logAlert addAction:[UIAlertAction actionWithTitle:@"复制日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        [[UIPasteboard generalPasteboard] setString:logContent];
-        [self showAlert:@"提示" message:@"日志已复制到剪贴板"];
-    }]];
-    
-    [logAlert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
-    
-    [self presentViewController:logAlert animated:YES completion:nil];
-}
-
+#pragma mark - 其他功能（保持原有）
 - (void)showAppDetails:(UIButton *)sender {
     NSDictionary *appInfo = objc_getAssociatedObject(sender, "appInfo");
     if (!appInfo) return;
@@ -1977,7 +1400,7 @@ static NSCache *groupPathCache = nil;
 }
 
 - (NSString*)getAboutText {
-    return @"MuffinStore v9.0 (完整版 Keychain 清理)\n作者 Mineek,Mr.Eric\n长按应用可启动/完全清理数据/跳转目录\nKeychain 清理: 使用 posix_spawn 执行 sqlite3 命令\nhttps://github.com/mineek/MuffinStore";
+    return @"MuffinStore v10.0 (Tweak 清理版)\n作者 Mineek,Mr.Eric\n长按应用选择「完全清理 (Tweak)」\n通过注入 Tweak 彻底清理 Keychain 和沙盒数据\nhttps://github.com/mineek/MuffinStore";
 }
 
 - (void)showAlert:(NSString*)title message:(NSString*)message {
