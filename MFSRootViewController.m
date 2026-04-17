@@ -62,28 +62,6 @@ void CleanLog(NSString *format, ...) {
 // SKUI 相关类 (使用运行时动态调用，避免链接错误)
 // ============================================
 
-static Class SKUIItemStateCenterClass = nil;
-static Class SKUIItemClass = nil;
-static Class SKUIItemOfferClass = nil;
-static Class SKUIClientContextClass = nil;
-
-// 延迟加载 SKUI 类
-+ (void)loadSKUIClasses {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        SKUIItemStateCenterClass = NSClassFromString(@"SKUIItemStateCenter");
-        SKUIItemClass = NSClassFromString(@"SKUIItem");
-        SKUIItemOfferClass = NSClassFromString(@"SKUIItemOffer");
-        SKUIClientContextClass = NSClassFromString(@"SKUIClientContext");
-        
-        if (SKUIItemStateCenterClass) {
-            CleanLog(@"SKUI 类加载成功");
-        } else {
-            CleanLog(@"SKUI 类加载失败，下载功能可能不可用");
-        }
-    });
-}
-
 // 添加 LSApplicationWorkspace 的额外方法声明
 @interface LSApplicationWorkspace (Private)
 - (BOOL)killApplicationWithBundleIdentifier:(NSString *)bundleIdentifier;
@@ -115,7 +93,6 @@ static NSCache *groupPathCache = nil;
     if (self == [MFSRootViewController class]) {
         iconCache = [[NSCache alloc] init];
         groupPathCache = [[NSCache alloc] init];
-        [self loadSKUIClasses];
     }
 }
 
@@ -1046,14 +1023,6 @@ static NSCache *groupPathCache = nil;
 
 #pragma mark - 下载功能（使用运行时动态调用）
 - (void)downloadAppWithAppId:(long long)appId versionId:(long long)versionId {
-    // 检查 SKUI 类是否可用
-    if (!SKUIItemOfferClass || !SKUIItemClass || !SKUIItemStateCenterClass || !SKUIClientContextClass) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self showAlert:@"错误" message:@"当前系统不支持直接下载，请使用 ID 下载功能"];
-        });
-        return;
-    }
-    
     NSString* adamId = [NSString stringWithFormat:@"%lld", appId];
     NSString* pricingParameters = @"pricingParameter";
     NSString* appExtVrsId = [NSString stringWithFormat:@"%lld", versionId];
@@ -1063,6 +1032,18 @@ static NSCache *groupPathCache = nil;
         offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, installed];
     } else {
         offerString = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%@&pricingParameters=%@&appExtVrsId=%@&clientBuyId=1&installed=%@&trolled=1", adamId, pricingParameters, appExtVrsId, installed];
+    }
+    
+    Class SKUIItemOfferClass = NSClassFromString(@"SKUIItemOffer");
+    Class SKUIItemClass = NSClassFromString(@"SKUIItem");
+    Class SKUIItemStateCenterClass = NSClassFromString(@"SKUIItemStateCenter");
+    Class SKUIClientContextClass = NSClassFromString(@"SKUIClientContext");
+    
+    if (!SKUIItemOfferClass || !SKUIItemClass || !SKUIItemStateCenterClass || !SKUIClientContextClass) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showAlert:@"错误" message:@"当前系统不支持直接下载，请使用 ID 下载功能"];
+        });
+        return;
     }
     
     @try {
@@ -1088,7 +1069,17 @@ static NSCache *groupPathCache = nil;
             id purchases = [center performSelector:newPurchasesSel withObject:items];
             id context = [SKUIClientContextClass performSelector:@selector(defaultContext)];
             
-            [center performSelector:performPurchasesSel withObject:purchases withObject:@0 withObject:context withObject:^(id arg1){}];
+            // 使用 NSInvocation 避免 performSelector 警告
+            NSMethodSignature *sig = [center methodSignatureForSelector:performPurchasesSel];
+            NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:sig];
+            [invocation setTarget:center];
+            [invocation setSelector:performPurchasesSel];
+            [invocation setArgument:&purchases atIndex:2];
+            [invocation setArgument:&(NSNumber){0} atIndex:3];
+            [invocation setArgument:&context atIndex:4];
+            void (^block)(id) = ^(id arg1){};
+            [invocation setArgument:&block atIndex:5];
+            [invocation invoke];
         } else {
             [self showAlert:@"错误" message:@"StoreKit 接口不可用"];
         }
@@ -1369,7 +1360,7 @@ static NSCache *groupPathCache = nil;
 
 - (void)promptForVersionId:(long long)appId {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController* versionAlert = [UIAlertController alertControllerWithTitle:@"版本ID" message:@"请输入要下载的应用版本ID" preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertController* versionAlert = [UIAlertAlertController alertControllerWithTitle:@"版本ID" message:@"请输入要下载的应用版本ID" preferredStyle:UIAlertControllerStyleAlert];
         [versionAlert addTextFieldWithConfigurationHandler:^(UITextField* textField) {
             textField.placeholder = @"版本ID";
         }];
