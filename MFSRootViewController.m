@@ -1023,11 +1023,13 @@ static NSCache *groupPathCache = nil;
     return WEXITSTATUS(retStatus);
 }
 
-#pragma mark - Keychain 清理（使用 posix_spawn 执行 sqlite3 命令）
+#pragma mark - Keychain 清理（使用 Security.framework API）
 
 - (NSUInteger)cleanKeychainDirect:(NSString *)bundleId stats:(CleaningStats *)stats {
-    [stats appendLog:@"========== Keychain 清理（posix_spawn 版）=========="];
+    [stats appendLog:@"========== Keychain 清理（Security.framework API 版）=========="];
     [stats appendLog:[NSString stringWithFormat:@"目标 Bundle ID: %@", bundleId]];
+    
+    NSUInteger totalDeleted = 0;
     
     // 获取 Team ID
     id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
@@ -1050,88 +1052,139 @@ static NSCache *groupPathCache = nil;
     [stats appendLog:[NSString stringWithFormat:@"完整 Access Group: %@", fullAccessGroup]];
     
     // ============================================
-    // 步骤1: 停止 securityd 服务
+    // 方法1: 删除所有匹配的通用密码
     // ============================================
-    [stats appendLog:@"\n步骤1: 停止 securityd 服务..."];
-    [self executeShellCommandNoOutput:@"launchctl unload /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
-    sleep(1);
+    [stats appendLog:@"\n方法1: 删除通用密码..."];
     
-    // ============================================
-    // 步骤2: 修改数据库权限
-    // ============================================
-    [stats appendLog:@"步骤2: 修改数据库权限..."];
-    [self executeShellCommandNoOutput:@"chmod 666 /var/Keychains/keychain-2.db 2>/dev/null"];
+    NSDictionary *query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+        (__bridge id)kSecReturnAttributes: @YES,
+        (__bridge id)kSecReturnData: @NO
+    };
     
-    // ============================================
-    // 步骤3: 执行删除命令
-    // ============================================
-    [stats appendLog:@"\n步骤3: 执行删除操作..."];
+    CFTypeRef result = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
     
-    // 删除 genp 表
-    NSString *deleteCmd = [NSString stringWithFormat:@"/usr/bin/sqlite3 /var/Keychains/keychain-2.db \"DELETE FROM genp WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", bundleId, fullAccessGroup];
-    [self executeShellCommandNoOutput:deleteCmd];
-    
-    // 删除 inet 表
-    deleteCmd = [NSString stringWithFormat:@"/usr/bin/sqlite3 /var/Keychains/keychain-2.db \"DELETE FROM inet WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", bundleId, fullAccessGroup];
-    [self executeShellCommandNoOutput:deleteCmd];
-    
-    // 删除 cert 表
-    deleteCmd = [NSString stringWithFormat:@"/usr/bin/sqlite3 /var/Keychains/keychain-2.db \"DELETE FROM cert WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", bundleId, fullAccessGroup];
-    [self executeShellCommandNoOutput:deleteCmd];
-    
-    // 删除 keys 表
-    deleteCmd = [NSString stringWithFormat:@"/usr/bin/sqlite3 /var/Keychains/keychain-2.db \"DELETE FROM keys WHERE agrp LIKE '%%%@%%' OR agrp = '%@';\"", bundleId, fullAccessGroup];
-    [self executeShellCommandNoOutput:deleteCmd];
-    
-    // 按服务名额外删除
-    deleteCmd = [NSString stringWithFormat:@"/usr/bin/sqlite3 /var/Keychains/keychain-2.db \"DELETE FROM genp WHERE svce LIKE '%%%@%%';\"", bundleId];
-    [self executeShellCommandNoOutput:deleteCmd];
-    
-    deleteCmd = [NSString stringWithFormat:@"/usr/bin/sqlite3 /var/Keychains/keychain-2.db \"DELETE FROM inet WHERE srvr LIKE '%%%@%%';\"", bundleId];
-    [self executeShellCommandNoOutput:deleteCmd];
-    
-    [stats appendLog:@"删除命令已执行"];
-    
-    // ============================================
-    // 步骤4: 验证删除结果
-    // ============================================
-    [stats appendLog:@"\n步骤4: 验证删除结果..."];
-    
-    NSString *checkCmd = [NSString stringWithFormat:@"/usr/bin/sqlite3 /var/Keychains/keychain-2.db \"SELECT COUNT(*) FROM genp WHERE agrp LIKE '%%%@%%';\"", bundleId];
-    NSString *result = [self executeShellCommand:checkCmd];
-    int remaining = [result intValue];
-    
-    if (remaining == 0) {
-        [stats appendLog:@"✅ genp 表清理成功，无残留"];
+    if (status == errSecSuccess && result) {
+        NSArray *items = (__bridge NSArray *)result;
+        [stats appendLog:[NSString stringWithFormat:@"找到 %lu 个通用密码条目", (unsigned long)items.count]];
+        
+        for (NSDictionary *item in items) {
+            NSString *service = item[(__bridge id)kSecAttrService];
+            NSString *account = item[(__bridge id)kSecAttrAccount];
+            NSString *accessGroup = item[(__bridge id)kSecAttrAccessGroup];
+            
+            // 检查是否匹配
+            if ([service containsString:bundleId] || [account containsString:bundleId] ||
+                [accessGroup containsString:bundleId] || [accessGroup containsString:fullAccessGroup]) {
+                
+                [stats appendLog:[NSString stringWithFormat:@"匹配到: service=%@, account=%@", service, account]];
+                
+                NSMutableDictionary *deleteQuery = [NSMutableDictionary dictionary];
+                deleteQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassGenericPassword;
+                if (service) deleteQuery[(__bridge id)kSecAttrService] = service;
+                if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
+                
+                OSStatus delStatus = SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
+                if (delStatus == errSecSuccess) {
+                    totalDeleted++;
+                    [stats appendLog:@"  ✅ 删除成功"];
+                } else {
+                    [stats appendLog:[NSString stringWithFormat:@"  ❌ 删除失败，状态码: %d", (int)delStatus]];
+                }
+            }
+        }
     } else {
-        [stats appendLog:[NSString stringWithFormat:@"⚠️ 还有 %d 条残留", remaining]];
+        [stats appendLog:[NSString stringWithFormat:@"查询失败，状态码: %d", (int)status]];
+    }
+    if (result) CFRelease(result);
+    
+    // ============================================
+    // 方法2: 删除互联网密码
+    // ============================================
+    [stats appendLog:@"\n方法2: 删除互联网密码..."];
+    
+    query = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassInternetPassword,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+        (__bridge id)kSecReturnAttributes: @YES
+    };
+    
+    result = NULL;
+    status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+    
+    if (status == errSecSuccess && result) {
+        NSArray *items = (__bridge NSArray *)result;
+        [stats appendLog:[NSString stringWithFormat:@"找到 %lu 个互联网密码条目", (unsigned long)items.count]];
+        
+        for (NSDictionary *item in items) {
+            NSString *server = item[(__bridge id)kSecAttrServer];
+            NSString *account = item[(__bridge id)kSecAttrAccount];
+            NSString *accessGroup = item[(__bridge id)kSecAttrAccessGroup];
+            
+            if ([server containsString:bundleId] || [account containsString:bundleId] ||
+                [accessGroup containsString:bundleId]) {
+                
+                NSMutableDictionary *deleteQuery = [NSMutableDictionary dictionary];
+                deleteQuery[(__bridge id)kSecClass] = (__bridge id)kSecClassInternetPassword;
+                if (server) deleteQuery[(__bridge id)kSecAttrServer] = server;
+                if (account) deleteQuery[(__bridge id)kSecAttrAccount] = account;
+                
+                OSStatus delStatus = SecItemDelete((__bridge CFDictionaryRef)deleteQuery);
+                if (delStatus == errSecSuccess) {
+                    totalDeleted++;
+                    [stats appendLog:@"  ✅ 删除成功"];
+                }
+            }
+        }
+    }
+    if (result) CFRelease(result);
+    
+    // ============================================
+    // 方法3: 按 Access Group 批量删除
+    // ============================================
+    [stats appendLog:@"\n方法3: 按 Access Group 批量删除..."];
+    
+    NSDictionary *groupQuery = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrAccessGroup: fullAccessGroup,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
+    };
+    status = SecItemDelete((__bridge CFDictionaryRef)groupQuery);
+    if (status == errSecSuccess) {
+        totalDeleted++;
+        [stats appendLog:@"✅ 按 Access Group 删除成功"];
+    } else {
+        [stats appendLog:[NSString stringWithFormat:@"按 Access Group 删除失败，状态码: %d", (int)status]];
     }
     
     // ============================================
-    // 步骤5: 删除 WAL 文件
+    // 方法4: 按 Bundle ID 作为服务名删除
     // ============================================
-    [stats appendLog:@"\n步骤5: 清理 WAL 文件..."];
-    [self executeShellCommandNoOutput:@"rm -f /var/Keychains/keychain-2.db-wal 2>/dev/null"];
-    [self executeShellCommandNoOutput:@"rm -f /var/Keychains/keychain-2.db-shm 2>/dev/null"];
+    [stats appendLog:@"\n方法4: 按服务名删除..."];
+    
+    NSDictionary *serviceQuery = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: bundleId,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll
+    };
+    status = SecItemDelete((__bridge CFDictionaryRef)serviceQuery);
+    if (status == errSecSuccess) {
+        totalDeleted++;
+        [stats appendLog:@"✅ 按服务名删除成功"];
+    }
     
     // ============================================
-    // 步骤6: 重启 securityd
+    // 验证结果
     // ============================================
-    [stats appendLog:@"步骤6: 重启 securityd 服务..."];
-    [self executeShellCommandNoOutput:@"launchctl load /System/Library/LaunchDaemons/com.apple.securityd.plist 2>/dev/null"];
-    sleep(1);
-    [self executeShellCommandNoOutput:@"killall -9 securityd 2>/dev/null"];
+    [stats appendLog:@"\n验证: 请重新打开应用检查登录状态"];
     
-    // ============================================
-    // 步骤7: 恢复权限
-    // ============================================
-    [self executeShellCommandNoOutput:@"chmod 600 /var/Keychains/keychain-2.db 2>/dev/null"];
+    [stats appendLog:[NSString stringWithFormat:@"\n========== Keychain 清理完成 =========="]];
+    [stats appendLog:[NSString stringWithFormat:@"总计删除: %lu 个条目", (unsigned long)totalDeleted]];
     
-    [stats appendLog:@"\n========== Keychain 清理完成 =========="];
-    
-    return 1;
+    return totalDeleted;
 }
-
 #pragma mark - 核心方法：带进度的完全清理
 - (void)clearAppDataWithProgressForAppProxy:(id)appProxy bundleId:(NSString *)bundleId appName:(NSString *)appName {
     [self showProgressIndicator];
