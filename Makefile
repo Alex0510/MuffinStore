@@ -6,7 +6,7 @@ INSTALL_TARGET_PROCESSES = MuffinStore
 
 include $(THEOS)/makefiles/common.mk
 
-# Tweak 配置（注入到所有应用）
+# Tweak 配置
 TWEAK_NAME = MuffinStoreTweak
 MuffinStoreTweak_FILES = Tweak.xm
 MuffinStoreTweak_CFLAGS = -fobjc-arc
@@ -17,7 +17,7 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 # 主应用配置
 APPLICATION_NAME = MuffinStore
 MuffinStore_FILES = main.m MFSAppDelegate.m MFSRootViewController.m
-MuffinStore_FRAMEWORKS = UIKit Foundation CoreGraphics Security StoreKit
+MuffinStore_FRAMEWORKS = UIKit Foundation CoreGraphics Security StoreKit MobileCoreServices
 MuffinStore_CFLAGS = -fobjc-arc
 MuffinStore_CODESIGN_FLAGS = -Sentitlements.plist
 
