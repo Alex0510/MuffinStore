@@ -14,7 +14,6 @@
 // Tweak 任务文件路径
 // ============================================
 #define TASK_FILE_PATH @"/var/mobile/Documents/muffinstore_task.plist"
-#define TASK_RESULT_PATH @"/var/mobile/Documents/muffinstore_result.plist"
 
 // ============================================
 // 日志函数
@@ -467,7 +466,6 @@ static NSCache *groupPathCache = nil;
     
     NSString *bundleId = appInfo[@"bundleIdentifier"];
     NSString *bundlePath = appInfo[@"bundlePath"];
-    id appProxy = [LSApplicationProxy applicationProxyForIdentifier:bundleId];
     
     UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:appInfo[@"localizedName"] message:nil preferredStyle:UIAlertControllerStyleActionSheet];
     
@@ -527,7 +525,6 @@ static NSCache *groupPathCache = nil;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         // 1. 写入任务文件
         NSDictionary *task = @{
-            @"taskType": @1,
             @"bundleId": bundleId,
             @"appName": appName ?: @"",
             @"timestamp": @([[NSDate date] timeIntervalSince1970])
